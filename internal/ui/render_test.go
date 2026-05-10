@@ -58,11 +58,17 @@ func TestPadColRight_VisibleWidthInvariant(t *testing.T) {
 	}
 }
 
-// renderSelected must keep reverse mode on across inner ANSI resets,
-// otherwise the highlight visibly drops after the first coloured cell
-// (the reported pod-row bug). Every `\x1b[0m` in the input must be
-// followed by `\x1b[7m`, and lipgloss.Width() must be unchanged.
-func TestRenderSelected_ReverseSurvivesInnerResets(t *testing.T) {
+// bgOn is the SGR sequence renderSelected emits — kept here so a
+// drift between the production code and the tests fails loudly
+// rather than silently passing both sides on the wrong colour.
+const selectedBgOn = "\x1b[48;2;58;58;58m"
+
+// renderSelected must keep the background-on SGR alive across inner
+// ANSI resets, otherwise the highlight visibly drops after the first
+// coloured cell (the reported pod-row bug). Every `\x1b[0m` in the
+// input must be followed by the bg-on sequence, and lipgloss.Width()
+// must be unchanged.
+func TestRenderSelected_BgSurvivesInnerResets(t *testing.T) {
 	red := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	// Two coloured cells with plain text between/around them — the
 	// shape a real pod row has after warnGlyph + padCol(phase) +
@@ -71,20 +77,28 @@ func TestRenderSelected_ReverseSurvivesInnerResets(t *testing.T) {
 
 	got := renderSelected(line)
 
-	if !strings.HasPrefix(got, "\x1b[7m") {
-		t.Fatalf("renderSelected must start with reverse-on, got %q", got)
+	if !strings.HasPrefix(got, selectedBgOn) {
+		t.Fatalf("renderSelected must start with bg-on, got %q", got)
 	}
 	if !strings.HasSuffix(got, "\x1b[0m") {
 		t.Fatalf("renderSelected must end with full reset, got %q", got)
 	}
 	// Every inner `\x1b[0m` (cell terminator) must be immediately
-	// followed by a fresh `\x1b[7m` — that's the whole point of the
-	// helper. Count: inner resets in `line` is 2 (one per styled cell);
-	// total resets in `got` is 3 (2 inner + 1 trailing); each inner
-	// must have `\x1b[7m` right after.
+	// followed by a fresh bg-on. Count: inner resets in `line` is 2
+	// (one per styled cell); each must have bg-on right after.
 	innerResets := strings.Count(line, "\x1b[0m")
-	if got, want := strings.Count(got, "\x1b[0m\x1b[7m"), innerResets; got != want {
-		t.Fatalf("inner resets re-armed with reverse: got %d, want %d", got, want)
+	if got, want := strings.Count(got, "\x1b[0m"+selectedBgOn), innerResets; got != want {
+		t.Fatalf("inner resets re-armed with bg-on: got %d, want %d", got, want)
+	}
+	// Per-cell foregrounds must be preserved (the whole point of
+	// using bg instead of reverse — the green dot stays green).
+	if !strings.Contains(got, "Running") || !strings.Contains(got, "●") {
+		t.Fatalf("cell content not preserved end-to-end: %q", got)
+	}
+	// No reverse-mode SGR anywhere — that's the prior approach and we
+	// explicitly moved away from it.
+	if strings.Contains(got, "\x1b[7m") {
+		t.Fatalf("reverse-mode SGR leaked into output: %q", got)
 	}
 	// Visible width is preserved (no garbage glyphs, no widening).
 	if lw, rw := lipgloss.Width(line), lipgloss.Width(got); lw != rw {
@@ -96,7 +110,7 @@ func TestRenderSelected_ReverseSurvivesInnerResets(t *testing.T) {
 func TestRenderSelected_PlainRowCheapWrap(t *testing.T) {
 	line := "namespace      name        Running   0  5m"
 	got := renderSelected(line)
-	want := "\x1b[7m" + line + "\x1b[0m"
+	want := selectedBgOn + line + "\x1b[0m"
 	if got != want {
 		t.Fatalf("plain row wrap mismatch:\ngot=%q\nwant=%q", got, want)
 	}

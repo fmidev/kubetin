@@ -73,27 +73,37 @@ func padCellANSIRight(content string, width int) string {
 	return strings.Repeat(" ", width-visible) + content
 }
 
-// renderSelected wraps a body row in the selection highlight,
-// preserving the highlight across cells that emit their own ANSI
-// codes. `Theme.Selected.Render(line)` only sets reverse mode once
-// at the start; every styled cell (`padCol` with a non-empty style,
-// `padCellANSI` content) ends with `\x1b[0m`, which resets *all*
-// SGR attributes including reverse — so the highlight visibly drops
-// after the first coloured cell and the rest of the row renders
-// unhighlighted (the original bug). Splice a fresh `\x1b[7m` after
-// every inner reset to keep reverse mode alive end-to-end. Same
-// technique highlightMatches uses in the log viewer for the same
-// underlying reason.
+// renderSelected wraps a body row in the selection highlight: a
+// uniform dark-grey background painted under the whole row, with
+// per-cell foreground colours (Running/Pending/Failed phase, the
+// container-state dots) preserved unchanged. Same look htop/btop use
+// — the selected row is visually distinct without erasing the colour
+// information the row was carrying.
+//
+// Implementation: every styled cell (padCol with a non-empty style,
+// padCellANSI content) ends with `\x1b[0m`, which resets *all* SGR
+// attributes — including the bg we just set. Splice a fresh bg-on
+// after every inner reset so the highlight survives end-to-end.
+//
+// Why not Theme.Selected.Render(line): that wraps with the bg's SGR
+// once at the start; the first inner reset clears it and the rest of
+// the row renders unhighlighted (the original bug). And we want a
+// background, not reverse — reverse video swaps fg/bg per cell, so
+// the green container dot becomes black-on-green and the colour
+// information is lost.
+//
+// SGR 48;2;58;58;58 == lipgloss.Color("#3a3a3a"). Keep in sync with
+// Theme.Selected.
 func renderSelected(line string) string {
 	const (
-		reverseOn = "\x1b[7m"
+		bgOn      = "\x1b[48;2;58;58;58m"
 		fullReset = "\x1b[0m"
 	)
 	if !strings.Contains(line, fullReset) {
 		// Plain row → cheap wrap, no inner resets to defend against.
-		return reverseOn + line + fullReset
+		return bgOn + line + fullReset
 	}
-	return reverseOn + strings.ReplaceAll(line, fullReset, fullReset+reverseOn) + fullReset
+	return bgOn + strings.ReplaceAll(line, fullReset, fullReset+bgOn) + fullReset
 }
 
 // shortHost trims a host's domain suffix — "node-1.example.com" →
