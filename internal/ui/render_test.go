@@ -57,3 +57,47 @@ func TestPadColRight_VisibleWidthInvariant(t *testing.T) {
 		t.Fatalf("padColRight should be right-justified, got %q", got)
 	}
 }
+
+// renderSelected must keep reverse mode on across inner ANSI resets,
+// otherwise the highlight visibly drops after the first coloured cell
+// (the reported pod-row bug). Every `\x1b[0m` in the input must be
+// followed by `\x1b[7m`, and lipgloss.Width() must be unchanged.
+func TestRenderSelected_ReverseSurvivesInnerResets(t *testing.T) {
+	red := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	// Two coloured cells with plain text between/around them — the
+	// shape a real pod row has after warnGlyph + padCol(phase) +
+	// padCellANSI(dots).
+	line := "ns  " + red.Render("Running") + "  " + red.Render("●") + "  rest"
+
+	got := renderSelected(line)
+
+	if !strings.HasPrefix(got, "\x1b[7m") {
+		t.Fatalf("renderSelected must start with reverse-on, got %q", got)
+	}
+	if !strings.HasSuffix(got, "\x1b[0m") {
+		t.Fatalf("renderSelected must end with full reset, got %q", got)
+	}
+	// Every inner `\x1b[0m` (cell terminator) must be immediately
+	// followed by a fresh `\x1b[7m` — that's the whole point of the
+	// helper. Count: inner resets in `line` is 2 (one per styled cell);
+	// total resets in `got` is 3 (2 inner + 1 trailing); each inner
+	// must have `\x1b[7m` right after.
+	innerResets := strings.Count(line, "\x1b[0m")
+	if got, want := strings.Count(got, "\x1b[0m\x1b[7m"), innerResets; got != want {
+		t.Fatalf("inner resets re-armed with reverse: got %d, want %d", got, want)
+	}
+	// Visible width is preserved (no garbage glyphs, no widening).
+	if lw, rw := lipgloss.Width(line), lipgloss.Width(got); lw != rw {
+		t.Fatalf("visible width changed: line=%d, selected=%d", lw, rw)
+	}
+}
+
+// Cheap path: plain input with no inner resets gets the simple wrap.
+func TestRenderSelected_PlainRowCheapWrap(t *testing.T) {
+	line := "namespace      name        Running   0  5m"
+	got := renderSelected(line)
+	want := "\x1b[7m" + line + "\x1b[0m"
+	if got != want {
+		t.Fatalf("plain row wrap mismatch:\ngot=%q\nwant=%q", got, want)
+	}
+}

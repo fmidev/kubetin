@@ -73,6 +73,29 @@ func padCellANSIRight(content string, width int) string {
 	return strings.Repeat(" ", width-visible) + content
 }
 
+// renderSelected wraps a body row in the selection highlight,
+// preserving the highlight across cells that emit their own ANSI
+// codes. `Theme.Selected.Render(line)` only sets reverse mode once
+// at the start; every styled cell (`padCol` with a non-empty style,
+// `padCellANSI` content) ends with `\x1b[0m`, which resets *all*
+// SGR attributes including reverse — so the highlight visibly drops
+// after the first coloured cell and the rest of the row renders
+// unhighlighted (the original bug). Splice a fresh `\x1b[7m` after
+// every inner reset to keep reverse mode alive end-to-end. Same
+// technique highlightMatches uses in the log viewer for the same
+// underlying reason.
+func renderSelected(line string) string {
+	const (
+		reverseOn = "\x1b[7m"
+		fullReset = "\x1b[0m"
+	)
+	if !strings.Contains(line, fullReset) {
+		// Plain row → cheap wrap, no inner resets to defend against.
+		return reverseOn + line + fullReset
+	}
+	return reverseOn + strings.ReplaceAll(line, fullReset, fullReset+reverseOn) + fullReset
+}
+
 // shortHost trims a host's domain suffix — "node-1.example.com" →
 // "node-1". Used in the pod table's NODE column where FQDNs eat
 // horizontal space without adding information the operator usually
