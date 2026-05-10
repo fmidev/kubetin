@@ -1230,9 +1230,22 @@ func (m Model) renderHeader() string {
 	// Each line clamped to exactly (m.width × 1) so two-line header is
 	// guaranteed two visible rows regardless of how wide the metrics
 	// line wants to be on a narrow terminal.
+	//
+	// hr is a single-row horizontal separator under the header,
+	// matching the sidebar's right-edge `│` in colour (236) so the
+	// top-bar divider and the sidebar divider read as the same
+	// visual element wrapped around the body. View()'s bodyHeight
+	// computation uses lipgloss.Height(header), so adding this row
+	// automatically shrinks the body by one and the layout invariant
+	// (total render == m.width × m.height) holds without further work.
+	hr := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("236")).
+		Render(strings.Repeat("─", m.width))
 	return clampCanvas(m.renderHeaderIdentity(st), m.width, 1) +
 		"\n" +
-		clampCanvas(m.renderHeaderMetrics(st), m.width, 1)
+		clampCanvas(m.renderHeaderMetrics(st), m.width, 1) +
+		"\n" +
+		hr
 }
 
 // renderHeaderIdentity is the original single-line header — cluster
