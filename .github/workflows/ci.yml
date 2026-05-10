@@ -36,3 +36,36 @@ jobs:
 
       - name: go build
         run: go build ./...
+
+  # Cross-compile for every release-matrix target on every PR. The
+  # native `go build ./...` above only proves the runner's own arch
+  # builds — it missed cmd/kubetin/stderr_unix.go using syscall.Dup2,
+  # which isn't provided on linux/arm64, until the release matrix
+  # blew up post-merge. Matrix must stay in lockstep with release.yml.
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -trimpath ./cmd/kubetin
