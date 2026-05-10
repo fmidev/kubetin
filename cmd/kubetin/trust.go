@@ -16,12 +16,18 @@
 //     "previous baseline" to compare against and forcing the user to
 //     bounce back to a docs page is hostile.
 //
-//  3. trust list exists but discovered files don't all match: refuse
-//     to load the unknown ones and tell the user how to bless them.
-//     We deliberately don't prompt here — files appearing silently
-//     between sessions is exactly the threat the trust list defends
-//     against, and an interactive y/N with the malicious payload
-//     already loaded into client-go is too late.
+//  3. trust list exists but discovered files don't all match: prompt
+//     the user, same shape as first-run, distinguishing "content
+//     changed" (a path we previously trusted now hashes differently
+//     — typical after `oc login` / `gcloud … get-credentials` /
+//     kubelogin refresh) from "newly appeared" (the original threat
+//     model). y → re-bless the listed files + persist + carry on,
+//     n → exit. We prompt rather than warn-and-continue because the
+//     bubbletea alt-screen wipes anything printed to stderr the
+//     instant the TUI starts, so a warning the user never sees is
+//     equivalent to no warning at all. The prompt is safe: untrusted
+//     files have NOT been loaded into client-go at this point — they
+//     only get loaded after re-discovery, after the user accepts.
 package main
 
 import (
@@ -107,11 +113,10 @@ func loadTrustedDiscovery() (*kubeconfig.Discovered, error) {
 		return d, err
 	}
 
-	// Non-first-run: refuse the untrusted set, but distinguish two
-	// cases. "Content changed" — a path we previously trusted now
-	// hashes differently — is overwhelmingly common after `oc login`,
-	// `gcloud container clusters get-credentials`, or kubelogin
-	// refresh. "New file" is the original threat model.
+	// Non-first-run: trust list exists, but some discovered files are
+	// unknown or have changed. Prompt — the previous behaviour of
+	// warn-and-continue was equivalent to silent failure because the
+	// TUI's alt-screen erases stderr the moment it starts.
 	var changed, added []string
 	for _, f := range untrusted {
 		if tl.HasKnownPath(f) {
@@ -121,29 +126,21 @@ func loadTrustedDiscovery() (*kubeconfig.Discovered, error) {
 		}
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "kubetin: refusing %d untrusted kubeconfig file(s):\n", len(untrusted))
-	if len(changed) > 0 {
-		fmt.Fprintf(&b, "\n  Content changed (e.g. `oc login` / `gcloud …` rotated the token):\n")
-		for _, f := range changed {
-			fmt.Fprintf(&b, "    %s\n", f)
-		}
+	ok, err := promptTrustChanges(changed, added)
+	if err != nil {
+		return nil, err
 	}
-	if len(added) > 0 {
-		fmt.Fprintf(&b, "\n  Newly appeared (not previously trusted):\n")
-		for _, f := range added {
-			fmt.Fprintf(&b, "    %s\n", f)
-		}
+	if !ok {
+		return nil, fmt.Errorf("aborted at trust prompt")
 	}
-	fmt.Fprintf(&b, "\nRun `kubetin -trust` to re-bless these files.\n")
-
-	if len(d.Contexts) == 0 {
-		// Nothing trusted at all — full stop.
-		return nil, fmt.Errorf("%s", b.String())
+	for _, f := range untrusted {
+		_ = tl.Add(f)
 	}
-	// Some files are trusted; warn about the rest and continue.
-	fmt.Fprint(os.Stderr, b.String())
-	return d, nil
+	if err := tl.Save(); err != nil {
+		return nil, fmt.Errorf("save trust list: %w", err)
+	}
+	d, _, err = kubeconfig.DiscoverTrusted(tl)
+	return d, err
 }
 
 func promptTrustAll(files []string) (bool, error) {
@@ -154,7 +151,38 @@ func promptTrustAll(files []string) (bool, error) {
 	fmt.Println()
 	fmt.Println("Each kubeconfig may invoke external auth plugins (gke-gcloud-auth-plugin,")
 	fmt.Println("aws-iam-auth, kubelogin, …) at connect time. Only add files you trust.")
-	fmt.Print("Trust all of the above and continue? [y/N] ")
+	return askYesNo("Trust all of the above and continue? [y/N] ")
+}
+
+// promptTrustChanges runs the same shape of prompt as promptTrustAll,
+// but for the case where the trust list already exists and some
+// discovered files no longer match it. Sections are emitted only when
+// non-empty so the prompt stays scannable when only one bucket applies
+// (e.g. just an `oc login` token rotation).
+func promptTrustChanges(changed, added []string) (bool, error) {
+	fmt.Println("kubetin: kubeconfig trust list has unverified entries.")
+	if len(changed) > 0 {
+		fmt.Println()
+		fmt.Println("  Content changed (e.g. `oc login` / `gcloud …` / kubelogin rotated a token):")
+		for _, f := range changed {
+			fmt.Printf("    %s\n", f)
+		}
+	}
+	if len(added) > 0 {
+		fmt.Println()
+		fmt.Println("  Newly appeared (not previously trusted):")
+		for _, f := range added {
+			fmt.Printf("    %s\n", f)
+		}
+	}
+	fmt.Println()
+	fmt.Println("Each kubeconfig may invoke external auth plugins at connect time.")
+	fmt.Println("Only re-trust if you recognise the change.")
+	return askYesNo("Re-trust all of the above and continue? [y/N] ")
+}
+
+func askYesNo(prompt string) (bool, error) {
+	fmt.Print(prompt)
 	r := bufio.NewReader(os.Stdin)
 	line, err := r.ReadString('\n')
 	if err != nil {
