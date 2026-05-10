@@ -27,11 +27,20 @@ package main
 import (
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // silenceStderr replaces fd 2 with /dev/null and returns a function
 // that restores the original stderr. Errors are non-fatal — if the
 // platform misbehaves we just don't get the protection.
+//
+// We use unix.Dup2 from golang.org/x/sys/unix instead of syscall.Dup2
+// because syscall.Dup2 isn't provided on linux/arm64 (and other
+// newer Linux architectures) — those archs only expose dup3(2), and
+// the stdlib syscall package never wrapped it. unix.Dup2 abstracts
+// over this: real Dup2 where it exists, Dup3(…, 0) where it doesn't.
+// syscall.Dup and syscall.Close still work cross-arch.
 func silenceStderr() (restore func(), err error) {
 	saved, err := syscall.Dup(2)
 	if err != nil {
@@ -42,7 +51,7 @@ func silenceStderr() (restore func(), err error) {
 		_ = syscall.Close(saved)
 		return func() {}, err
 	}
-	if err := syscall.Dup2(int(null.Fd()), 2); err != nil {
+	if err := unix.Dup2(int(null.Fd()), 2); err != nil {
 		_ = null.Close()
 		_ = syscall.Close(saved)
 		return func() {}, err
@@ -50,7 +59,7 @@ func silenceStderr() (restore func(), err error) {
 	_ = null.Close() // dup2 keeps it open via fd 2
 
 	return func() {
-		_ = syscall.Dup2(saved, 2)
+		_ = unix.Dup2(saved, 2)
 		_ = syscall.Close(saved)
 	}, nil
 }
