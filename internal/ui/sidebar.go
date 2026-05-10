@@ -26,9 +26,21 @@ func (m Model) renderSidebar(height int) string {
 	})
 
 	header := m.Theme.Header.Render(fmt.Sprintf(" CLUSTERS (%d)", len(snap)))
+	// Inner separator: same colour (236) as the rail's right-edge
+	// vertical separator, sized to the sidebar's content width. Used
+	// to visually group each cluster's row (+ optional bars line) so a
+	// long fleet doesn't read as one wall of text.
+	innerSep := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("236")).
+		Render(strings.Repeat("─", SidebarWidth-1))
+
 	var lines []string
 	lines = append(lines, header)
-	for _, st := range snap {
+	lines = append(lines, innerSep)
+	for i, st := range snap {
+		if i > 0 {
+			lines = append(lines, innerSep)
+		}
 		lines = append(lines, m.renderSidebarRow(st))
 		if st.MetricsAvailable && st.AllocCPUMilli > 0 {
 			lines = append(lines, m.renderSidebarBars(st))
