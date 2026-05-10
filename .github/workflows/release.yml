@@ -1,0 +1,106 @@
+# Driven by release-please (https://github.com/googleapis/release-please).
+#
+# Use conventional-commit subject lines on PR merges into main:
+#   feat: new search-by-namespace shortcut
+#   fix: stop crashing on empty kubeconfig
+#   chore: bump dependencies
+#
+# release-please watches those, opens a PR titled "chore(main): release X.Y.Z"
+# that contains the bumped CHANGELOG. Merging that PR tags + creates the
+# GitHub Release; the build matrix below then attaches the binaries to it.
+#
+# Single workflow on purpose: GITHUB_TOKEN-driven tag pushes do NOT trigger
+# other workflows, so we can't have a separate "on tag" workflow build the
+# binaries. Doing it all in one workflow avoids the need for a personal
+# access token.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: go
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          base="kubetin-${{ needs.release-please.outputs.tag_name }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          go build -trimpath -ldflags="-s -w" -o "dist/${base}/kubetin" ./cmd/kubetin
+          cp LICENSE README.md "dist/${base}/"
+          tar -czf "dist/${base}.tar.gz" -C dist "${base}"
+          (cd dist && shasum -a 256 "${base}.tar.gz" > "${base}.tar.gz.sha256")
+          rm -rf "dist/${base}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kubetin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 7
+
+  upload:
+    name: attach binaries to release
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: aggregate checksums
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          rm -f *.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS

@@ -1,0 +1,10 @@
+# Build output
+/bin/
+
+# Local Claude Code settings (do not commit)
+/.claude/
+
+# Editor / OS clutter
+.DS_Store
+*.swp
+*~
