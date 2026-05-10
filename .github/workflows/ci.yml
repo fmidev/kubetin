@@ -34,16 +34,16 @@ jobs:
       - name: go test
         run: go test ./...
 
-      - name: go build
-        run: go build ./...
-
-  # Cross-compile for every release-matrix target on every PR. The
-  # native `go build ./...` above only proves the runner's own arch
-  # builds — it missed cmd/kubetin/stderr_unix.go using syscall.Dup2,
-  # which isn't provided on linux/arm64, until the release matrix
-  # blew up post-merge. Matrix must stay in lockstep with release.yml.
+  # Cross-compile for every release-matrix target. Gated on `test`
+  # passing — no point spinning up three full-arch builds if gofmt /
+  # vet / unit tests already broke. Replaces the prior `go build
+  # ./...` step inside `test`, which only covered the runner's own
+  # arch (linux/amd64) — exactly how the cmd/kubetin/stderr_unix.go
+  # `syscall.Dup2` breakage slipped through to the v1.0.0 release.
+  # Matrix must stay in lockstep with release.yml.
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
