@@ -290,7 +290,7 @@ func (m Model) renderNodeTable(maxRows, _ int) string {
 			padCol(r.KernelVer, colKernel, m.Theme.Base) + "  " +
 			padCol(r.Runtime, colRuntime, m.Theme.Base)
 		if r.UID == m.cursor {
-			line = m.Theme.Selected.Render(line)
+			line = renderSelected(line)
 		}
 		b.WriteString(line)
 		b.WriteByte('\n')

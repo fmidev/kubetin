@@ -122,7 +122,7 @@ func (m Model) renderActionMenu(canvasWidth, canvasHeight int) string {
 		}
 		line := fmt.Sprintf("%s %s", marker, style.Render(label))
 		if i == m.actionMenu.cursor {
-			line = m.Theme.Selected.Render(line)
+			line = renderSelected(line)
 		}
 		b.WriteString(line + "\n")
 	}

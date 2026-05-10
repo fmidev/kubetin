@@ -59,7 +59,7 @@ func (m Model) renderNsPicker(canvasWidth, canvasHeight int) string {
 		text := truncate(opt, w-6)
 		line := fmt.Sprintf("%s %s", marker, text)
 		if i+startIdx == m.nsPickerCursor {
-			line = m.Theme.Selected.Render(line)
+			line = renderSelected(line)
 		}
 		b.WriteString(line + "\n")
 	}

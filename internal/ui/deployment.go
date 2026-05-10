@@ -154,7 +154,7 @@ func (m Model) renderDeployTable(maxRows, _ int) string {
 			padColRight(fmt.Sprintf("%d", r.Available), colAvail, m.Theme.Base) + "  " +
 			padColRight(formatAge(r.CreatedAt), colAge, m.Theme.Base)
 		if r.UID == m.cursor {
-			line = m.Theme.Selected.Render(line)
+			line = renderSelected(line)
 		}
 		b.WriteString(line)
 		b.WriteByte('\n')

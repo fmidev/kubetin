@@ -746,7 +746,7 @@ func (m Model) renderContainerPicker(canvasWidth, canvasHeight int) string {
 		}
 		line := fmt.Sprintf("%s %s", marker, c)
 		if i == m.logs.pickerCur {
-			line = m.Theme.Selected.Render(line)
+			line = renderSelected(line)
 		}
 		b.WriteString(line + "\n")
 	}

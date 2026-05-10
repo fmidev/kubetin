@@ -29,7 +29,7 @@ func DefaultTheme() Theme {
 		Dim:       lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
 		Header:    lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#dddddd")),
 		Footer:    lipgloss.NewStyle().Foreground(lipgloss.Color("244")),
-		Selected:  lipgloss.NewStyle().Reverse(true),
+		Selected:  lipgloss.NewStyle().Background(lipgloss.Color("#3a3a3a")),
 		Title:     lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7dd3fc")),
 		StatusOK:  lipgloss.NewStyle().Foreground(lipgloss.Color("#4ade80")),
 		StatusBad: lipgloss.NewStyle().Foreground(lipgloss.Color("#f87171")),

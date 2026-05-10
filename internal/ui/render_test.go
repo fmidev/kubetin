@@ -57,3 +57,61 @@ func TestPadColRight_VisibleWidthInvariant(t *testing.T) {
 		t.Fatalf("padColRight should be right-justified, got %q", got)
 	}
 }
+
+// bgOn is the SGR sequence renderSelected emits — kept here so a
+// drift between the production code and the tests fails loudly
+// rather than silently passing both sides on the wrong colour.
+const selectedBgOn = "\x1b[48;2;58;58;58m"
+
+// renderSelected must keep the background-on SGR alive across inner
+// ANSI resets, otherwise the highlight visibly drops after the first
+// coloured cell (the reported pod-row bug). Every `\x1b[0m` in the
+// input must be followed by the bg-on sequence, and lipgloss.Width()
+// must be unchanged.
+func TestRenderSelected_BgSurvivesInnerResets(t *testing.T) {
+	red := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	// Two coloured cells with plain text between/around them — the
+	// shape a real pod row has after warnGlyph + padCol(phase) +
+	// padCellANSI(dots).
+	line := "ns  " + red.Render("Running") + "  " + red.Render("●") + "  rest"
+
+	got := renderSelected(line)
+
+	if !strings.HasPrefix(got, selectedBgOn) {
+		t.Fatalf("renderSelected must start with bg-on, got %q", got)
+	}
+	if !strings.HasSuffix(got, "\x1b[0m") {
+		t.Fatalf("renderSelected must end with full reset, got %q", got)
+	}
+	// Every inner `\x1b[0m` (cell terminator) must be immediately
+	// followed by a fresh bg-on. Count: inner resets in `line` is 2
+	// (one per styled cell); each must have bg-on right after.
+	innerResets := strings.Count(line, "\x1b[0m")
+	if got, want := strings.Count(got, "\x1b[0m"+selectedBgOn), innerResets; got != want {
+		t.Fatalf("inner resets re-armed with bg-on: got %d, want %d", got, want)
+	}
+	// Per-cell foregrounds must be preserved (the whole point of
+	// using bg instead of reverse — the green dot stays green).
+	if !strings.Contains(got, "Running") || !strings.Contains(got, "●") {
+		t.Fatalf("cell content not preserved end-to-end: %q", got)
+	}
+	// No reverse-mode SGR anywhere — that's the prior approach and we
+	// explicitly moved away from it.
+	if strings.Contains(got, "\x1b[7m") {
+		t.Fatalf("reverse-mode SGR leaked into output: %q", got)
+	}
+	// Visible width is preserved (no garbage glyphs, no widening).
+	if lw, rw := lipgloss.Width(line), lipgloss.Width(got); lw != rw {
+		t.Fatalf("visible width changed: line=%d, selected=%d", lw, rw)
+	}
+}
+
+// Cheap path: plain input with no inner resets gets the simple wrap.
+func TestRenderSelected_PlainRowCheapWrap(t *testing.T) {
+	line := "namespace      name        Running   0  5m"
+	got := renderSelected(line)
+	want := selectedBgOn + line + "\x1b[0m"
+	if got != want {
+		t.Fatalf("plain row wrap mismatch:\ngot=%q\nwant=%q", got, want)
+	}
+}
