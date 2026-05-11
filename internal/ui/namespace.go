@@ -130,14 +130,28 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 		colName   = 36
 		colStatus = 14
 		colAge    = 5
+		// Three resource-count sub-columns, headed PODS / DEP / WRN.
+		// PODS gets one extra cell because pod counts hit four digits
+		// on big clusters; DEP and WRN stay at 3 because anything
+		// over 999 deployments in one namespace is its own problem.
+		colPods   = 4
+		colDeps   = 3
+		colWarn   = 3
 		colLabels = 60
 	)
+
+	// Single-pass count of pods / deploys / warning events per
+	// namespace. Avoids O(N · (P+D+E)) inside the row loop.
+	counts := m.collectNsCounts()
 
 	hdr := m.Theme.Header
 	header := " " +
 		padCol("NAME", colName, hdr) + "  " +
 		padCol("STATUS", colStatus, hdr) + "  " +
 		padColRight("AGE", colAge, hdr) + "  " +
+		padColRight("PODS", colPods, hdr) + "  " +
+		padColRight("DEP", colDeps, hdr) + "  " +
+		padColRight("WRN", colWarn, hdr) + "  " +
 		padCol("LABELS", colLabels, hdr)
 
 	var b strings.Builder
@@ -183,6 +197,15 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 			statusStyle = m.Theme.StatusWrn
 		}
 
+		c := counts[r.Name]
+		// WRN cell is the whole point of this column — colour-code it
+		// so a problem namespace pops on scan. Dim when zero so the
+		// eye is drawn only to non-empty cells; red when populated.
+		warnStyle := m.Theme.StatusDim
+		if c.warnings > 0 {
+			warnStyle = m.Theme.StatusBad
+		}
+
 		// One leading space replaces the warnGlyph column that the
 		// pod / deploy / node tables use — namespaces don't have a
 		// useful "has-recent-warning" signal of their own.
@@ -190,6 +213,9 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 			padCol(r.Name, colName, m.Theme.Base) + "  " +
 			padCol(string(r.Phase), colStatus, statusStyle) + "  " +
 			padColRight(formatAge(r.CreatedAt), colAge, m.Theme.Base) + "  " +
+			padColRight(itoa(c.pods), colPods, m.Theme.Base) + "  " +
+			padColRight(itoa(c.deploys), colDeps, m.Theme.Base) + "  " +
+			padColRight(itoa(c.warnings), colWarn, warnStyle) + "  " +
 			padCol(labelSummary(r.Labels, colLabels), colLabels, m.Theme.Dim)
 		if r.UID == m.cursor {
 			line = renderSelected(line)
@@ -198,4 +224,49 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// nsCount holds the per-namespace counts for one render pass.
+// Built by collectNsCounts in a single walk over the in-memory
+// caches; consumed by renderNamespacesView one row at a time.
+type nsCount struct {
+	pods     int
+	deploys  int
+	warnings int
+}
+
+// collectNsCounts walks pods / deployments / events once and groups
+// counts by namespace name. O(P+D+E), not O(N·(P+D+E)) — important
+// for big clusters where naive per-row counting would scan thousands
+// of pods for each of dozens of namespaces.
+//
+// WRN counts ONLY Type=="Warning" events. Normal-class events are
+// noise and would dominate the cell; the whole point of the column
+// is to surface "where the problems are."
+//
+// Counts reflect only what kubetin has cached on the focused
+// cluster. The watchers are usually synced within a couple of
+// seconds; before then counts will show 0, which is the same
+// trade-off every other view already makes.
+func (m Model) collectNsCounts() map[string]nsCount {
+	out := make(map[string]nsCount)
+	for _, p := range m.pods {
+		c := out[p.Namespace]
+		c.pods++
+		out[p.Namespace] = c
+	}
+	for _, d := range m.deployments {
+		c := out[d.Namespace]
+		c.deploys++
+		out[d.Namespace] = c
+	}
+	for _, e := range m.events {
+		if e.Type != "Warning" {
+			continue
+		}
+		c := out[e.Namespace]
+		c.warnings++
+		out[e.Namespace] = c
+	}
+	return out
 }
