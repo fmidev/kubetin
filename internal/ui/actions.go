@@ -226,26 +226,9 @@ func (m Model) renderActionMenuPanel() string {
 
 	var b strings.Builder
 
-	// Resource ident block: aligned label + value rows so the user
-	// reads kind / namespace / cluster context at a glance. Labels
-	// (POD:, NS:, CLS:) sit dim; the values carry the colour. The
-	// "ACTIONS" title sits in the top border (spliced in below).
-	rows := m.actionMenuIdentRows()
-	maxLabel := 0
-	for _, r := range rows {
-		if w := lipgloss.Width(r.label); w > maxLabel {
-			maxLabel = w
-		}
-	}
-	for _, r := range rows {
-		labelStyled := m.Theme.Dim.Render(r.label)
-		pad := strings.Repeat(" ", maxLabel-lipgloss.Width(r.label)+1)
-		valueBudget := innerW - maxLabel - 1
-		value := r.valStyle.Render(truncate(r.value, valueBudget))
-		b.WriteString(labelStyled + pad + value + "\n")
-	}
-	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
-
+	// Resource ident is carried by the border: ns/name in the top
+	// title, cluster in the bottom border. Keeps the dialog body
+	// focused on the action list itself.
 	// A "danger" divider is inserted before the first destructive row
 	// so safe and destructive actions read as separate groups. Only
 	// inserted when there's at least one of each — menus for read-only
@@ -280,80 +263,62 @@ func (m Model) renderActionMenuPanel() string {
 		Width(w).
 		Render(b.String())
 
-	// Splice "ACTIONS" into the top border, centred. Reuses the same
-	// ANSI-aware splicer the floating overlay uses.
-	return setBorderTitle(box, m.Theme.Title.Render("ACTIONS"))
+	// Top border: <ns>/<name> in Title style (or just the name when
+	// the resource is cluster-scoped). Bottom border: cluster context
+	// in Dim. Reserve 6 cells of border + spacing on each side when
+	// truncating long names so the title never collides with corners.
+	const titleBudget = w - 6
+	top := m.Theme.Title.Render(truncate(actionMenuTitle(m.actionMenu.ref), titleBudget))
+	bottom := ""
+	if m.WatchedContext != "" {
+		bottom = m.Theme.Dim.Render(truncate(m.WatchedContext, titleBudget))
+	}
+	return setBorderTitles(box, top, bottom)
 }
 
-// setBorderTitle replaces the middle ─ chars of the box's top border
-// line with " title ". The title carries its own colour; the border
-// chars on either side keep their original (dim 244) style.
-func setBorderTitle(box, title string) string {
-	if box == "" || title == "" {
+// actionMenuTitle returns the namespace/name pair shown in the top
+// border. Falls back to "ACTIONS" if the cursor row is empty (the
+// modal should never open in that state, but the guard keeps the
+// title from going blank if it does).
+func actionMenuTitle(ref cluster.DescribeRef) string {
+	if ref.Name == "" {
+		return "ACTIONS"
+	}
+	if ref.Namespace != "" {
+		return ref.Namespace + "/" + ref.Name
+	}
+	return ref.Name
+}
+
+// setBorderTitles splices top/bottom labels into the box's first and
+// last lines respectively. Either label may be empty (the splice for
+// that line is skipped). Reuses the ANSI-aware spliceLine helper so
+// border colour state outside the label is preserved.
+func setBorderTitles(box, top, bottom string) string {
+	if box == "" {
 		return box
 	}
 	lines := strings.Split(box, "\n")
 	if len(lines) == 0 {
 		return box
 	}
-	decorated := " " + title + " "
-	decoratedW := lipgloss.Width(decorated)
-	topW := lipgloss.Width(lines[0])
-	col := (topW - decoratedW) / 2
-	if col < 1 {
-		col = 1
+	if top != "" {
+		lines[0] = spliceCentered(lines[0], top)
 	}
-	lines[0] = spliceLine(lines[0], decorated, col)
+	if bottom != "" && len(lines) > 1 {
+		last := len(lines) - 1
+		lines[last] = spliceCentered(lines[last], bottom)
+	}
 	return strings.Join(lines, "\n")
 }
 
-// identRow is one row in the resource-ident block at the top of the
-// action menu (e.g. "POD: foo", "NS: bar", "CLS: kenya"). Stored as
-// (label, value, style) so the renderer can column-align all rows to
-// the widest label without case-splitting on every render.
-type identRow struct {
-	label    string
-	value    string
-	valStyle lipgloss.Style
-}
-
-// actionMenuIdentRows returns the label/value rows for the current
-// menu target: the resource kind line (POD/DEP/NODE/NS), the
-// namespace (when the resource has one and isn't itself a Namespace),
-// and the cluster context. Always shown; cheap and unambiguous beats
-// "hide when only one cluster is configured".
-func (m Model) actionMenuIdentRows() []identRow {
-	ref := m.actionMenu.ref
-	out := []identRow{}
-
-	var kindLabel string
-	switch ref.Kind {
-	case "Pod":
-		kindLabel = "POD:"
-	case "Deployment":
-		kindLabel = "DEP:"
-	case "Node":
-		kindLabel = "NODE:"
-	case "Namespace":
-		kindLabel = "NS:"
-	default:
-		if ref.Kind != "" {
-			kindLabel = strings.ToUpper(ref.Kind) + ":"
-		}
+func spliceCentered(line, label string) string {
+	decorated := " " + label + " "
+	col := (lipgloss.Width(line) - lipgloss.Width(decorated)) / 2
+	if col < 1 {
+		col = 1
 	}
-	if kindLabel != "" && ref.Name != "" {
-		out = append(out, identRow{kindLabel, ref.Name, m.Theme.Title})
-	}
-
-	if ref.Namespace != "" && ref.Kind != "Namespace" {
-		out = append(out, identRow{"NS:", ref.Namespace, m.Theme.Header})
-	}
-
-	if m.WatchedContext != "" {
-		out = append(out, identRow{"CLS:", m.WatchedContext, m.Theme.Header})
-	}
-
-	return out
+	return spliceLine(line, decorated, col)
 }
 
 // actionRow builds one menu row at width innerW. The trailing status
