@@ -346,7 +346,7 @@ func (m Model) actionMenuIdentRows() []identRow {
 	}
 
 	if ref.Namespace != "" && ref.Kind != "Namespace" {
-		out = append(out, identRow{"NS:", ref.Namespace, m.Theme.Dim})
+		out = append(out, identRow{"NS:", ref.Namespace, m.Theme.Header})
 	}
 
 	if m.WatchedContext != "" {
