@@ -33,6 +33,8 @@ func TestViewFitsCanvas(t *testing.T) {
 		{"nodes/narrow", 80, 24, ViewNodes, nil},
 		{"deploy/wide", 200, 50, ViewDeployments, nil},
 		{"events/wide", 200, 50, ViewEvents, nil},
+		{"namespaces/wide", 200, 50, ViewNamespaces, nil},
+		{"namespaces/narrow", 80, 24, ViewNamespaces, nil},
 		{"overview/wide", 200, 50, ViewOverview, nil},
 		{"overview/narrow", 80, 24, ViewOverview, nil},
 

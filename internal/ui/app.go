@@ -27,6 +27,9 @@ type DeployEventMsg cluster.DeployEvent
 // EvtEventMsg wraps a cluster.EventEvent for tea.Program.Send.
 type EvtEventMsg cluster.EventEvent
 
+// NsEventMsg wraps a cluster.NamespaceEvent for tea.Program.Send.
+type NsEventMsg cluster.NamespaceEvent
+
 // MetricsSnapshotMsg wraps a focused-cluster metrics snapshot.
 type MetricsSnapshotMsg cluster.MetricsSnapshot
 
@@ -64,6 +67,7 @@ const (
 	ViewDeployments
 	ViewNodes
 	ViewEvents
+	ViewNamespaces
 	ViewOverview // fleet overview, full-screen cards
 )
 
@@ -136,6 +140,7 @@ type Model struct {
 	nodes         map[types.UID]nodeRow
 	deployments   map[types.UID]deploymentRow
 	events        map[types.UID]eventRow
+	namespaces    map[types.UID]nsRow
 	view          View
 	cursor        types.UID
 	width         int
@@ -149,8 +154,8 @@ type Model struct {
 	// of that kind. Used so the empty-table placeholder can distinguish
 	// "still syncing" from "synced with zero rows" — otherwise a Tab to
 	// a cluster with no pods looks identical to a stuck informer.
-	syncedPods, syncedNodes, syncedDeploys, syncedEvents bool
-	syncStartedAt                                        time.Time
+	syncedPods, syncedNodes, syncedDeploys, syncedEvents, syncedNamespaces bool
+	syncStartedAt                                                          time.Time
 
 	// Cluster-aggregate network rates, last sample. clusterNetOK is
 	// false until the first non-error NetworkSnapshotMsg arrives —
@@ -207,6 +212,7 @@ func New(context string, store *model.Store, contexts []string) Model {
 		nodes:          make(map[types.UID]nodeRow),
 		deployments:    make(map[types.UID]deploymentRow),
 		events:         make(map[types.UID]eventRow),
+		namespaces:     make(map[types.UID]nsRow),
 		permissions:    make(map[string]bool),
 	}
 }
@@ -317,6 +323,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		applyEvtEvent(m.events, cluster.EventEvent(msg))
 		m.syncedEvents = true
+		return m, nil
+
+	case NsEventMsg:
+		if msg.Context != m.WatchedContext {
+			return m, nil
+		}
+		applyNsEvent(m.namespaces, cluster.NamespaceEvent(msg))
+		m.syncedNamespaces = true
 		return m, nil
 
 	case DescribeResultMsg:
@@ -588,8 +602,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.nodes = make(map[types.UID]nodeRow)
 		m.deployments = make(map[types.UID]deploymentRow)
 		m.events = make(map[types.UID]eventRow)
+		m.namespaces = make(map[types.UID]nsRow)
 		m.cursor = ""
-		m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents = false, false, false, false
+		m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents, m.syncedNamespaces = false, false, false, false, false
 		m.syncStartedAt = time.Now()
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
 		// A scoped object on the previous cluster doesn't exist on the
@@ -702,6 +717,13 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = ""
 		}
 		m.eventScope = nil
+	case "5":
+		if m.view != ViewNamespaces {
+			m.view = ViewNamespaces
+			m.cursor = ""
+			m.eventScope = nil
+			m.anchorCursorToVisible()
+		}
 	case "/":
 		m.filterFocused = true
 	case "n":
@@ -1001,6 +1023,21 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
 		return m.openDrainConfirm(ref)
+	case ActSetNamespace:
+		ref := m.actionMenu.ref
+		m.actionMenu.open = false
+		// Client-side only — no apiserver call. Switch the namespace
+		// filter, jump to the Pods view (the most common reason you
+		// scoped to a namespace is to see what's running in it), and
+		// surface a toast so the action feels acknowledged. Cursor
+		// resets because the previous-view cursor wouldn't map.
+		m.namespace = ref.Name
+		m.view = ViewPods
+		m.cursor = ""
+		m.anchorCursorToVisible()
+		m.toast = "ns:" + ref.Name
+		m.toastUntil = time.Now().Add(2 * time.Second)
+		return m, tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
 	case ActDelete:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1315,6 +1352,8 @@ func (m Model) mainPane(height, width int) string {
 		return m.renderDeployTable(height, width)
 	case ViewEvents:
 		return m.renderEventsView(height, width)
+	case ViewNamespaces:
+		return m.renderNamespacesView(height, width)
 	}
 	return m.renderTable(height, width)
 }
@@ -1359,6 +1398,21 @@ func (m Model) visibleUIDs() []types.UID {
 				continue
 			}
 			out = append(out, uid)
+		}
+		return out
+	case ViewNamespaces:
+		// Namespaces are cluster-scoped so the m.namespace filter
+		// doesn't apply — selecting "ns: foo" then opening the ns
+		// view should still show every namespace. We sort by Name
+		// here so the cursor logic walks the table in the same order
+		// the renderer paints it.
+		rows := sortedNsRows(m.namespaces)
+		out := make([]types.UID, 0, len(rows))
+		for _, r := range rows {
+			if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
+				continue
+			}
+			out = append(out, r.UID)
 		}
 		return out
 	case ViewOverview:
@@ -1452,6 +1506,9 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 	case ViewEvents:
 		viewLabel = "events"
 		total = len(m.events)
+	case ViewNamespaces:
+		viewLabel = "namespaces"
+		total = len(m.namespaces)
 	}
 	title := m.Theme.Title.Render(
 		fmt.Sprintf(" kubetin %s · ns:%s · %s ", strings.TrimSpace(display), ns, viewLabel),
@@ -1616,6 +1673,8 @@ func (m Model) filterCounts() (matched, total int) {
 		total = len(m.deployments)
 	case ViewEvents:
 		total = len(m.events)
+	case ViewNamespaces:
+		total = len(m.namespaces)
 	default:
 		total = len(m.pods)
 	}
