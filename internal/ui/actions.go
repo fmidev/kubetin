@@ -15,6 +15,7 @@ type Action int
 const (
 	ActDescribe Action = iota
 	ActLogs
+	ActExec
 	ActEvents
 	ActScale
 	ActRestart
@@ -27,6 +28,8 @@ func (a Action) Label() string {
 		return "Describe"
 	case ActLogs:
 		return "Logs"
+	case ActExec:
+		return "Exec (shell)"
 	case ActEvents:
 		return "Events"
 	case ActScale:
@@ -48,7 +51,7 @@ func (a Action) destructive() bool { return a == ActDelete }
 func actionsFor(kind string) []Action {
 	switch kind {
 	case "Pod":
-		return []Action{ActDescribe, ActLogs, ActEvents, ActDelete}
+		return []Action{ActDescribe, ActLogs, ActExec, ActEvents, ActDelete}
 	case "Deployment":
 		return []Action{ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
 	case "Node":
@@ -95,6 +98,13 @@ func verbsForAction(a Action, ref cluster.DescribeRef) (av actionVerb, gated boo
 		// have populated that cache, so gate on the same verb so we
 		// don't offer a menu item the user's RBAC can't actually feed.
 		return actionVerb{"list", "", "events"}, true
+	case ActExec:
+		// `kubectl exec` is `create pods/exec` under the covers — a
+		// subresource POST that opens a streaming session. Many
+		// developer-tier roles get pods/get + pods/log but not
+		// pods/exec; hiding the menu item when denied avoids users
+		// hitting Enter on something they'll never be allowed to run.
+		return actionVerb{"create", "", "pods/exec"}, true
 	}
 	return actionVerb{}, false
 }

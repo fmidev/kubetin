@@ -107,6 +107,14 @@ type Model struct {
 	// OnLogsStop cancels the active log stream.
 	OnLogsStop func()
 
+	// OnExec opens an interactive shell into a pod container. Unlike
+	// the other callbacks which return a tea.Msg (synchronous fetch),
+	// exec is a terminal hand-off: the callback returns a tea.Cmd
+	// that wraps tea.Exec(cluster.ExecCmd) so bubbletea releases the
+	// alt-screen for the lifetime of the session and reclaims it on
+	// the user's `exit` / `Ctrl-D`.
+	OnExec func(focusedCtx string, ref cluster.DescribeRef, container string, command []string) tea.Cmd
+
 	pods          map[types.UID]podRow
 	nodes         map[types.UID]nodeRow
 	deployments   map[types.UID]deploymentRow
@@ -150,6 +158,7 @@ type Model struct {
 	scaleConfirm   scaleConfirmState
 	restartConfirm restartConfirmState
 	logs           logsState
+	exec           execState
 	permissions    map[string]bool // cached SSAR results, keyed via cluster.PermissionKey
 	overviewScroll int
 	toast          string // ephemeral one-line status (e.g. "Deleted Pod/foo")
@@ -220,6 +229,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.actionMenu.open {
 			return m.handleActionMenuKey(msg)
+		}
+		if m.exec.pickerOpen {
+			return m.handleExecPickerKey(msg)
 		}
 		if m.nsPickerOpen {
 			return m.handleNsPickerKey(msg)
@@ -342,6 +354,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.toastUntil = time.Now().Add(4 * time.Second)
 		return m, tea.Tick(4*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
+
+	case ExecDoneMsg:
+		// Bubbletea has already reclaimed the alt-screen by the time
+		// this arrives. We only need to surface non-nil errors so a
+		// failed setup ("rbac: create pods/exec denied", "container
+		// not running", etc.) doesn't disappear silently into the
+		// regained TUI. Clean exits (user typed `exit` / Ctrl-D)
+		// land here with msg.Err == nil and produce no toast.
+		if msg.Err != nil {
+			m.toast = fmt.Sprintf("✕ Exec: %s", msg.Err.Error())
+			m.toastUntil = time.Now().Add(6 * time.Second)
+			return m, tea.Tick(6*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
+		}
+		return m, nil
 
 	case ScaleResultMsg:
 		res := cluster.ScaleResult(msg)
@@ -844,6 +870,10 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
 		return m.openLogsForCursor(ref)
+	case ActExec:
+		ref := m.actionMenu.ref
+		m.actionMenu.open = false
+		return m.openExec(ref)
 	case ActEvents:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1129,7 +1159,7 @@ func (m Model) View() string {
 
 	// Overlay precedence (highest first):
 	// logs → confirms (delete/scale/restart) → describe → action menu
-	// → help → ns picker.
+	// → exec picker → help → ns picker.
 	switch {
 	case m.logs.open:
 		body = m.renderLogs(m.width, bodyHeight)
@@ -1143,6 +1173,8 @@ func (m Model) View() string {
 		body = m.renderDescribe(m.width, bodyHeight)
 	case m.actionMenu.open:
 		body = m.renderActionMenu(m.width, bodyHeight)
+	case m.exec.pickerOpen:
+		body = m.renderExecPicker(m.width, bodyHeight)
 	case m.helpOpen:
 		body = m.renderHelp(m.width, bodyHeight)
 	case m.nsPickerOpen:

@@ -239,6 +239,35 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	// Make sure we stop the stream on shutdown.
 	defer stopLogs()
 
+	// Wire exec. The callback returns a tea.Cmd rather than a tea.Msg
+	// because exec needs the program to release the alt-screen for
+	// the lifetime of the session, which is exactly what tea.Exec
+	// provides. The audit log lands two lines: one when kubetin
+	// requests the session (before the apiserver call), one when the
+	// session ends with the outcome. NewExecCmd failing means we
+	// never reached the apiserver — short-circuit with ExecDoneMsg
+	// so the UI surfaces the error without an empty terminal flicker.
+	m.OnExec = func(focusedCtx string, ref cluster.DescribeRef, container string, command []string) tea.Cmd {
+		klog.Infof("exec: %s container=%s in ns/%s on %s cmd=%v requested",
+			ref.Name, container, ref.Namespace, focusedCtx, command)
+		execCmd, err := sup.NewExecCmd(focusedCtx, ref.Namespace, ref.Name, container, command)
+		if err != nil {
+			klog.Errorf("exec: %s container=%s on %s setup FAILED: %v",
+				ref.Name, container, focusedCtx, err)
+			return func() tea.Msg { return ui.ExecDoneMsg{Err: err} }
+		}
+		return tea.Exec(execCmd, func(execErr error) tea.Msg {
+			if execErr != nil {
+				klog.Errorf("exec: %s container=%s on %s ended with error: %v",
+					ref.Name, container, focusedCtx, execErr)
+			} else {
+				klog.Infof("exec: %s container=%s on %s ended cleanly",
+					ref.Name, container, focusedCtx)
+			}
+			return ui.ExecDoneMsg{Err: execErr}
+		})
+	}
+
 	// Wire scale.
 	m.OnScale = func(focusedCtx string, ref cluster.DescribeRef, replicas int32) tea.Msg {
 		klog.Infof("scale: %s/%s in ns/%s on %s → %d requested",
