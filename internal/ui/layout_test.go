@@ -48,6 +48,10 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.describe.result.YAML = strings.Repeat("yaml line\n", 60)
 		}},
 		{"action-menu", 120, 40, ViewPods, func(m *Model) { m.actionMenu.open = true }},
+		{"exec-picker", 120, 40, ViewPods, func(m *Model) {
+			m.exec.pickerOpen = true
+			m.exec.containers = []string{"app", "sidecar", "istio-proxy"}
+		}},
 		{"ns-picker", 120, 40, ViewPods, func(m *Model) {
 			m.nsPickerOpen = true
 			m.nsPickerOptions = []string{"(all namespaces)", "default", "kube-system"}
