@@ -56,6 +56,7 @@ var helpGroups = []helpGroup{
 			{"2", "deployments"},
 			{"3", "nodes"},
 			{"4", "events"},
+			{"5", "namespaces"},
 		},
 	},
 	{

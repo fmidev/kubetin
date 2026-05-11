@@ -61,6 +61,13 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 				Name: r.Name,
 			}, true
 		}
+	case ViewNamespaces:
+		if r, ok := m.namespaces[m.cursor]; ok {
+			return cluster.DescribeRef{
+				Version: "v1", Resource: "namespaces", Kind: "Namespace",
+				Name: r.Name,
+			}, true
+		}
 	}
 	return cluster.DescribeRef{}, false
 }

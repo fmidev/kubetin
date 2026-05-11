@@ -22,6 +22,7 @@ const (
 	ActCordon
 	ActUncordon
 	ActDrain
+	ActSetNamespace
 	ActDelete
 )
 
@@ -45,6 +46,8 @@ func (a Action) Label() string {
 		return "Uncordon"
 	case ActDrain:
 		return "Drain"
+	case ActSetNamespace:
+		return "Set as active namespace"
 	case ActDelete:
 		return "Delete"
 	}
@@ -71,6 +74,11 @@ func actionsFor(kind string) []Action {
 		return []Action{ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
 	case "Node":
 		return []Action{ActDescribe, ActEvents, ActCordon, ActUncordon, ActDrain}
+	case "Namespace":
+		// Set-as-active first because that's the by-far most-frequent
+		// action on a namespace row — the user already has the cursor
+		// on it, one Enter saves three keystrokes from the picker.
+		return []Action{ActSetNamespace, ActDescribe, ActEvents, ActDelete}
 	}
 	return []Action{ActDescribe}
 }

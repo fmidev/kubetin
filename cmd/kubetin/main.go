@@ -577,6 +577,19 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 		}
 	}()
 
+	// Namespace watcher is cluster-scoped; on namespace-restricted
+	// users (typical OpenShift project) the watcher itself no-ops
+	// via the Supervisor.ResolveScope check inside Run(), so we can
+	// always spawn it — RBAC checks live one layer down rather than
+	// being duplicated here.
+	nsw := cluster.NewNamespaceWatcher(target, 256)
+	go forwardNsEvents(child, nsw, c.prog)
+	go func() {
+		if err := nsw.Run(child, c.sup); err != nil {
+			klog.Errorf("namespace watcher (%s) exited: %v", target, err)
+		}
+	}()
+
 	mp := cluster.NewFocusedMetricsPoller(target, 4)
 	go forwardMetrics(child, mp, c.prog)
 	go func() {
@@ -638,6 +651,17 @@ func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p *tea.Progr
 			return
 		case ev := <-w.Out:
 			p.Send(ui.EvtEventMsg(ev))
+		}
+	}
+}
+
+func forwardNsEvents(ctx context.Context, w *cluster.NamespaceWatcher, p *tea.Program) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-w.Out:
+			p.Send(ui.NsEventMsg(ev))
 		}
 	}
 }
