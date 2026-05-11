@@ -38,10 +38,24 @@ type MetricsSnapshotMsg cluster.MetricsSnapshot
 type NetworkSnapshotMsg cluster.NetworkSnapshot
 
 // PermissionResultMsg is fired when a SelfSubjectAccessReview returns.
-// Key matches cluster.PermissionKey().
+// Key matches cluster.PermissionKey(). Context is the origin cluster so
+// the UI receiver can drop results that arrived after the user Tabbed
+// away — same pattern every other async msg uses.
 type PermissionResultMsg struct {
+	Context string
 	Key     string
 	Allowed bool
+	Reason  string // populated for denials; verbatim from SSAR Status.Reason
+	Err     string // populated on transport / RBAC error
+}
+
+// permState is the cached SSAR result. Reason/Err are kept so the
+// RBAC overlay can explain *why* a permission was denied instead of
+// just dropping the bit.
+type permState struct {
+	Allowed bool
+	Reason  string
+	Err     string
 }
 
 // DeleteResultMsg is fired when a Delete call returns.
@@ -189,7 +203,9 @@ type Model struct {
 	drainProgress  drainProgressState
 	logs           logsState
 	exec           execState
-	permissions    map[string]bool // cached SSAR results, keyed via cluster.PermissionKey
+	permissions         map[string]permState // cached SSAR results, keyed via cluster.PermissionKey
+	permissionsInFlight map[string]struct{}  // dispatched but not yet returned; lets the RBAC overlay render "?" without re-firing
+	rbacOpen            bool
 	overviewScroll int
 	toast          string // ephemeral one-line status (e.g. "Deleted Pod/foo")
 	toastUntil     time.Time
@@ -219,7 +235,8 @@ func New(context string, store *model.Store, contexts []string) Model {
 		deployments:    make(map[types.UID]deploymentRow),
 		events:         make(map[types.UID]eventRow),
 		namespaces:     make(map[types.UID]nsRow),
-		permissions:    make(map[string]bool),
+		permissions:         make(map[string]permState),
+		permissionsInFlight: make(map[string]struct{}),
 	}
 }
 
@@ -275,6 +292,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.helpOpen {
 			return m.handleHelpKey(msg)
+		}
+		if m.rbacOpen {
+			return m.handleRBACKey(msg)
 		}
 		if m.filterFocused {
 			return m.handleFilterKey(msg)
@@ -352,7 +372,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case PermissionResultMsg:
-		m.permissions[msg.Key] = msg.Allowed
+		if msg.Context != "" && msg.Context != m.WatchedContext {
+			return m, nil
+		}
+		delete(m.permissionsInFlight, msg.Key)
+		m.permissions[msg.Key] = permState{Allowed: msg.Allowed, Reason: msg.Reason, Err: msg.Err}
 		// If the menu is open and references this key, refresh
 		// its options so newly-allowed actions become visible. Re-
 		// anchor the cursor to the SAME action it was on before — by
@@ -363,13 +387,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.actionMenu.open {
 			var prev Action = -1
 			if m.actionMenu.cursor < len(m.actionMenu.options) {
-				prev = m.actionMenu.options[m.actionMenu.cursor]
+				prev = m.actionMenu.options[m.actionMenu.cursor].Action
 			}
-			m.actionMenu.options = m.permittedActions(m.actionMenu.ref)
-			m.actionMenu.cursor = 0
+			m.actionMenu.options = m.classifiedActions(m.actionMenu.ref)
+			m.actionMenu.cursor = firstSelectable(m.actionMenu.options)
 			if prev >= 0 {
-				for i, a := range m.actionMenu.options {
-					if a == prev {
+				for i, it := range m.actionMenu.options {
+					if it.Action == prev && it.Status == actionAllowed {
 						m.actionMenu.cursor = i
 						break
 					}
@@ -680,6 +704,14 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.debugMode = !m.debugMode
 	case "?":
 		m.helpOpen = !m.helpOpen
+	case "R":
+		m.rbacOpen = !m.rbacOpen
+		if m.rbacOpen {
+			cmds := m.dispatchRBACOverview()
+			if len(cmds) > 0 {
+				return m, tea.Batch(cmds...)
+			}
+		}
 	case "d":
 		return m.openDescribe(false)
 	// Note: Shift-Y at the table level used to dispatch describe
@@ -859,11 +891,11 @@ func (m Model) openActionMenu() (tea.Model, tea.Cmd) {
 	}
 	m.actionMenu.open = true
 	m.actionMenu.ref = ref
-	m.actionMenu.options = m.permittedActions(ref)
-	m.actionMenu.cursor = 0
+	m.actionMenu.options = m.classifiedActions(ref)
+	m.actionMenu.cursor = firstSelectable(m.actionMenu.options)
 	m.actionMenu.notice = ""
 
-	// Dispatch any missing SSAR checks so we can re-filter when results land.
+	// Dispatch any missing SSAR checks so we can re-classify when results land.
 	cmds := m.dispatchPermissionChecks(ref)
 	if len(cmds) > 0 {
 		return m, tea.Batch(cmds...)
@@ -871,19 +903,20 @@ func (m Model) openActionMenu() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// permittedActions filters actionsFor by what we know is allowed.
-// Unknown (uncached) gated actions are HIDDEN until the SSAR returns
-// — better to err on the side of "don't surface a button I might not
-// be allowed to push" than to dangle a forbidden one.
+// classifiedActions returns every applicable action for the row's Kind,
+// each tagged with its RBAC status. Replaces the old permittedActions
+// (which silently dropped denied + pending rows): showing them dimmed
+// is more informative — users now see "Exec (no permission)" instead
+// of an Exec entry that just isn't there.
 //
 // Node has one extra dimension: Cordon and Uncordon are mutually
 // exclusive based on the node's current Schedulable state. We surface
 // only the one that would actually change something — showing both
 // against a cordoned node would let the user "cordon" something
 // already cordoned, which reads as a no-op bug.
-func (m Model) permittedActions(ref cluster.DescribeRef) []Action {
+func (m Model) classifiedActions(ref cluster.DescribeRef) []actionItem {
 	all := actionsFor(ref.Kind)
-	out := make([]Action, 0, len(all))
+	out := make([]actionItem, 0, len(all))
 	var schedulable, hasNode bool
 	if ref.Kind == "Node" {
 		schedulable, hasNode = m.nodeSchedulable(ref.Name)
@@ -899,15 +932,33 @@ func (m Model) permittedActions(ref cluster.DescribeRef) []Action {
 		}
 		av, gated := verbsForAction(a, ref)
 		if !gated {
-			out = append(out, a)
+			out = append(out, actionItem{Action: a, Status: actionAllowed})
 			continue
 		}
 		key := cluster.PermissionKey(m.WatchedContext, av.Verb, av.Group, av.Resource, ref.Namespace)
-		if allowed, ok := m.permissions[key]; ok && allowed {
-			out = append(out, a)
+		if state, ok := m.permissions[key]; ok {
+			if state.Allowed {
+				out = append(out, actionItem{Action: a, Status: actionAllowed})
+			} else {
+				out = append(out, actionItem{Action: a, Status: actionDenied, Reason: state.Reason})
+			}
+			continue
 		}
+		out = append(out, actionItem{Action: a, Status: actionPending})
 	}
 	return out
+}
+
+// firstSelectable returns the index of the first allowed row in opts,
+// or 0 if nothing is selectable yet. Used when (re)opening the menu so
+// the cursor lands on something the user can press Enter on.
+func firstSelectable(opts []actionItem) int {
+	for i, it := range opts {
+		if it.Status == actionAllowed {
+			return i
+		}
+	}
+	return 0
 }
 
 // nodeSchedulable looks up the cached Schedulable state for a node
@@ -924,8 +975,10 @@ func (m Model) nodeSchedulable(name string) (bool, bool) {
 }
 
 // dispatchPermissionChecks emits SSAR commands for gated actions
-// whose permission status we haven't cached yet.
-func (m Model) dispatchPermissionChecks(ref cluster.DescribeRef) []tea.Cmd {
+// whose permission status we haven't cached yet. Marks each dispatched
+// key in-flight so the RBAC overlay (and a second concurrent menu open)
+// can render "?" without re-firing the same SSAR.
+func (m *Model) dispatchPermissionChecks(ref cluster.DescribeRef) []tea.Cmd {
 	if m.OnCanI == nil {
 		return nil
 	}
@@ -940,6 +993,10 @@ func (m Model) dispatchPermissionChecks(ref cluster.DescribeRef) []tea.Cmd {
 		if _, ok := m.permissions[key]; ok {
 			continue
 		}
+		if _, busy := m.permissionsInFlight[key]; busy {
+			continue
+		}
+		m.permissionsInFlight[key] = struct{}{}
 		cb := m.OnCanI
 		ctxName := m.WatchedContext
 		ns := ref.Namespace
@@ -951,7 +1008,44 @@ func (m Model) dispatchPermissionChecks(ref cluster.DescribeRef) []tea.Cmd {
 	return cmds
 }
 
+// dispatchRBACOverview fans out every rbacProbeSet entry against both
+// cluster scope (namespace="") and the active namespace filter (when
+// set). Bounded at ~22 SSARs per cluster; results land via the same
+// PermissionResultMsg path so the cache shape stays single-purpose.
+func (m *Model) dispatchRBACOverview() []tea.Cmd {
+	if m.OnCanI == nil {
+		return nil
+	}
+	scopes := []string{""}
+	if m.namespace != "" {
+		scopes = append(scopes, m.namespace)
+	}
+	cmds := []tea.Cmd{}
+	for _, p := range rbacProbeSet() {
+		for _, ns := range scopes {
+			key := cluster.PermissionKey(m.WatchedContext, p.Verb, p.APIGroup, p.Resource, ns)
+			if _, ok := m.permissions[key]; ok {
+				continue
+			}
+			if _, busy := m.permissionsInFlight[key]; busy {
+				continue
+			}
+			m.permissionsInFlight[key] = struct{}{}
+			cb := m.OnCanI
+			ctxName := m.WatchedContext
+			verb, group, res, scope := p.Verb, p.APIGroup, p.Resource, ns
+			cmds = append(cmds, func() tea.Msg {
+				return cb(ctxName, verb, group, res, scope)
+			})
+		}
+	}
+	return cmds
+}
+
 // handleActionMenuKey routes input while the action menu is open.
+// j/k skip past denied/pending rows so the cursor only ever sits on
+// something Enter can act on. Enter on anything else is a no-op
+// (defensive — the cursor logic should already prevent this).
 func (m Model) handleActionMenuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "esc", "q":
@@ -960,15 +1054,28 @@ func (m Model) handleActionMenuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case "j", "down":
-		if m.actionMenu.cursor < len(m.actionMenu.options)-1 {
-			m.actionMenu.cursor++
+		for i := m.actionMenu.cursor + 1; i < len(m.actionMenu.options); i++ {
+			if m.actionMenu.options[i].Status == actionAllowed {
+				m.actionMenu.cursor = i
+				break
+			}
 		}
 	case "k", "up":
-		if m.actionMenu.cursor > 0 {
-			m.actionMenu.cursor--
+		for i := m.actionMenu.cursor - 1; i >= 0; i-- {
+			if m.actionMenu.options[i].Status == actionAllowed {
+				m.actionMenu.cursor = i
+				break
+			}
 		}
 	case "enter":
-		return m.executeAction(m.actionMenu.options[m.actionMenu.cursor])
+		if m.actionMenu.cursor >= len(m.actionMenu.options) {
+			return m, nil
+		}
+		it := m.actionMenu.options[m.actionMenu.cursor]
+		if it.Status != actionAllowed {
+			return m, nil
+		}
+		return m.executeAction(it.Action)
 	}
 	return m, nil
 }
@@ -1215,6 +1322,12 @@ func (m *Model) cycleFocus(delta int) tea.Cmd {
 		}
 		if st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded {
 			m.WatchedContext = c
+			// Permissions are per-cluster — a stale entry from the old
+			// context would let the new view paint a confident wrong
+			// answer (the RBAC overlay especially, which renders straight
+			// from cache). Drop both caches; they refill on demand.
+			m.permissions = make(map[string]permState)
+			m.permissionsInFlight = make(map[string]struct{})
 			cb := m.OnFocusChange
 			return func() tea.Msg {
 				cb(c)
@@ -1345,6 +1458,8 @@ func (m Model) View() string {
 		body = m.renderExecPicker(m.width, bodyHeight)
 	case m.helpOpen:
 		body = m.renderHelp(m.width, bodyHeight)
+	case m.rbacOpen:
+		body = m.renderRBAC(m.width, bodyHeight)
 	case m.nsPickerOpen:
 		body = m.renderNsPicker(m.width, bodyHeight)
 	}
@@ -1668,7 +1783,7 @@ func (m Model) renderFooter() string {
 	// just noise.
 	overlayOpen := m.logs.open || m.describe.open || m.deleteConfirm.open ||
 		m.scaleConfirm.open || m.restartConfirm.open || m.actionMenu.open ||
-		m.helpOpen || m.nsPickerOpen
+		m.helpOpen || m.nsPickerOpen || m.rbacOpen
 	if !overlayOpen && (m.filterFocused || m.filterText != "") {
 		caret := ""
 		if m.filterFocused {
