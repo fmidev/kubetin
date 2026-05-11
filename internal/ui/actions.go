@@ -224,20 +224,25 @@ func (m Model) renderActionMenuPanel() string {
 		statusAt = innerW - 2
 	)
 
-	ref := m.actionMenu.ref
 	var b strings.Builder
 
-	// Resource ident block: Kind / Name / ns each on their own line.
-	// The "ACTIONS" title sits in the top border (spliced in below)
-	// rather than on its own row, so there's no separate title line.
-	if ref.Kind != "" {
-		b.WriteString(m.Theme.Header.Render(ref.Kind) + "\n")
+	// Resource ident block: aligned label + value rows so the user
+	// reads kind / namespace / cluster context at a glance. Labels
+	// (POD:, NS:, CLS:) sit dim; the values carry the colour. The
+	// "ACTIONS" title sits in the top border (spliced in below).
+	rows := m.actionMenuIdentRows()
+	maxLabel := 0
+	for _, r := range rows {
+		if w := lipgloss.Width(r.label); w > maxLabel {
+			maxLabel = w
+		}
 	}
-	if ref.Name != "" {
-		b.WriteString(m.Theme.Title.Render(truncate(ref.Name, innerW)) + "\n")
-	}
-	if ref.Namespace != "" {
-		b.WriteString(m.Theme.Dim.Render("ns "+truncate(ref.Namespace, innerW-3)) + "\n")
+	for _, r := range rows {
+		labelStyled := m.Theme.Dim.Render(r.label)
+		pad := strings.Repeat(" ", maxLabel-lipgloss.Width(r.label)+1)
+		valueBudget := innerW - maxLabel - 1
+		value := r.valStyle.Render(truncate(r.value, valueBudget))
+		b.WriteString(labelStyled + pad + value + "\n")
 	}
 	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
 
@@ -300,6 +305,55 @@ func setBorderTitle(box, title string) string {
 	}
 	lines[0] = spliceLine(lines[0], decorated, col)
 	return strings.Join(lines, "\n")
+}
+
+// identRow is one row in the resource-ident block at the top of the
+// action menu (e.g. "POD: foo", "NS: bar", "CLS: kenya"). Stored as
+// (label, value, style) so the renderer can column-align all rows to
+// the widest label without case-splitting on every render.
+type identRow struct {
+	label    string
+	value    string
+	valStyle lipgloss.Style
+}
+
+// actionMenuIdentRows returns the label/value rows for the current
+// menu target: the resource kind line (POD/DEP/NODE/NS), the
+// namespace (when the resource has one and isn't itself a Namespace),
+// and the cluster context. Always shown; cheap and unambiguous beats
+// "hide when only one cluster is configured".
+func (m Model) actionMenuIdentRows() []identRow {
+	ref := m.actionMenu.ref
+	out := []identRow{}
+
+	var kindLabel string
+	switch ref.Kind {
+	case "Pod":
+		kindLabel = "POD:"
+	case "Deployment":
+		kindLabel = "DEP:"
+	case "Node":
+		kindLabel = "NODE:"
+	case "Namespace":
+		kindLabel = "NS:"
+	default:
+		if ref.Kind != "" {
+			kindLabel = strings.ToUpper(ref.Kind) + ":"
+		}
+	}
+	if kindLabel != "" && ref.Name != "" {
+		out = append(out, identRow{kindLabel, ref.Name, m.Theme.Title})
+	}
+
+	if ref.Namespace != "" && ref.Kind != "Namespace" {
+		out = append(out, identRow{"NS:", ref.Namespace, m.Theme.Dim})
+	}
+
+	if m.WatchedContext != "" {
+		out = append(out, identRow{"CLS:", m.WatchedContext, m.Theme.Header})
+	}
+
+	return out
 }
 
 // actionRow builds one menu row at width innerW. The trailing status
