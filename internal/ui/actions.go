@@ -226,9 +226,15 @@ func (m Model) renderActionMenuPanel() string {
 
 	var b strings.Builder
 
-	// Resource ident is carried by the border: ns/name in the top
-	// title, cluster in the bottom border. Keeps the dialog body
-	// focused on the action list itself.
+	// Resource ident is split across the border + first row: the top
+	// border carries "<Kind> Actions", the first inner row carries
+	// the centered <ns>/<name>, the bottom border carries the cluster
+	// context. Keeps the dialog body focused on the action list with
+	// minimal chrome.
+	resource := centerLine(actionMenuResource(m.actionMenu.ref), innerW, m.Theme.Title)
+	b.WriteString(resource + "\n")
+	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
+
 	// A "danger" divider is inserted before the first destructive row
 	// so safe and destructive actions read as separate groups. Only
 	// inserted when there's at least one of each — menus for read-only
@@ -263,10 +269,10 @@ func (m Model) renderActionMenuPanel() string {
 		Width(w).
 		Render(b.String())
 
-	// Top border: <ns>/<name> in Title style (or just the name when
-	// the resource is cluster-scoped). Bottom border: cluster context
-	// in Dim. Reserve 6 cells of border + spacing on each side when
-	// truncating long names so the title never collides with corners.
+	// Top border: "<Kind> Actions" in Title style. Bottom border:
+	// cluster context in Dim. Reserve 6 cells of border + spacing on
+	// each side when truncating so the labels never collide with the
+	// corners.
 	const titleBudget = w - 6
 	top := m.Theme.Title.Render(truncate(actionMenuTitle(m.actionMenu.ref), titleBudget))
 	bottom := ""
@@ -276,18 +282,43 @@ func (m Model) renderActionMenuPanel() string {
 	return setBorderTitles(box, top, bottom)
 }
 
-// actionMenuTitle returns the namespace/name pair shown in the top
-// border. Falls back to "ACTIONS" if the cursor row is empty (the
-// modal should never open in that state, but the guard keeps the
-// title from going blank if it does).
+// actionMenuTitle returns the "<Kind> Actions" label for the top
+// border. Falls back to "Actions" if the kind is unknown.
 func actionMenuTitle(ref cluster.DescribeRef) string {
+	if ref.Kind == "" {
+		return "Actions"
+	}
+	return ref.Kind + " Actions"
+}
+
+// actionMenuResource returns the ns/name pair (or just name for
+// cluster-scoped kinds) that's rendered centered as the first content
+// row of the dialog. Empty if the menu opened without a target.
+func actionMenuResource(ref cluster.DescribeRef) string {
 	if ref.Name == "" {
-		return "ACTIONS"
+		return ""
 	}
 	if ref.Namespace != "" {
 		return ref.Namespace + "/" + ref.Name
 	}
 	return ref.Name
+}
+
+// centerLine returns s centered inside a width-wide string, styled.
+// Long content is truncated to width; short content is padded with
+// spaces on both sides.
+func centerLine(s string, width int, style lipgloss.Style) string {
+	if width <= 0 {
+		return ""
+	}
+	t := truncate(s, width)
+	w := lipgloss.Width(t)
+	if w >= width {
+		return style.Render(t)
+	}
+	left := (width - w) / 2
+	right := width - w - left
+	return strings.Repeat(" ", left) + style.Render(t) + strings.Repeat(" ", right)
 }
 
 // setBorderTitles splices top/bottom labels into the box's first and
