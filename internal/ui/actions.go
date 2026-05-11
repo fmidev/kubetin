@@ -231,7 +231,7 @@ func (m Model) renderActionMenuPanel() string {
 	// the centered <ns>/<name>, the bottom border carries the cluster
 	// context. Keeps the dialog body focused on the action list with
 	// minimal chrome.
-	resource := centerLine(actionMenuResource(m.actionMenu.ref), innerW, m.Theme.Title)
+	resource := centerLine(actionMenuResource(m.actionMenu.ref), innerW, m.Theme.Header)
 	b.WriteString(resource + "\n")
 	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
 
