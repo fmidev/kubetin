@@ -235,24 +235,9 @@ func (m Model) renderActionMenuPanel() string {
 	b.WriteString(resource + "\n")
 	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
 
-	// A "danger" divider is inserted before the first destructive row
-	// so safe and destructive actions read as separate groups. Only
-	// inserted when there's at least one of each — menus for read-only
-	// resources stay clean.
-	dangerDividerDone := false
-	hasNonDestructive := false
-	for _, it := range m.actionMenu.options {
-		if !it.Action.destructive() {
-			hasNonDestructive = true
-			break
-		}
-	}
-
+	// Destructive rows render in red; that's enough to set them apart
+	// from safe actions without an extra divider eating a row.
 	for i, it := range m.actionMenu.options {
-		if it.Action.destructive() && !dangerDividerDone && hasNonDestructive {
-			b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
-			dangerDividerDone = true
-		}
 		b.WriteString(m.actionRow(i, it, innerW, statusAt) + "\n")
 	}
 
@@ -277,7 +262,7 @@ func (m Model) renderActionMenuPanel() string {
 	top := m.Theme.Title.Render(truncate(actionMenuTitle(m.actionMenu.ref), titleBudget))
 	bottom := ""
 	if m.WatchedContext != "" {
-		bottom = m.Theme.Dim.Render(truncate(m.WatchedContext, titleBudget))
+		bottom = m.Theme.Header.Render(truncate(m.WatchedContext, titleBudget))
 	}
 	return setBorderTitles(box, top, bottom)
 }
