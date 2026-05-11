@@ -227,11 +227,9 @@ func (m Model) renderActionMenuPanel() string {
 	ref := m.actionMenu.ref
 	var b strings.Builder
 
-	// Title row.
-	b.WriteString(m.Theme.Title.Render("ACTIONS") + "\n")
-	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
-
 	// Resource ident block: Kind / Name / ns each on their own line.
+	// The "ACTIONS" title sits in the top border (spliced in below)
+	// rather than on its own row, so there's no separate title line.
 	if ref.Kind != "" {
 		b.WriteString(m.Theme.Header.Render(ref.Kind) + "\n")
 	}
@@ -268,14 +266,40 @@ func (m Model) renderActionMenuPanel() string {
 	if m.actionMenu.notice != "" {
 		b.WriteString(m.Theme.StatusWrn.Render(m.actionMenu.notice) + "\n")
 	}
-	b.WriteString(m.Theme.Footer.Render("j/k · enter · esc"))
+	b.WriteString(m.Theme.Footer.Render("↑↓ · enter · esc"))
 
-	return lipgloss.NewStyle().
+	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("244")).
 		Padding(1, 2).
 		Width(w).
 		Render(b.String())
+
+	// Splice "ACTIONS" into the top border, centred. Reuses the same
+	// ANSI-aware splicer the floating overlay uses.
+	return setBorderTitle(box, m.Theme.Title.Render("ACTIONS"))
+}
+
+// setBorderTitle replaces the middle ─ chars of the box's top border
+// line with " title ". The title carries its own colour; the border
+// chars on either side keep their original (dim 244) style.
+func setBorderTitle(box, title string) string {
+	if box == "" || title == "" {
+		return box
+	}
+	lines := strings.Split(box, "\n")
+	if len(lines) == 0 {
+		return box
+	}
+	decorated := " " + title + " "
+	decoratedW := lipgloss.Width(decorated)
+	topW := lipgloss.Width(lines[0])
+	col := (topW - decoratedW) / 2
+	if col < 1 {
+		col = 1
+	}
+	lines[0] = spliceLine(lines[0], decorated, col)
+	return strings.Join(lines, "\n")
 }
 
 // actionRow builds one menu row at width innerW. The trailing status
