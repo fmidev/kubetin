@@ -173,6 +173,12 @@ type Model struct {
 	sortKey  SortKey
 	sortDesc bool
 
+	// Namespace view has its own sort state — its columns differ from
+	// the pod table (no Restarts/CPU/Mem, has Pods/Deps/Warn counts),
+	// so it gets a parallel enum + flag rather than overloading SortKey.
+	nsSortKey  NsSortKey
+	nsSortDesc bool
+
 	helpOpen       bool
 	describe       describeState
 	actionMenu     actionMenuState
@@ -733,10 +739,23 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.namespace = ""
 		m.anchorCursorToVisible()
 	case "s":
-		m.sortKey = m.sortKey.next()
+		// Each table view owns its own sort state; dispatch by view so
+		// `s` cycles the visible table's columns rather than silently
+		// rotating the pod table's sort key from inside another view.
+		switch m.view {
+		case ViewNamespaces:
+			m.nsSortKey = m.nsSortKey.next()
+		default:
+			m.sortKey = m.sortKey.next()
+		}
 		// Cursor anchored to UID; new sort order will keep it visible.
 	case "S":
-		m.sortDesc = !m.sortDesc
+		switch m.view {
+		case ViewNamespaces:
+			m.nsSortDesc = !m.nsSortDesc
+		default:
+			m.sortDesc = !m.sortDesc
+		}
 	case "esc":
 		// ESC priority: close overlays first, then clear narrowing.
 		if m.helpOpen {
@@ -1403,10 +1422,11 @@ func (m Model) visibleUIDs() []types.UID {
 	case ViewNamespaces:
 		// Namespaces are cluster-scoped so the m.namespace filter
 		// doesn't apply — selecting "ns: foo" then opening the ns
-		// view should still show every namespace. We sort by Name
-		// here so the cursor logic walks the table in the same order
-		// the renderer paints it.
-		rows := sortedNsRows(m.namespaces)
+		// view should still show every namespace. Walk in the same
+		// order the renderer paints (active sort key + direction) so
+		// j/k step through the visible table.
+		counts := m.collectNsCounts()
+		rows := sortedNsRows(m.namespaces, m.nsSortKey, m.nsSortDesc, counts)
 		out := make([]types.UID, 0, len(rows))
 		for _, r := range rows {
 			if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
