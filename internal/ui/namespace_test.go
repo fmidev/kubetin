@@ -2,7 +2,9 @@ package ui
 
 import (
 	"testing"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -54,6 +56,80 @@ func TestCollectNsCounts(t *testing.T) {
 		}
 		if g != w {
 			t.Errorf("ns %q: got %+v, want %+v", ns, g, w)
+		}
+	}
+}
+
+// TestSortedNsRows covers each sort key's primary ordering plus the
+// desc flag. The tiebreaker chain (Name → UID) keeps ordering total,
+// so equal-key rows have a deterministic fallback — the test inputs
+// give each row a unique primary value so we're really exercising the
+// per-key path, not the tiebreaker.
+func TestSortedNsRows(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	rows := map[types.UID]nsRow{
+		"a": {UID: "a", Name: "beta", Phase: corev1.NamespaceActive, CreatedAt: base.Add(2 * time.Hour)},
+		"b": {UID: "b", Name: "alpha", Phase: corev1.NamespaceTerminating, CreatedAt: base.Add(1 * time.Hour)},
+		"c": {UID: "c", Name: "gamma", Phase: corev1.NamespaceActive, CreatedAt: base},
+	}
+	counts := map[string]nsCount{
+		"alpha": {pods: 5, deploys: 1, warnings: 0},
+		"beta":  {pods: 2, deploys: 3, warnings: 7},
+		"gamma": {pods: 0, deploys: 2, warnings: 1},
+	}
+
+	cases := []struct {
+		name string
+		key  NsSortKey
+		desc bool
+		want []string // expected Name order
+	}{
+		{"name asc", NsSortName, false, []string{"alpha", "beta", "gamma"}},
+		{"name desc", NsSortName, true, []string{"gamma", "beta", "alpha"}},
+		// Active < Terminating lexicographically — beta and gamma are
+		// Active, alpha is Terminating. Within Active, name tiebreaks.
+		{"status asc", NsSortStatus, false, []string{"beta", "gamma", "alpha"}},
+		// Older first ascending; gamma is oldest.
+		{"age asc", NsSortAge, false, []string{"gamma", "alpha", "beta"}},
+		{"pods asc", NsSortPods, false, []string{"gamma", "beta", "alpha"}},
+		{"pods desc", NsSortPods, true, []string{"alpha", "beta", "gamma"}},
+		{"deps asc", NsSortDeps, false, []string{"alpha", "gamma", "beta"}},
+		{"warn desc", NsSortWarn, true, []string{"beta", "gamma", "alpha"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sortedNsRows(rows, tc.key, tc.desc, counts)
+			if len(got) != len(tc.want) {
+				t.Fatalf("len = %d, want %d", len(got), len(tc.want))
+			}
+			for i, r := range got {
+				if r.Name != tc.want[i] {
+					t.Errorf("row %d = %q, want %q (full order: %v)", i, r.Name, tc.want[i], rowNames(got))
+				}
+			}
+		})
+	}
+}
+
+func rowNames(rs []nsRow) []string {
+	out := make([]string, len(rs))
+	for i, r := range rs {
+		out[i] = r.Name
+	}
+	return out
+}
+
+// TestNsSortKeyNextCycle pins the cycle order — `s` walks columns
+// left-to-right and wraps. Regressing this would silently swap which
+// column the visible arrow lands on next.
+func TestNsSortKeyNextCycle(t *testing.T) {
+	want := []NsSortKey{NsSortStatus, NsSortAge, NsSortPods, NsSortDeps, NsSortWarn, NsSortName}
+	k := NsSortName
+	for i, w := range want {
+		k = k.next()
+		if k != w {
+			t.Errorf("step %d: got %v, want %v", i, k, w)
 		}
 	}
 }

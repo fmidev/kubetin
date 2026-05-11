@@ -37,15 +37,78 @@ func applyNsEvent(m map[types.UID]nsRow, ev cluster.NamespaceEvent) {
 	}
 }
 
-func sortedNsRows(m map[types.UID]nsRow) []nsRow {
+// NsSortKey identifies a column to sort the Namespace table by.
+// Order matches column order on screen so `s` cycles in the same
+// direction the eye scans.
+type NsSortKey int
+
+const (
+	NsSortName NsSortKey = iota
+	NsSortStatus
+	NsSortAge
+	NsSortPods
+	NsSortDeps
+	NsSortWarn
+
+	nsSortKeyCount
+)
+
+// next cycles through namespace sort keys in column order.
+func (k NsSortKey) next() NsSortKey { return (k + 1) % nsSortKeyCount }
+
+// sortedNsRows returns the rows ordered by key/desc. Pods/Deps/Warn
+// rely on the pre-computed per-namespace counts; pass nil when the
+// caller doesn't need those keys (cursor walks don't, the renderer
+// does).
+func sortedNsRows(m map[types.UID]nsRow, key NsSortKey, desc bool, counts map[string]nsCount) []nsRow {
 	out := make([]nsRow, 0, len(m))
 	for _, r := range m {
 		out = append(out, r)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		return out[i].Name < out[j].Name
+		if desc {
+			return nsLessBy(out[j], out[i], key, counts)
+		}
+		return nsLessBy(out[i], out[j], key, counts)
 	})
 	return out
+}
+
+// nsLessBy is the strict total-order comparator for nsRow. Falls
+// through to Name then UID after the primary key so the result is
+// stable across re-sorts (UID is unique cluster-wide).
+func nsLessBy(a, b nsRow, k NsSortKey, counts map[string]nsCount) bool {
+	switch k {
+	case NsSortName:
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+	case NsSortStatus:
+		if a.Phase != b.Phase {
+			return a.Phase < b.Phase
+		}
+	case NsSortAge:
+		// Older first ascending: smaller CreatedAt = "less".
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.Before(b.CreatedAt)
+		}
+	case NsSortPods:
+		if counts[a.Name].pods != counts[b.Name].pods {
+			return counts[a.Name].pods < counts[b.Name].pods
+		}
+	case NsSortDeps:
+		if counts[a.Name].deploys != counts[b.Name].deploys {
+			return counts[a.Name].deploys < counts[b.Name].deploys
+		}
+	case NsSortWarn:
+		if counts[a.Name].warnings != counts[b.Name].warnings {
+			return counts[a.Name].warnings < counts[b.Name].warnings
+		}
+	}
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	return a.UID < b.UID
 }
 
 // labelSummary renders a one-line approximation of a namespace's
@@ -116,7 +179,26 @@ func itoa(n int) string {
 //	Terminating  → yellow (red when stuck for > ~10 min would be a
 //	                       v2 polish; v1 keeps it simple)
 func (m Model) renderNamespacesView(maxRows, _ int) string {
-	all := sortedNsRows(m.namespaces)
+	const (
+		colName   = 36
+		colStatus = 14
+		colAge    = 5
+		// Three resource-count sub-columns, headed PODS / DEP / WRN.
+		// Each column is one cell wider than the header label so the
+		// sort arrow has room when the column is the active sort —
+		// without that extra cell padCellANSIRight truncates the arrow
+		// off the right edge (same trick colRst uses in the pod table).
+		colPods   = 5
+		colDeps   = 4
+		colWarn   = 4
+		colLabels = 60
+	)
+
+	// Single-pass count of pods / deploys / warning events per
+	// namespace. Avoids O(N · (P+D+E)) inside the row loop.
+	counts := m.collectNsCounts()
+
+	all := sortedNsRows(m.namespaces, m.nsSortKey, m.nsSortDesc, counts)
 	needle := strings.ToLower(m.filterText)
 	rows := make([]nsRow, 0, len(all))
 	for _, r := range all {
@@ -126,33 +208,32 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 		rows = append(rows, r)
 	}
 
-	const (
-		colName   = 36
-		colStatus = 14
-		colAge    = 5
-		// Three resource-count sub-columns, headed PODS / DEP / WRN.
-		// PODS gets one extra cell because pod counts hit four digits
-		// on big clusters; DEP and WRN stay at 3 because anything
-		// over 999 deployments in one namespace is its own problem.
-		colPods   = 4
-		colDeps   = 3
-		colWarn   = 3
-		colLabels = 60
-	)
-
-	// Single-pass count of pods / deploys / warning events per
-	// namespace. Avoids O(N · (P+D+E)) inside the row loop.
-	counts := m.collectNsCounts()
-
+	// Mixed-style header cell: bold-grey label + cyan arrow when this
+	// column is the active sort. Same pattern as the pod table — label
+	// and arrow are pre-styled, so they MUST go through padCellANSI,
+	// not padCol (padCol's byte-level truncate would slice the escape
+	// sequence and bleed broken codes across the screen).
 	hdr := m.Theme.Header
+	arrowStyle := m.Theme.Title
+	mark := func(col NsSortKey, label string) string {
+		base := hdr.Render(label)
+		if m.nsSortKey != col {
+			return base
+		}
+		arrow := "▲"
+		if m.nsSortDesc {
+			arrow = "▼"
+		}
+		return base + arrowStyle.Render(arrow)
+	}
 	header := " " +
-		padCol("NAME", colName, hdr) + "  " +
-		padCol("STATUS", colStatus, hdr) + "  " +
-		padColRight("AGE", colAge, hdr) + "  " +
-		padColRight("PODS", colPods, hdr) + "  " +
-		padColRight("DEP", colDeps, hdr) + "  " +
-		padColRight("WRN", colWarn, hdr) + "  " +
-		padCol("LABELS", colLabels, hdr)
+		padCellANSI(mark(NsSortName, "NAME"), colName) + "  " +
+		padCellANSI(mark(NsSortStatus, "STATUS"), colStatus) + "  " +
+		padCellANSIRight(mark(NsSortAge, "AGE"), colAge) + "  " +
+		padCellANSIRight(mark(NsSortPods, "PODS"), colPods) + "  " +
+		padCellANSIRight(mark(NsSortDeps, "DEP"), colDeps) + "  " +
+		padCellANSIRight(mark(NsSortWarn, "WRN"), colWarn) + "  " +
+		padCellANSI(hdr.Render("LABELS"), colLabels)
 
 	var b strings.Builder
 	b.WriteString(header)
