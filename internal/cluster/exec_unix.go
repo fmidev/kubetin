@@ -156,6 +156,32 @@ func (c *ExecCmd) Run() error {
 	sizeQ := newResizeQueue(fd)
 	defer sizeQ.stop()
 
+	// Enter our own alt-screen buffer for the duration of the exec
+	// session. Without this, bubbletea's tea.Exec has already exited
+	// its alt-screen by the time we get here, which exposes whatever
+	// was on the user's normal terminal buffer before kubetin
+	// started — the shell prompt then renders on top of that
+	// pre-kubetin content. Entering alt-screen (1049h) clears the
+	// alt buffer on entry, gives us a clean canvas, and on exit
+	// (1049l) restores the pre-kubetin contents the user expects to
+	// see *outside* kubetin. bubbletea's RestoreTerminal() then
+	// re-enters its own alt-screen for the TUI on top.
+	//
+	// Deferred last so it fires first on return: alt-screen exit
+	// before raw-mode restore feels visually cleaner — the user
+	// sees their original terminal a beat before any focus blip
+	// from re-entering raw cooked mode.
+	const (
+		altScreenOn  = "\x1b[?1049h\x1b[H" // enter alt-screen + home cursor
+		altScreenOff = "\x1b[?1049l"
+	)
+	if _, err := io.WriteString(c.stdout, altScreenOn); err != nil {
+		return fmt.Errorf("term alt-screen on: %w", err)
+	}
+	defer func() {
+		_, _ = io.WriteString(c.stdout, altScreenOff)
+	}()
+
 	klog.Infof("exec: starting %s/%s container=%s cmd=%v",
 		c.namespace, c.pod, c.container, c.command)
 
