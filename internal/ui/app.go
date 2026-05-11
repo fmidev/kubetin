@@ -1453,7 +1453,20 @@ func (m Model) View() string {
 	case m.describe.open:
 		body = m.renderDescribe(m.width, bodyHeight)
 	case m.actionMenu.open:
-		body = m.renderActionMenu(m.width, bodyHeight)
+		// Floating overlay: keep the underlying table visible around
+		// the menu so the user can still see the row they came from.
+		// clampCanvas below guarantees the composited result matches
+		// (m.width, bodyHeight) — overlayAt only splices, it doesn't
+		// alter visible dimensions.
+		body = clampCanvas(body, m.width, bodyHeight)
+		panel := m.renderActionMenuPanel()
+		panelW, panelH := lipgloss.Width(panel), lipgloss.Height(panel)
+		col := (m.width - panelW) / 2
+		row := (bodyHeight - panelH) / 2
+		if row < 0 {
+			row = 0
+		}
+		body = overlayAt(body, panel, col, row)
 	case m.exec.pickerOpen:
 		body = m.renderExecPicker(m.width, bodyHeight)
 	case m.helpOpen:

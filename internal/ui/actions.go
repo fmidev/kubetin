@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -205,68 +204,126 @@ type actionMenuState struct {
 	notice  string // ephemeral status line (e.g. "Logs: not yet implemented")
 }
 
-// renderActionMenu draws the centered actions modal.
-func (m Model) renderActionMenu(canvasWidth, canvasHeight int) string {
+// renderActionMenuPanel returns just the bordered modal box (no
+// canvas placement). The caller composites it over the underlying
+// table via overlayAt so the row the user came from stays visible
+// alongside the menu.
+//
+// Layout: title "ACTIONS" → kind / name / namespace stacked on
+// separate lines so realistic-length pod names don't cram the title,
+// → action rows with trailing status glyphs for denied (✗) and
+// pending (…). Destructive rows get a leading ⚠ glyph in addition to
+// the red label so danger reads even with colours off (NO_COLOR).
+func (m Model) renderActionMenuPanel() string {
 	if !m.actionMenu.open {
 		return ""
 	}
-	const w = 50
+	const (
+		w        = 52
+		innerW   = w - 6 // box width minus border (2) and padding (2*2)
+		statusAt = innerW - 2
+	)
 
+	ref := m.actionMenu.ref
 	var b strings.Builder
-	title := m.Theme.Title.Render(" actions ") +
-		m.Theme.Dim.Render(" "+actionsTitle(m.actionMenu.ref))
-	b.WriteString(title + "\n")
-	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", w-2)) + "\n")
-	for i, it := range m.actionMenu.options {
-		marker := "  "
-		if i == m.actionMenu.cursor {
-			marker = m.Theme.Title.Render(" ›")
-		}
-		label := it.Action.Label()
-		var styled string
-		var suffix string
-		switch it.Status {
-		case actionAllowed:
-			style := m.Theme.Base
-			if it.Action.destructive() {
-				style = m.Theme.StatusBad
-			}
-			styled = style.Render(label)
-		case actionPending:
-			styled = m.Theme.Dim.Render(label)
-			suffix = m.Theme.Dim.Render(" …")
-		case actionDenied:
-			styled = m.Theme.Dim.Render(label)
-			suffix = m.Theme.Dim.Render(" (no permission)")
-		}
-		line := fmt.Sprintf("%s %s%s", marker, styled, suffix)
-		if i == m.actionMenu.cursor && it.Status == actionAllowed {
-			line = renderSelected(line)
-		}
-		b.WriteString(line + "\n")
-	}
-	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", w-2)) + "\n")
-	if m.actionMenu.notice != "" {
-		b.WriteString(m.Theme.StatusWrn.Render(" "+m.actionMenu.notice) + "\n")
-	}
-	b.WriteString(m.Theme.Footer.Render(" j/k  enter  esc"))
 
-	box := lipgloss.NewStyle().
+	// Title row.
+	b.WriteString(m.Theme.Title.Render("ACTIONS") + "\n")
+	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
+
+	// Resource ident block: Kind / Name / ns each on their own line.
+	if ref.Kind != "" {
+		b.WriteString(m.Theme.Header.Render(ref.Kind) + "\n")
+	}
+	if ref.Name != "" {
+		b.WriteString(m.Theme.Title.Render(truncate(ref.Name, innerW)) + "\n")
+	}
+	if ref.Namespace != "" {
+		b.WriteString(m.Theme.Dim.Render("ns "+truncate(ref.Namespace, innerW-3)) + "\n")
+	}
+	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
+
+	// A "danger" divider is inserted before the first destructive row
+	// so safe and destructive actions read as separate groups. Only
+	// inserted when there's at least one of each — menus for read-only
+	// resources stay clean.
+	dangerDividerDone := false
+	hasNonDestructive := false
+	for _, it := range m.actionMenu.options {
+		if !it.Action.destructive() {
+			hasNonDestructive = true
+			break
+		}
+	}
+
+	for i, it := range m.actionMenu.options {
+		if it.Action.destructive() && !dangerDividerDone && hasNonDestructive {
+			b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
+			dangerDividerDone = true
+		}
+		b.WriteString(m.actionRow(i, it, innerW, statusAt) + "\n")
+	}
+
+	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
+	if m.actionMenu.notice != "" {
+		b.WriteString(m.Theme.StatusWrn.Render(m.actionMenu.notice) + "\n")
+	}
+	b.WriteString(m.Theme.Footer.Render("j/k · enter · esc"))
+
+	return lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("244")).
-		Padding(0, 1).
+		Padding(1, 2).
 		Width(w).
 		Render(b.String())
-
-	return lipgloss.Place(canvasWidth, canvasHeight, lipgloss.Center, lipgloss.Center, box)
 }
 
-func actionsTitle(r cluster.DescribeRef) string {
-	if r.Name == "" {
-		return ""
+// actionRow builds one menu row at width innerW. The trailing status
+// glyph (✗ / …) sits at column statusAt so the column reads cleanly
+// across rows. Cursor row gets both the › marker and the bg
+// highlight (the user asked for both signals).
+func (m Model) actionRow(i int, it actionItem, innerW, statusAt int) string {
+	marker := "  "
+	if i == m.actionMenu.cursor {
+		marker = m.Theme.Title.Render("›") + " "
 	}
-	if r.Namespace != "" {
-		return r.Kind + "/" + r.Name + " · " + r.Namespace
+
+	label := it.Action.Label()
+	prefix := ""
+	style := m.Theme.Base
+	switch it.Status {
+	case actionAllowed:
+		if it.Action.destructive() {
+			style = m.Theme.StatusBad
+			prefix = m.Theme.StatusBad.Render("⚠ ")
+		}
+	case actionPending, actionDenied:
+		style = m.Theme.Dim
 	}
-	return r.Kind + "/" + r.Name
+
+	body := marker + prefix + style.Render(label)
+
+	// Right-pad the body to statusAt then append the glyph.
+	bodyW := lipgloss.Width(body)
+	if bodyW < statusAt {
+		body += strings.Repeat(" ", statusAt-bodyW)
+	}
+	switch it.Status {
+	case actionPending:
+		body += m.Theme.Dim.Render("…")
+	case actionDenied:
+		body += m.Theme.StatusBad.Render("✗")
+	}
+
+	// Final pad-to-innerW so renderSelected paints the highlight all
+	// the way across the row.
+	bodyW = lipgloss.Width(body)
+	if bodyW < innerW {
+		body += strings.Repeat(" ", innerW-bodyW)
+	}
+
+	if i == m.actionMenu.cursor && it.Status == actionAllowed {
+		body = renderSelected(body)
+	}
+	return body
 }
