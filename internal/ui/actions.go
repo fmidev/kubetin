@@ -32,7 +32,7 @@ func (a Action) Label() string {
 	case ActLogs:
 		return "Logs"
 	case ActExec:
-		return "Exec (shell)"
+		return "Shell"
 	case ActEvents:
 		return "Events"
 	case ActScale:
