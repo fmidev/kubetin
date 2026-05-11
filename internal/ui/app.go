@@ -44,6 +44,10 @@ type PermissionResultMsg struct {
 // DeleteResultMsg is fired when a Delete call returns.
 type DeleteResultMsg cluster.DeleteResult
 
+// NodeOpResultMsg is fired when a Cordon or Uncordon call returns.
+// The Op field on cluster.NodeOpResult disambiguates which one.
+type NodeOpResultMsg cluster.NodeOpResult
+
 // toastClearMsg fires after the toast deadline so we re-render
 // without the message.
 type toastClearMsg time.Time
@@ -115,6 +119,19 @@ type Model struct {
 	// the user's `exit` / `Ctrl-D`.
 	OnExec func(focusedCtx string, ref cluster.DescribeRef, container string, command []string) tea.Cmd
 
+	// OnCordon / OnUncordon: synchronous one-shot PATCH on
+	// /spec/unschedulable. Returns a NodeOpResultMsg.
+	OnCordon   func(focusedCtx string, node string) tea.Msg
+	OnUncordon func(focusedCtx string, node string) tea.Msg
+
+	// OnDrainStart begins an async drain. It returns DrainStartMsg
+	// synchronously to confirm the supervisor accepted the request
+	// (or surface a setup error); subsequent DrainProgressMsg /
+	// DrainDoneMsg events flow asynchronously over the program's
+	// channel — main.go spawns a forwarder goroutine for the same
+	// reason logs do.
+	OnDrainStart func(focusedCtx, node string) tea.Msg
+
 	pods          map[types.UID]podRow
 	nodes         map[types.UID]nodeRow
 	deployments   map[types.UID]deploymentRow
@@ -157,6 +174,8 @@ type Model struct {
 	deleteConfirm  deleteConfirmState
 	scaleConfirm   scaleConfirmState
 	restartConfirm restartConfirmState
+	drainConfirm   drainConfirmState
+	drainProgress  drainProgressState
 	logs           logsState
 	exec           execState
 	permissions    map[string]bool // cached SSAR results, keyed via cluster.PermissionKey
@@ -223,6 +242,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.restartConfirm.open {
 			return m.handleRestartConfirmKey(msg)
+		}
+		if m.drainConfirm.open {
+			return m.handleDrainConfirmKey(msg)
+		}
+		if m.drainProgress.open {
+			return m.handleDrainProgressKey(msg)
 		}
 		if m.describe.open {
 			return m.handleDescribeKey(msg)
@@ -354,6 +379,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.toastUntil = time.Now().Add(4 * time.Second)
 		return m, tea.Tick(4*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
+
+	case NodeOpResultMsg:
+		res := cluster.NodeOpResult(msg)
+		if res.Context != m.WatchedContext {
+			return m, nil
+		}
+		// One toast for both Cordon and Uncordon — same shape, just
+		// different verb in the message. The watcher will update the
+		// node row's Schedulable column on its own; we don't need to
+		// mutate m.nodes here.
+		verb := "Cordoned"
+		if res.Op == "uncordon" {
+			verb = "Uncordoned"
+		}
+		if res.OK {
+			m.toast = fmt.Sprintf("✓ %s %s", verb, res.Node)
+		} else {
+			m.toast = fmt.Sprintf("✕ %s %s failed: %s", verb, res.Node, res.Err)
+		}
+		m.toastUntil = time.Now().Add(4 * time.Second)
+		return m, tea.Tick(4*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
+
+	case DrainStartMsg:
+		return m.applyDrainStart(msg)
+	case DrainProgressMsg:
+		return m.applyDrainProgress(msg)
+	case DrainDoneMsg:
+		return m.applyDrainDone(msg)
 
 	case ExecDoneMsg:
 		// Bubbletea has already reclaimed the alt-screen by the time
@@ -781,10 +834,28 @@ func (m Model) openActionMenu() (tea.Model, tea.Cmd) {
 // Unknown (uncached) gated actions are HIDDEN until the SSAR returns
 // — better to err on the side of "don't surface a button I might not
 // be allowed to push" than to dangle a forbidden one.
+//
+// Node has one extra dimension: Cordon and Uncordon are mutually
+// exclusive based on the node's current Schedulable state. We surface
+// only the one that would actually change something — showing both
+// against a cordoned node would let the user "cordon" something
+// already cordoned, which reads as a no-op bug.
 func (m Model) permittedActions(ref cluster.DescribeRef) []Action {
 	all := actionsFor(ref.Kind)
 	out := make([]Action, 0, len(all))
+	var schedulable, hasNode bool
+	if ref.Kind == "Node" {
+		schedulable, hasNode = m.nodeSchedulable(ref.Name)
+	}
 	for _, a := range all {
+		if ref.Kind == "Node" && hasNode {
+			if a == ActCordon && !schedulable {
+				continue
+			}
+			if a == ActUncordon && schedulable {
+				continue
+			}
+		}
 		av, gated := verbsForAction(a, ref)
 		if !gated {
 			out = append(out, a)
@@ -796,6 +867,19 @@ func (m Model) permittedActions(ref cluster.DescribeRef) []Action {
 		}
 	}
 	return out
+}
+
+// nodeSchedulable looks up the cached Schedulable state for a node
+// by name. Second return is false when the node isn't in our cache
+// — in which case the caller falls back to showing both Cordon and
+// Uncordon, since we don't know which would be the no-op.
+func (m Model) nodeSchedulable(name string) (bool, bool) {
+	for _, n := range m.nodes {
+		if n.Name == name {
+			return n.Schedulable, true
+		}
+	}
+	return false, false
 }
 
 // dispatchPermissionChecks emits SSAR commands for gated actions
@@ -893,6 +977,30 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
 		return m.openRestartConfirm(ref)
+	case ActCordon:
+		ref := m.actionMenu.ref
+		m.actionMenu.open = false
+		if m.OnCordon == nil {
+			return m, nil
+		}
+		cb := m.OnCordon
+		focused := m.WatchedContext
+		name := ref.Name
+		return m, func() tea.Msg { return cb(focused, name) }
+	case ActUncordon:
+		ref := m.actionMenu.ref
+		m.actionMenu.open = false
+		if m.OnUncordon == nil {
+			return m, nil
+		}
+		cb := m.OnUncordon
+		focused := m.WatchedContext
+		name := ref.Name
+		return m, func() tea.Msg { return cb(focused, name) }
+	case ActDrain:
+		ref := m.actionMenu.ref
+		m.actionMenu.open = false
+		return m.openDrainConfirm(ref)
 	case ActDelete:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1169,6 +1277,10 @@ func (m Model) View() string {
 		body = m.renderScaleConfirm(m.width, bodyHeight)
 	case m.restartConfirm.open:
 		body = m.renderRestartConfirm(m.width, bodyHeight)
+	case m.drainProgress.open:
+		body = m.renderDrainProgress(m.width, bodyHeight)
+	case m.drainConfirm.open:
+		body = m.renderDrainConfirm(m.width, bodyHeight)
 	case m.describe.open:
 		body = m.renderDescribe(m.width, bodyHeight)
 	case m.actionMenu.open:
