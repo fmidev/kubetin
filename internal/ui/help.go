@@ -96,6 +96,7 @@ var helpGroups = []helpGroup{
 		Title: "System",
 		Bindings: [][2]string{
 			{"?", "this help"},
+			{"R", "RBAC permissions overlay"},
 			{"F2", "debug overlay"},
 			{"q / Ctrl-C", "quit"},
 		},

@@ -189,8 +189,16 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 		res := sup.CanI(fetchCtx, ctxName, verb, group, resource, namespace)
 		key := cluster.PermissionKey(ctxName, verb, group, resource, namespace)
 		// We treat "Err" as "no, I can't" — surfacing it as "allowed=true"
-		// would expose a button that crashes when used.
-		return ui.PermissionResultMsg{Key: key, Allowed: res.Allowed && res.Err == ""}
+		// would expose a button that crashes when used. Reason/Err flow
+		// through so the RBAC overlay can show *why* an action was
+		// denied instead of just "no".
+		return ui.PermissionResultMsg{
+			Context: ctxName,
+			Key:     key,
+			Allowed: res.Allowed && res.Err == "",
+			Reason:  res.Reason,
+			Err:     res.Err,
+		}
 	}
 
 	// Wire logs streaming. We hold a single cancellable context per

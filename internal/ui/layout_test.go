@@ -45,6 +45,37 @@ func TestViewFitsCanvas(t *testing.T) {
 		}},
 
 		{"help-open", 120, 40, ViewPods, func(m *Model) { m.helpOpen = true }},
+		{"rbac-open-empty", 120, 40, ViewPods, func(m *Model) { m.rbacOpen = true }},
+		{"rbac-open-mixed", 120, 40, ViewPods, func(m *Model) {
+			m.rbacOpen = true
+			m.permissions = map[string]permState{
+				"alpha|get||pods/log|":     {Allowed: true},
+				"alpha|create||pods/exec|": {Allowed: false, Reason: "forbidden by RBAC"},
+				"alpha|delete||pods|":      {Allowed: false, Err: "timeout"},
+			}
+			m.permissionsInFlight = map[string]struct{}{
+				"alpha|list||events|": {},
+			}
+		}},
+		{"rbac-open-with-ns", 120, 40, ViewPods, func(m *Model) {
+			m.rbacOpen = true
+			m.namespace = "kube-system"
+			m.permissions = map[string]permState{
+				"alpha|create||pods/exec|kube-system": {Allowed: true},
+			}
+		}},
+		{"rbac-narrow", 70, 24, ViewPods, func(m *Model) { m.rbacOpen = true }},
+		{"action-menu-denied", 120, 40, ViewPods, func(m *Model) {
+			m.actionMenu.open = true
+			m.actionMenu.ref.Kind = "Pod"
+			m.actionMenu.options = []actionItem{
+				{Action: ActDescribe, Status: actionAllowed},
+				{Action: ActLogs, Status: actionAllowed},
+				{Action: ActExec, Status: actionDenied, Reason: "forbidden"},
+				{Action: ActEvents, Status: actionPending},
+				{Action: ActDelete, Status: actionDenied, Reason: "forbidden"},
+			}
+		}},
 		{"describe-open", 120, 40, ViewPods, func(m *Model) {
 			m.describe.open = true
 			m.describe.result.YAML = strings.Repeat("yaml line\n", 60)

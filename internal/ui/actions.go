@@ -143,11 +143,64 @@ func verbsForAction(a Action, ref cluster.DescribeRef) (av actionVerb, gated boo
 	return actionVerb{}, false
 }
 
+// rbacProbe is one row in the RBAC overlay: a labelled tuple of
+// verb/group/resource that we want the apiserver to rule on, grouped
+// by the Kind it relates to so the overlay can section the output.
+type rbacProbe struct {
+	Group    string // for display grouping (Pods, Deployments, …) — not the API group
+	Action   string // human label ("Logs", "Exec", "Delete pods")
+	Verb     string
+	APIGroup string // RBAC group ("", "apps")
+	Resource string // may include subresource ("pods/log")
+}
+
+// rbacProbeSet enumerates every verb the action menu ever gates on,
+// expanded to a per-Kind list so the RBAC overlay can show ✓/✗ per
+// (verb, resource) combination. Kept here next to verbsForAction so
+// adding a new gated action surfaces obviously in one place.
+func rbacProbeSet() []rbacProbe {
+	return []rbacProbe{
+		{"Pods", "Logs", "get", "", "pods/log"},
+		{"Pods", "Exec", "create", "", "pods/exec"},
+		{"Pods", "Delete", "delete", "", "pods"},
+		{"Pods", "Events (list)", "list", "", "events"},
+		{"Deployments", "Scale", "update", "apps", "deployments/scale"},
+		{"Deployments", "Restart (patch)", "patch", "apps", "deployments"},
+		{"Deployments", "Delete", "delete", "apps", "deployments"},
+		{"Nodes", "Cordon / Uncordon", "patch", "", "nodes"},
+		{"Nodes", "Drain (evict pods)", "create", "", "pods/eviction"},
+		{"Nodes", "Delete", "delete", "", "nodes"},
+		{"Namespaces", "Delete", "delete", "", "namespaces"},
+	}
+}
+
+// actionStatus describes the RBAC state of one menu row at render time.
+// Until this PR the menu hid denied rows entirely; we now classify
+// them so the renderer can dim a "no permission" line in-place. That
+// gives the user a concrete reason for a missing capability instead of
+// a button they can never see.
+type actionStatus int
+
+const (
+	actionAllowed actionStatus = iota
+	actionPending              // SSAR dispatched, awaiting reply
+	actionDenied
+)
+
+// actionItem pairs an Action with its render-time RBAC status. The
+// action menu stores these directly so render + Enter handler agree on
+// what's actionable without re-querying the cache.
+type actionItem struct {
+	Action Action
+	Status actionStatus
+	Reason string // verbatim SSAR denial reason; empty when allowed/pending
+}
+
 // actionMenuState is the modal's state.
 type actionMenuState struct {
 	open    bool
 	ref     cluster.DescribeRef
-	options []Action
+	options []actionItem
 	cursor  int
 	notice  string // ephemeral status line (e.g. "Logs: not yet implemented")
 }
@@ -157,25 +210,37 @@ func (m Model) renderActionMenu(canvasWidth, canvasHeight int) string {
 	if !m.actionMenu.open {
 		return ""
 	}
-	const w = 42
+	const w = 50
 
 	var b strings.Builder
 	title := m.Theme.Title.Render(" actions ") +
 		m.Theme.Dim.Render(" "+actionsTitle(m.actionMenu.ref))
 	b.WriteString(title + "\n")
 	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", w-2)) + "\n")
-	for i, a := range m.actionMenu.options {
+	for i, it := range m.actionMenu.options {
 		marker := "  "
 		if i == m.actionMenu.cursor {
 			marker = m.Theme.Title.Render(" ›")
 		}
-		label := a.Label()
-		style := m.Theme.Base
-		if a.destructive() {
-			style = m.Theme.StatusBad
+		label := it.Action.Label()
+		var styled string
+		var suffix string
+		switch it.Status {
+		case actionAllowed:
+			style := m.Theme.Base
+			if it.Action.destructive() {
+				style = m.Theme.StatusBad
+			}
+			styled = style.Render(label)
+		case actionPending:
+			styled = m.Theme.Dim.Render(label)
+			suffix = m.Theme.Dim.Render(" …")
+		case actionDenied:
+			styled = m.Theme.Dim.Render(label)
+			suffix = m.Theme.Dim.Render(" (no permission)")
 		}
-		line := fmt.Sprintf("%s %s", marker, style.Render(label))
-		if i == m.actionMenu.cursor {
+		line := fmt.Sprintf("%s %s%s", marker, styled, suffix)
+		if i == m.actionMenu.cursor && it.Status == actionAllowed {
 			line = renderSelected(line)
 		}
 		b.WriteString(line + "\n")
