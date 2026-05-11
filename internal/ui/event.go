@@ -12,6 +12,25 @@ import (
 	"github.com/fmidev/kubetin/internal/cluster"
 )
 
+// eventScopeRef narrows ViewEvents to events whose involvedObject
+// matches the given Kind/Namespace/Name. Set by the action menu's
+// "Events" item so a user can drill from a row into the events for
+// that specific resource. Compared by exact match on all three
+// fields — substring matching is what the text filter is for.
+type eventScopeRef struct {
+	Kind      string
+	Namespace string
+	Name      string
+}
+
+// matches returns true if the event row's involvedObject equals the
+// scope on all three fields.
+func (s eventScopeRef) matches(r eventRow) bool {
+	return r.InvolvedKind == s.Kind &&
+		r.InvolvedName == s.Name &&
+		r.InvolvedNs == s.Namespace
+}
+
 // eventRow is a single Event observation. We aggregate at render time
 // rather than at apply time, because the informer surfaces UPDATEs to
 // individual events as their Count increments.
@@ -149,20 +168,48 @@ func groupEvents(m map[types.UID]eventRow) []eventGroup {
 //	  Message (one or two lines, truncated)
 //	  Pod/foo · namespace · 14:32:01
 func (m Model) renderEventsView(maxRows, maxWidth int) string {
-	groups := groupEvents(m.events)
+	// Pre-filter by scope before grouping so the per-group Count
+	// stays correct — aggregating-then-filtering would double-count
+	// (Reason+Message) pairs that span the scoped object plus
+	// unrelated objects.
+	events := m.events
+	if m.eventScope != nil {
+		events = make(map[types.UID]eventRow, len(m.events))
+		for uid, r := range m.events {
+			if m.eventScope.matches(r) {
+				events[uid] = r
+			}
+		}
+	}
+	groups := groupEvents(events)
 
 	if maxWidth < 40 {
 		maxWidth = 40
 	}
 
 	var b strings.Builder
-	header := m.Theme.Header.Render(fmt.Sprintf(" EVENTS (%d groups, %d total events)",
-		len(groups), totalEventCount(groups)))
+	var header string
+	if m.eventScope != nil {
+		header = m.Theme.Header.Render(fmt.Sprintf(
+			" EVENTS — %s/%s · %s (%d groups, %d total events) · esc to clear",
+			m.eventScope.Kind, m.eventScope.Name, m.eventScope.Namespace,
+			len(groups), totalEventCount(groups),
+		))
+	} else {
+		header = m.Theme.Header.Render(fmt.Sprintf(
+			" EVENTS (%d groups, %d total events)",
+			len(groups), totalEventCount(groups),
+		))
+	}
 	b.WriteString(header)
 	b.WriteString("\n\n")
 	rendered := 2
 
 	if len(groups) == 0 {
+		if m.eventScope != nil {
+			b.WriteString(m.Theme.Dim.Render("  no events for this " + strings.ToLower(m.eventScope.Kind) + " yet"))
+			return b.String()
+		}
 		b.WriteString(m.emptyPlaceholder(m.syncedEvents, "events"))
 		return b.String()
 	}
