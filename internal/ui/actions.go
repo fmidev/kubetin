@@ -19,6 +19,9 @@ const (
 	ActEvents
 	ActScale
 	ActRestart
+	ActCordon
+	ActUncordon
+	ActDrain
 	ActDelete
 )
 
@@ -36,6 +39,12 @@ func (a Action) Label() string {
 		return "Scale"
 	case ActRestart:
 		return "Restart (Rollout)"
+	case ActCordon:
+		return "Cordon"
+	case ActUncordon:
+		return "Uncordon"
+	case ActDrain:
+		return "Drain"
 	case ActDelete:
 		return "Delete"
 	}
@@ -43,11 +52,17 @@ func (a Action) Label() string {
 }
 
 // destructive returns true for actions that should require an extra
-// confirmation step (currently just Delete).
-func (a Action) destructive() bool { return a == ActDelete }
+// confirmation step. Drain joins Delete here — evicting every pod on
+// a node is the same blast-radius shape.
+func (a Action) destructive() bool { return a == ActDelete || a == ActDrain }
 
 // actionsFor returns the menu items applicable to a given Kind.
 // Kept tiny and explicit so adding a new resource is one obvious spot.
+//
+// Node lists *both* Cordon and Uncordon — the caller prunes one based
+// on the node's current Schedulable state before showing the menu.
+// Keeping it state-blind here avoids threading runtime state through
+// the actionsFor signature.
 func actionsFor(kind string) []Action {
 	switch kind {
 	case "Pod":
@@ -55,7 +70,7 @@ func actionsFor(kind string) []Action {
 	case "Deployment":
 		return []Action{ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
 	case "Node":
-		return []Action{ActDescribe, ActEvents}
+		return []Action{ActDescribe, ActEvents, ActCordon, ActUncordon, ActDrain}
 	}
 	return []Action{ActDescribe}
 }
@@ -105,6 +120,17 @@ func verbsForAction(a Action, ref cluster.DescribeRef) (av actionVerb, gated boo
 		// pods/exec; hiding the menu item when denied avoids users
 		// hitting Enter on something they'll never be allowed to run.
 		return actionVerb{"create", "", "pods/exec"}, true
+	case ActCordon, ActUncordon:
+		// Both go through a strategic-merge PATCH on
+		// /spec/unschedulable. `patch nodes` is the single verb.
+		return actionVerb{"patch", "", "nodes"}, true
+	case ActDrain:
+		// Drain cordons first (patch nodes), then evicts every pod
+		// (create pods/eviction). We gate on the eviction verb
+		// because that's the rarer permission — cluster admins
+		// have both; most developer roles have neither; the few
+		// roles that have one usually have the other.
+		return actionVerb{"create", "", "pods/eviction"}, true
 	}
 	return actionVerb{}, false
 }

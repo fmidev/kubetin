@@ -319,6 +319,92 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 		return ui.DeleteResultMsg(res)
 	}
 
+	// Node maintenance — Cordon, Uncordon, Drain.
+	//
+	// Cordon and Uncordon are one-shot PATCHes; we audit-log the
+	// request and the result, and that's the whole story. Drain is
+	// async because the eviction loop can take minutes against busy
+	// nodes — we hand the supervisor a parent context the UI can
+	// cancel, kick the Drain goroutine, and forward each progress
+	// event to the bubbletea program from a small fan-out goroutine.
+	m.OnCordon = func(focusedCtx, node string) tea.Msg {
+		klog.Infof("cordon: %s on %s requested", node, focusedCtx)
+		opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		res := sup.Cordon(opCtx, focusedCtx, node)
+		if res.OK {
+			klog.Infof("cordon: %s on %s OK", node, focusedCtx)
+		} else {
+			klog.Errorf("cordon: %s on %s FAILED: %s", node, focusedCtx, res.Err)
+		}
+		return ui.NodeOpResultMsg(res)
+	}
+	m.OnUncordon = func(focusedCtx, node string) tea.Msg {
+		klog.Infof("uncordon: %s on %s requested", node, focusedCtx)
+		opCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		res := sup.Uncordon(opCtx, focusedCtx, node)
+		if res.OK {
+			klog.Infof("uncordon: %s on %s OK", node, focusedCtx)
+		} else {
+			klog.Errorf("uncordon: %s on %s FAILED: %s", node, focusedCtx, res.Err)
+		}
+		return ui.NodeOpResultMsg(res)
+	}
+	m.OnDrainStart = func(focusedCtx, node string) tea.Msg {
+		klog.Infof("drain: %s on %s requested", node, focusedCtx)
+		// Drain context is detached from the per-request timeout —
+		// the UI cancels via the function we return on the
+		// DrainStartMsg, not via a wall-clock deadline. ctx is the
+		// process-level context, so an outer shutdown still aborts.
+		drainCtx, cancel := context.WithCancel(ctx)
+		progress := make(chan cluster.DrainProgress, 64)
+
+		go sup.Drain(drainCtx, focusedCtx, node, progress)
+
+		// Forwarder goroutine — drains the channel into the
+		// bubbletea program. We collect "blocked" pods locally so
+		// we can hand the final list to DrainDoneMsg without making
+		// the UI re-walk its own append-only list.
+		go func() {
+			var blocked []string
+			var finalDone, finalTotal int
+			var finalErr string
+			for ev := range progress {
+				prog.Send(ui.DrainProgressMsg(ev))
+				if ev.Total > finalTotal {
+					finalTotal = ev.Total
+				}
+				if ev.Done > finalDone {
+					finalDone = ev.Done
+				}
+				if ev.Phase == "blocked" {
+					blocked = append(blocked, ev.Pod+" ("+ev.Err+")")
+				}
+				if ev.Phase == "error" {
+					finalErr = ev.Err
+				}
+			}
+			klog.Infof("drain: %s on %s ended done=%d/%d err=%q blocked=%d",
+				node, focusedCtx, finalDone, finalTotal, finalErr, len(blocked))
+			prog.Send(ui.DrainDoneMsg{
+				Context: focusedCtx,
+				Node:    node,
+				Done:    finalDone,
+				Total:   finalTotal,
+				Err:     finalErr,
+				Blocked: blocked,
+			})
+			cancel() // releases the drain context once the stream is fully drained
+		}()
+
+		return ui.DrainStartMsg{
+			Context: focusedCtx,
+			Node:    node,
+			Cancel:  cancel,
+		}
+	}
+
 	// No mouse capture: kubetin does not use mouse events yet, and
 	// enabling it disables the terminal's native click-and-drag text
 	// selection, breaking copy-paste. Re-enable with WithMouseClicks

@@ -52,6 +52,21 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.exec.pickerOpen = true
 			m.exec.containers = []string{"app", "sidecar", "istio-proxy"}
 		}},
+		{"drain-confirm", 120, 40, ViewNodes, func(m *Model) {
+			m.drainConfirm.open = true
+			m.drainConfirm.node = "node-1"
+		}},
+		{"drain-progress", 120, 40, ViewNodes, func(m *Model) {
+			m.drainProgress.open = true
+			m.drainProgress.node = "node-1"
+			m.drainProgress.phase = "evicting"
+			m.drainProgress.current = "kube-system/coredns-abc"
+			m.drainProgress.done = 3
+			m.drainProgress.total = 10
+			m.drainProgress.blocked = []string{
+				"kube-system/etcd-0 (PDB blocked after 5 retries)",
+			}
+		}},
 		{"ns-picker", 120, 40, ViewPods, func(m *Model) {
 			m.nsPickerOpen = true
 			m.nsPickerOptions = []string{"(all namespaces)", "default", "kube-system"}

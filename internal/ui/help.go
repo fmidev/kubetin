@@ -77,7 +77,7 @@ var helpGroups = []helpGroup{
 	{
 		Title: "Inspect",
 		Bindings: [][2]string{
-			{"Enter", "action menu (Describe / Logs / Exec / Events / Delete)"},
+			{"Enter", "action menu (Describe / Logs / Exec / Events / Cordon / Drain / Delete)"},
 			{"d", "describe selected resource"},
 			{"Shift-Y", "(inside Secret describe) reveal data"},
 		},
