@@ -212,8 +212,8 @@ type actionMenuState struct {
 // Layout: title "ACTIONS" → kind / name / namespace stacked on
 // separate lines so realistic-length pod names don't cram the title,
 // → action rows with trailing status glyphs for denied (✗) and
-// pending (…). Destructive rows get a leading ⚠ glyph in addition to
-// the red label so danger reads even with colours off (NO_COLOR).
+// pending (…). Destructive rows render in red and sit below a dim
+// divider so the visual separation reads at a glance.
 func (m Model) renderActionMenuPanel() string {
 	if !m.actionMenu.open {
 		return ""
@@ -313,19 +313,17 @@ func (m Model) actionRow(i int, it actionItem, innerW, statusAt int) string {
 	}
 
 	label := it.Action.Label()
-	prefix := ""
 	style := m.Theme.Base
 	switch it.Status {
 	case actionAllowed:
 		if it.Action.destructive() {
 			style = m.Theme.StatusBad
-			prefix = m.Theme.StatusBad.Render("⚠ ")
 		}
 	case actionPending, actionDenied:
 		style = m.Theme.Dim
 	}
 
-	body := marker + prefix + style.Render(label)
+	body := marker + style.Render(label)
 
 	// Right-pad the body to statusAt then append the glyph.
 	bodyW := lipgloss.Width(body)
