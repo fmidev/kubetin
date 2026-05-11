@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.0](https://github.com/fmidev/kubetin/compare/v1.1.0...v1.2.0) (2026-05-11)
+
+
+### Features
+
+* exec into a container from the action menu ([#24](https://github.com/fmidev/kubetin/issues/24)) ([ca7f13a](https://github.com/fmidev/kubetin/commit/ca7f13a750a12687b53e1425284b7e52bab64d69))
+* scoped events view from the action menu ([#9](https://github.com/fmidev/kubetin/issues/9)) ([fca8055](https://github.com/fmidev/kubetin/commit/fca8055763a24732caf48a18a21e55c91ef860d4))
+
+
+### Bug Fixes
+
+* sort events by LastSeen, stable, with Reason tie-breaker ([#10](https://github.com/fmidev/kubetin/issues/10)) ([7641f60](https://github.com/fmidev/kubetin/commit/7641f60088ad9fc86cf4ce7786892bb6404d7252))
+
 ## [1.1.0](https://github.com/fmidev/kubetin/compare/v1.0.0...v1.1.0) (2026-05-10)
 
 
