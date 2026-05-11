@@ -128,16 +128,33 @@ func groupEvents(m map[types.UID]eventRow) []eventGroup {
 	for _, g := range byKey {
 		out = append(out, *g)
 	}
-	// Sort: severity desc (Warning first), then count desc, then
-	// lastSeen desc.
-	sort.Slice(out, func(i, j int) bool {
-		if (out[i].Type == "Warning") != (out[j].Type == "Warning") {
-			return out[i].Type == "Warning"
+	// Sort: most recent first, alphabetical Reason as tie-breaker.
+	//
+	// The prior sort used (Type=Warning desc, Count desc, LastSeen
+	// desc) and called sort.Slice. Two problems with that:
+	//
+	//  - Count is a moving target. Every time the event watcher
+	//    surfaces a fresh occurrence, the group's Count bumps and
+	//    the row can jump several positions. From the user's seat
+	//    that read as "order changes for no apparent reason."
+	//
+	//  - sort.Slice is not stable. With three mutable keys and lots
+	//    of ties (events from one rollout hitting the same second),
+	//    two consecutive renders could produce different orderings
+	//    of the same set.
+	//
+	// Sorting by LastSeen-only matches the log-viewer mental model
+	// (newest at top, older drifts down). Severity is still visible
+	// from the coloured ● dot at the start of every card, so taking
+	// Type out of the sort key doesn't hide anything — it just stops
+	// it from competing with the time dimension. SliceStable + a
+	// Reason tie-breaker gives a fully deterministic order even when
+	// timestamps coincide.
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].LastSeen.Equal(out[j].LastSeen) {
+			return out[i].LastSeen.After(out[j].LastSeen)
 		}
-		if out[i].Count != out[j].Count {
-			return out[i].Count > out[j].Count
-		}
-		return out[i].LastSeen.After(out[j].LastSeen)
+		return out[i].Reason < out[j].Reason
 	})
 	return out
 }
