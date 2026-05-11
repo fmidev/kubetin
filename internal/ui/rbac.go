@@ -57,7 +57,7 @@ func (m Model) renderRBAC(canvasWidth, canvasHeight int) string {
 	title := m.Theme.Title.Render(" RBAC ") +
 		m.Theme.Dim.Render(" cluster "+m.WatchedContext)
 	if showNs {
-		title += m.Theme.Dim.Render(" · ns "+m.namespace)
+		title += m.Theme.Dim.Render(" · ns " + m.namespace)
 	}
 	b.WriteString(title + "\n")
 	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", w-2)) + "\n")

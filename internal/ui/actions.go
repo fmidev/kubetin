@@ -147,11 +147,11 @@ func verbsForAction(a Action, ref cluster.DescribeRef) (av actionVerb, gated boo
 // verb/group/resource that we want the apiserver to rule on, grouped
 // by the Kind it relates to so the overlay can section the output.
 type rbacProbe struct {
-	Group     string // for display grouping (Pods, Deployments, …) — not the API group
-	Action    string // human label ("Logs", "Exec", "Delete pods")
-	Verb      string
-	APIGroup  string // RBAC group ("", "apps")
-	Resource  string // may include subresource ("pods/log")
+	Group    string // for display grouping (Pods, Deployments, …) — not the API group
+	Action   string // human label ("Logs", "Exec", "Delete pods")
+	Verb     string
+	APIGroup string // RBAC group ("", "apps")
+	Resource string // may include subresource ("pods/log")
 }
 
 // rbacProbeSet enumerates every verb the action menu ever gates on,

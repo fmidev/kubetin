@@ -193,22 +193,22 @@ type Model struct {
 	nsSortKey  NsSortKey
 	nsSortDesc bool
 
-	helpOpen       bool
-	describe       describeState
-	actionMenu     actionMenuState
-	deleteConfirm  deleteConfirmState
-	scaleConfirm   scaleConfirmState
-	restartConfirm restartConfirmState
-	drainConfirm   drainConfirmState
-	drainProgress  drainProgressState
-	logs           logsState
-	exec           execState
+	helpOpen            bool
+	describe            describeState
+	actionMenu          actionMenuState
+	deleteConfirm       deleteConfirmState
+	scaleConfirm        scaleConfirmState
+	restartConfirm      restartConfirmState
+	drainConfirm        drainConfirmState
+	drainProgress       drainProgressState
+	logs                logsState
+	exec                execState
 	permissions         map[string]permState // cached SSAR results, keyed via cluster.PermissionKey
 	permissionsInFlight map[string]struct{}  // dispatched but not yet returned; lets the RBAC overlay render "?" without re-firing
 	rbacOpen            bool
-	overviewScroll int
-	toast          string // ephemeral one-line status (e.g. "Deleted Pod/foo")
-	toastUntil     time.Time
+	overviewScroll      int
+	toast               string // ephemeral one-line status (e.g. "Deleted Pod/foo")
+	toastUntil          time.Time
 
 	// eventScope, when non-nil, restricts ViewEvents to events whose
 	// involvedObject matches the given Kind/Namespace/Name. Set by the
@@ -226,15 +226,15 @@ type Model struct {
 // we render; store provides multi-cluster probe state for the header.
 func New(context string, store *model.Store, contexts []string) Model {
 	return Model{
-		WatchedContext: context,
-		Store:          store,
-		Theme:          DefaultTheme(),
-		Contexts:       contexts,
-		pods:           make(map[types.UID]podRow),
-		nodes:          make(map[types.UID]nodeRow),
-		deployments:    make(map[types.UID]deploymentRow),
-		events:         make(map[types.UID]eventRow),
-		namespaces:     make(map[types.UID]nsRow),
+		WatchedContext:      context,
+		Store:               store,
+		Theme:               DefaultTheme(),
+		Contexts:            contexts,
+		pods:                make(map[types.UID]podRow),
+		nodes:               make(map[types.UID]nodeRow),
+		deployments:         make(map[types.UID]deploymentRow),
+		events:              make(map[types.UID]eventRow),
+		namespaces:          make(map[types.UID]nsRow),
 		permissions:         make(map[string]permState),
 		permissionsInFlight: make(map[string]struct{}),
 	}
