@@ -15,6 +15,7 @@ type Action int
 const (
 	ActDescribe Action = iota
 	ActLogs
+	ActEvents
 	ActScale
 	ActRestart
 	ActDelete
@@ -26,6 +27,8 @@ func (a Action) Label() string {
 		return "Describe"
 	case ActLogs:
 		return "Logs"
+	case ActEvents:
+		return "Events"
 	case ActScale:
 		return "Scale"
 	case ActRestart:
@@ -45,11 +48,11 @@ func (a Action) destructive() bool { return a == ActDelete }
 func actionsFor(kind string) []Action {
 	switch kind {
 	case "Pod":
-		return []Action{ActDescribe, ActLogs, ActDelete}
+		return []Action{ActDescribe, ActLogs, ActEvents, ActDelete}
 	case "Deployment":
-		return []Action{ActDescribe, ActScale, ActRestart, ActLogs, ActDelete}
+		return []Action{ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
 	case "Node":
-		return []Action{ActDescribe}
+		return []Action{ActDescribe, ActEvents}
 	}
 	return []Action{ActDescribe}
 }
@@ -85,6 +88,13 @@ func verbsForAction(a Action, ref cluster.DescribeRef) (av actionVerb, gated boo
 		// `kubectl rollout restart` patches a template annotation on
 		// the deployment object proper.
 		return actionVerb{"patch", "apps", "deployments"}, true
+	case ActEvents:
+		// Scoping the events view to a resource just walks the
+		// already-watched event cache — no extra API call is made.
+		// But the event watcher itself needs `list/watch events` to
+		// have populated that cache, so gate on the same verb so we
+		// don't offer a menu item the user's RBAC can't actually feed.
+		return actionVerb{"list", "", "events"}, true
 	}
 	return actionVerb{}, false
 }

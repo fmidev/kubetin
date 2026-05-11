@@ -155,6 +155,15 @@ type Model struct {
 	toast          string // ephemeral one-line status (e.g. "Deleted Pod/foo")
 	toastUntil     time.Time
 
+	// eventScope, when non-nil, restricts ViewEvents to events whose
+	// involvedObject matches the given Kind/Namespace/Name. Set by the
+	// action menu's "Events" item so the user can drill from a single
+	// pod / deployment / node into its events. Cleared on Esc inside
+	// ViewEvents and on every switch *away* from ViewEvents — the
+	// scope shouldn't survive into the next visit, otherwise it gets
+	// confusing fast.
+	eventScope *eventScopeRef
+
 	quitMsg string
 }
 
@@ -504,6 +513,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents = false, false, false, false
 		m.syncStartedAt = time.Now()
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
+		// A scoped object on the previous cluster doesn't exist on the
+		// new one — clear so the next render isn't filtered down to
+		// zero matches with no obvious way to recover.
+		m.eventScope = nil
 		return m, nil
 
 	case ProbeTickMsg:
@@ -562,6 +575,7 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "f1":
 		m.view = ViewOverview
 		m.cursor = ""
+		m.eventScope = nil
 	case "f2":
 		m.debugMode = !m.debugMode
 	case "?":
@@ -582,25 +596,33 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.view != ViewPods {
 			m.view = ViewPods
 			m.cursor = ""
+			m.eventScope = nil
 			m.anchorCursorToVisible()
 		}
 	case "2":
 		if m.view != ViewDeployments {
 			m.view = ViewDeployments
 			m.cursor = ""
+			m.eventScope = nil
 			m.anchorCursorToVisible()
 		}
 	case "3":
 		if m.view != ViewNodes {
 			m.view = ViewNodes
 			m.cursor = ""
+			m.eventScope = nil
 			m.anchorCursorToVisible()
 		}
 	case "4":
+		// Pressing 4 is "show me events" (unscoped). If the user got
+		// here via the action menu's Events item the scope is set;
+		// pressing 4 again is the way to clear it without leaving
+		// the events view.
 		if m.view != ViewEvents {
 			m.view = ViewEvents
 			m.cursor = ""
 		}
+		m.eventScope = nil
 	case "/":
 		m.filterFocused = true
 	case "n":
@@ -622,6 +644,7 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.filterText = ""
 		m.namespace = ""
+		m.eventScope = nil
 		m.anchorCursorToVisible()
 	}
 	return m, nil
@@ -821,6 +844,17 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
 		return m.openLogsForCursor(ref)
+	case ActEvents:
+		ref := m.actionMenu.ref
+		m.actionMenu.open = false
+		m.eventScope = &eventScopeRef{
+			Kind:      ref.Kind,
+			Namespace: ref.Namespace,
+			Name:      ref.Name,
+		}
+		m.view = ViewEvents
+		m.cursor = ""
+		return m, nil
 	case ActScale:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
