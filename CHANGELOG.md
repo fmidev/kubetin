@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0](https://github.com/fmidev/kubetin/compare/v1.2.0...v1.3.0) (2026-05-12)
+
+
+### Features
+
+* namespace listing view with action menu ([#28](https://github.com/fmidev/kubetin/issues/28)) ([63bac1c](https://github.com/fmidev/kubetin/commit/63bac1c73a0db9054f3ea5729b1d111665e45af6))
+* node cordon / uncordon / drain from the action menu ([#25](https://github.com/fmidev/kubetin/issues/25)) ([a9721a4](https://github.com/fmidev/kubetin/commit/a9721a414be27d5fec5b187413c8a689355927d8))
+* per-namespace resource counts (PODS / DEP / WRN) ([#31](https://github.com/fmidev/kubetin/issues/31)) ([783c156](https://github.com/fmidev/kubetin/commit/783c1565e1ff772e3ef74a00ca5591162297d5e8))
+* RBAC visibility — overlay + inline action-menu state ([#33](https://github.com/fmidev/kubetin/issues/33)) ([8e59c6b](https://github.com/fmidev/kubetin/commit/8e59c6b424ef0d2102e47e207e51e9afe7ad823b))
+* redesign action menu — colourful layout + floating overlay ([#34](https://github.com/fmidev/kubetin/issues/34)) ([aa656eb](https://github.com/fmidev/kubetin/commit/aa656eb5b87e7d0a3f88f4d677256f3808c5e342))
+* sortable columns in the namespace view ([#32](https://github.com/fmidev/kubetin/issues/32)) ([3e40ec2](https://github.com/fmidev/kubetin/commit/3e40ec2f26c59d4fdf9477e30ca4454e911f33f6))
+
 ## [1.2.0](https://github.com/fmidev/kubetin/compare/v1.1.0...v1.2.0) (2026-05-11)
 
 
