@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -33,7 +32,7 @@ func (a Action) Label() string {
 	case ActLogs:
 		return "Logs"
 	case ActExec:
-		return "Exec (shell)"
+		return "Shell"
 	case ActEvents:
 		return "Events"
 	case ActScale:
@@ -205,68 +204,183 @@ type actionMenuState struct {
 	notice  string // ephemeral status line (e.g. "Logs: not yet implemented")
 }
 
-// renderActionMenu draws the centered actions modal.
-func (m Model) renderActionMenu(canvasWidth, canvasHeight int) string {
+// renderActionMenuPanel returns just the bordered modal box (no
+// canvas placement). The caller composites it over the underlying
+// table via overlayAt so the row the user came from stays visible
+// alongside the menu.
+//
+// Layout: title "ACTIONS" → kind / name / namespace stacked on
+// separate lines so realistic-length pod names don't cram the title,
+// → action rows with trailing status glyphs for denied (✗) and
+// pending (…). Destructive rows render in red and sit below a dim
+// divider so the visual separation reads at a glance.
+func (m Model) renderActionMenuPanel() string {
 	if !m.actionMenu.open {
 		return ""
 	}
-	const w = 50
+	const (
+		w        = 52
+		innerW   = w - 6 // box width minus border (2) and padding (2*2)
+		statusAt = innerW - 2
+	)
 
 	var b strings.Builder
-	title := m.Theme.Title.Render(" actions ") +
-		m.Theme.Dim.Render(" "+actionsTitle(m.actionMenu.ref))
-	b.WriteString(title + "\n")
-	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", w-2)) + "\n")
+
+	// Resource ident is split across the border + first row: the top
+	// border carries "<Kind> Actions", the first inner row carries
+	// the centered <ns>/<name>, the bottom border carries the cluster
+	// context. Keeps the dialog body focused on the action list with
+	// minimal chrome.
+	resource := centerLine(actionMenuResource(m.actionMenu.ref), innerW, m.Theme.Header)
+	b.WriteString(resource + "\n")
+	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
+
+	// Destructive rows render in red; that's enough to set them apart
+	// from safe actions without an extra divider eating a row.
 	for i, it := range m.actionMenu.options {
-		marker := "  "
-		if i == m.actionMenu.cursor {
-			marker = m.Theme.Title.Render(" ›")
-		}
-		label := it.Action.Label()
-		var styled string
-		var suffix string
-		switch it.Status {
-		case actionAllowed:
-			style := m.Theme.Base
-			if it.Action.destructive() {
-				style = m.Theme.StatusBad
-			}
-			styled = style.Render(label)
-		case actionPending:
-			styled = m.Theme.Dim.Render(label)
-			suffix = m.Theme.Dim.Render(" …")
-		case actionDenied:
-			styled = m.Theme.Dim.Render(label)
-			suffix = m.Theme.Dim.Render(" (no permission)")
-		}
-		line := fmt.Sprintf("%s %s%s", marker, styled, suffix)
-		if i == m.actionMenu.cursor && it.Status == actionAllowed {
-			line = renderSelected(line)
-		}
-		b.WriteString(line + "\n")
+		b.WriteString(m.actionRow(i, it, innerW, statusAt) + "\n")
 	}
-	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", w-2)) + "\n")
+
+	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
 	if m.actionMenu.notice != "" {
-		b.WriteString(m.Theme.StatusWrn.Render(" "+m.actionMenu.notice) + "\n")
+		b.WriteString(m.Theme.StatusWrn.Render(m.actionMenu.notice) + "\n")
 	}
-	b.WriteString(m.Theme.Footer.Render(" j/k  enter  esc"))
+	b.WriteString(m.Theme.Footer.Render("↑↓ · enter · esc"))
 
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("244")).
-		Padding(0, 1).
+		Padding(1, 2).
 		Width(w).
 		Render(b.String())
 
-	return lipgloss.Place(canvasWidth, canvasHeight, lipgloss.Center, lipgloss.Center, box)
+	// Top border: "<Kind> Actions" in Title style. Bottom border:
+	// cluster context in Dim. Reserve 6 cells of border + spacing on
+	// each side when truncating so the labels never collide with the
+	// corners.
+	const titleBudget = w - 6
+	top := m.Theme.Title.Render(truncate(actionMenuTitle(m.actionMenu.ref), titleBudget))
+	bottom := ""
+	if m.WatchedContext != "" {
+		bottom = m.Theme.Header.Render(truncate(m.WatchedContext, titleBudget))
+	}
+	return setBorderTitles(box, top, bottom)
 }
 
-func actionsTitle(r cluster.DescribeRef) string {
-	if r.Name == "" {
+// actionMenuTitle returns the "<Kind> Actions" label for the top
+// border. Falls back to "Actions" if the kind is unknown.
+func actionMenuTitle(ref cluster.DescribeRef) string {
+	if ref.Kind == "" {
+		return "Actions"
+	}
+	return ref.Kind + " Actions"
+}
+
+// actionMenuResource returns the ns/name pair (or just name for
+// cluster-scoped kinds) that's rendered centered as the first content
+// row of the dialog. Empty if the menu opened without a target.
+func actionMenuResource(ref cluster.DescribeRef) string {
+	if ref.Name == "" {
 		return ""
 	}
-	if r.Namespace != "" {
-		return r.Kind + "/" + r.Name + " · " + r.Namespace
+	if ref.Namespace != "" {
+		return ref.Namespace + "/" + ref.Name
 	}
-	return r.Kind + "/" + r.Name
+	return ref.Name
+}
+
+// centerLine returns s centered inside a width-wide string, styled.
+// Long content is truncated to width; short content is padded with
+// spaces on both sides.
+func centerLine(s string, width int, style lipgloss.Style) string {
+	if width <= 0 {
+		return ""
+	}
+	t := truncate(s, width)
+	w := lipgloss.Width(t)
+	if w >= width {
+		return style.Render(t)
+	}
+	left := (width - w) / 2
+	right := width - w - left
+	return strings.Repeat(" ", left) + style.Render(t) + strings.Repeat(" ", right)
+}
+
+// setBorderTitles splices top/bottom labels into the box's first and
+// last lines respectively. Either label may be empty (the splice for
+// that line is skipped). Reuses the ANSI-aware spliceLine helper so
+// border colour state outside the label is preserved.
+func setBorderTitles(box, top, bottom string) string {
+	if box == "" {
+		return box
+	}
+	lines := strings.Split(box, "\n")
+	if len(lines) == 0 {
+		return box
+	}
+	if top != "" {
+		lines[0] = spliceCentered(lines[0], top)
+	}
+	if bottom != "" && len(lines) > 1 {
+		last := len(lines) - 1
+		lines[last] = spliceCentered(lines[last], bottom)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func spliceCentered(line, label string) string {
+	decorated := " " + label + " "
+	col := (lipgloss.Width(line) - lipgloss.Width(decorated)) / 2
+	if col < 1 {
+		col = 1
+	}
+	return spliceLine(line, decorated, col)
+}
+
+// actionRow builds one menu row at width innerW. The trailing status
+// glyph (✗ / …) sits at column statusAt so the column reads cleanly
+// across rows. Cursor row gets both the › marker and the bg
+// highlight (the user asked for both signals).
+func (m Model) actionRow(i int, it actionItem, innerW, statusAt int) string {
+	marker := "  "
+	if i == m.actionMenu.cursor {
+		marker = m.Theme.Title.Render("›") + " "
+	}
+
+	label := it.Action.Label()
+	style := m.Theme.Base
+	switch it.Status {
+	case actionAllowed:
+		if it.Action.destructive() {
+			style = m.Theme.StatusBad
+		}
+	case actionPending, actionDenied:
+		style = m.Theme.Dim
+	}
+
+	body := marker + style.Render(label)
+
+	// Right-pad the body to statusAt then append the glyph.
+	bodyW := lipgloss.Width(body)
+	if bodyW < statusAt {
+		body += strings.Repeat(" ", statusAt-bodyW)
+	}
+	switch it.Status {
+	case actionPending:
+		body += m.Theme.Dim.Render("…")
+	case actionDenied:
+		body += m.Theme.StatusBad.Render("✗")
+	}
+
+	// Final pad-to-innerW so renderSelected paints the highlight all
+	// the way across the row.
+	bodyW = lipgloss.Width(body)
+	if bodyW < innerW {
+		body += strings.Repeat(" ", innerW-bodyW)
+	}
+
+	if i == m.actionMenu.cursor && it.Status == actionAllowed {
+		body = renderSelected(body)
+	}
+	return body
 }

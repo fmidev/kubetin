@@ -115,3 +115,79 @@ func TestRenderSelected_PlainRowCheapWrap(t *testing.T) {
 		t.Fatalf("plain row wrap mismatch:\ngot=%q\nwant=%q", got, want)
 	}
 }
+
+// TestOverlayAt covers the floating-overlay splicer that the action
+// menu uses. The contract: same line count and per-line cell width as
+// the base, with panel content substituted at the (col, row) corner.
+func TestOverlayAt(t *testing.T) {
+	t.Run("plain narrower panel splices into base", func(t *testing.T) {
+		base := strings.Repeat("X", 20) + "\n" + strings.Repeat("Y", 20) + "\n" + strings.Repeat("Z", 20)
+		panel := "[ABC]\n[DEF]"
+		got := overlayAt(base, panel, 5, 1)
+		// Row 0 untouched.
+		lines := strings.Split(got, "\n")
+		if lines[0] != strings.Repeat("X", 20) {
+			t.Errorf("row 0 changed unexpectedly: %q", lines[0])
+		}
+		// Row 1 has panel at col 5: 5 Y's, [ABC], remaining Y's.
+		// `overlayAt` adds a trailing \x1b[0m between panel and rest.
+		wantRow1 := strings.Repeat("Y", 5) + "[ABC]" + "\x1b[0m" + strings.Repeat("Y", 10)
+		if lines[1] != wantRow1 {
+			t.Errorf("row 1: got %q, want %q", lines[1], wantRow1)
+		}
+		// Row 2 has panel at col 5: same shape for "[DEF]" + Z's.
+		wantRow2 := strings.Repeat("Z", 5) + "[DEF]" + "\x1b[0m" + strings.Repeat("Z", 10)
+		if lines[2] != wantRow2 {
+			t.Errorf("row 2: got %q, want %q", lines[2], wantRow2)
+		}
+	})
+
+	t.Run("panel rows past base are clipped", func(t *testing.T) {
+		base := "AAA"
+		panel := "X\nY\nZ"
+		got := overlayAt(base, panel, 0, 1)
+		// Base has one line; panel rows 1 and 2 land past EOF and are dropped.
+		if got != base {
+			t.Errorf("expected base unchanged for out-of-bounds panel rows, got %q", got)
+		}
+	})
+
+	t.Run("empty inputs are no-ops", func(t *testing.T) {
+		if got := overlayAt("", "X", 0, 0); got != "" {
+			t.Errorf("empty base should return empty, got %q", got)
+		}
+		if got := overlayAt("AAA", "", 0, 0); got != "AAA" {
+			t.Errorf("empty panel should return base unchanged, got %q", got)
+		}
+	})
+
+	t.Run("ANSI styled base outside splice region is preserved", func(t *testing.T) {
+		red := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+		base := red.Render("REDREDRED") + "PLAIN" // 9 styled + 5 plain = 14 cells
+		panel := "[X]"                            // 3 cells
+		got := overlayAt(base, panel, 6, 0)
+		// Visible width of result should match base.
+		if w := lipgloss.Width(got); w != lipgloss.Width(base) {
+			t.Errorf("width changed: got %d, want %d", w, lipgloss.Width(base))
+		}
+		// Panel marker must be present somewhere.
+		if !strings.Contains(got, "[X]") {
+			t.Errorf("panel not in output: %q", got)
+		}
+		// Red SGR should still be present (some red text remained left of panel).
+		if !strings.Contains(got, "\x1b[") {
+			t.Errorf("ANSI escapes stripped: %q", got)
+		}
+	})
+
+	t.Run("panel past EOL pads with spaces", func(t *testing.T) {
+		base := "ABC" // 3 cells
+		panel := "X"  // 1 cell
+		got := overlayAt(base, panel, 10, 0)
+		// First 3 chars are ABC, then 7 spaces of padding, then panel, then reset.
+		want := "ABC" + strings.Repeat(" ", 7) + "X" + "\x1b[0m"
+		if got != want {
+			t.Errorf("padding wrong: got %q, want %q", got, want)
+		}
+	})
+}

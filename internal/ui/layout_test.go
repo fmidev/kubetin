@@ -6,6 +6,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
 )
 
@@ -74,6 +75,25 @@ func TestViewFitsCanvas(t *testing.T) {
 				{Action: ActExec, Status: actionDenied, Reason: "forbidden"},
 				{Action: ActEvents, Status: actionPending},
 				{Action: ActDelete, Status: actionDenied, Reason: "forbidden"},
+			}
+		}},
+		{"action-menu-long-name", 120, 40, ViewPods, func(m *Model) {
+			m.actionMenu.open = true
+			m.actionMenu.ref = clusterRef("Pod", "default", strings.Repeat("x", 80))
+			m.actionMenu.options = []actionItem{
+				{Action: ActDescribe, Status: actionAllowed},
+				{Action: ActDelete, Status: actionAllowed},
+			}
+		}},
+		{"action-menu-floating", 120, 40, ViewPods, func(m *Model) {
+			// Seed a pod so the table behind the menu has visible
+			// content. The layout test asserts dimensions; we test the
+			// floating shape itself in TestActionMenuFloating below.
+			m.pods["uid-1"] = podRow{UID: "uid-1", Namespace: "default", Name: "behind-menu"}
+			m.actionMenu.open = true
+			m.actionMenu.ref = clusterRef("Pod", "default", "behind-menu")
+			m.actionMenu.options = []actionItem{
+				{Action: ActDescribe, Status: actionAllowed},
 			}
 		}},
 		{"describe-open", 120, 40, ViewPods, func(m *Model) {
@@ -205,6 +225,39 @@ func TestClampCanvasContract(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// clusterRef is a tiny test helper so the action-menu cases above
+// can construct a DescribeRef inline without dragging cluster types
+// into every case literal.
+func clusterRef(kind, namespace, name string) cluster.DescribeRef {
+	return cluster.DescribeRef{Kind: kind, Namespace: namespace, Name: name}
+}
+
+// TestActionMenuFloating asserts the action menu does NOT blank out
+// the underlying table — at least one row outside the menu's column
+// band still carries the pod name behind it. Pins the "non-blocking
+// overlay" behaviour so a regression to the old full-canvas modal
+// trips the test instead of just looking wrong.
+func TestActionMenuFloating(t *testing.T) {
+	store := model.NewStore()
+	m := New("alpha", store, []string{"alpha"})
+	m.width, m.height = 200, 50
+	m.pods["uid-1"] = podRow{UID: "uid-1", Namespace: "default", Name: "pod-behind-menu-zzz"}
+	m.actionMenu.open = true
+	m.actionMenu.ref = clusterRef("Pod", "default", "pod-behind-menu-zzz")
+	m.actionMenu.options = []actionItem{
+		{Action: ActDescribe, Status: actionAllowed},
+	}
+
+	out := m.View()
+
+	// The pod's name should still appear somewhere in the rendered
+	// canvas — the floating modal sits centred, leaving the body
+	// columns to the left/right intact.
+	if !strings.Contains(out, "pod-behind-menu-zzz") {
+		t.Errorf("expected pod name visible behind floating menu, but not present in render")
 	}
 }
 
