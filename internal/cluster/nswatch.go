@@ -27,14 +27,25 @@ const (
 // columns the table renders (plus UID for diffing). Labels travel as
 // a copied map so the consumer can mutate freely without poking the
 // informer cache.
+//
+// ResourceKind identifies whether this came from the core
+// `namespaces` API or the OpenShift `project.openshift.io/v1 projects`
+// API. The UI uses it to retitle the table ("namespaces" vs
+// "projects") and to render Project-only fields like DisplayName.
+//
+// DisplayName mirrors the `openshift.io/display-name` annotation
+// that Projects routinely carry. Empty for plain Namespaces and
+// Projects without the annotation.
 type NamespaceEvent struct {
-	Kind      NsEventKind
-	Context   string
-	Name      string
-	UID       types.UID
-	Phase     corev1.NamespacePhase // Active | Terminating
-	CreatedAt time.Time
-	Labels    map[string]string
+	Kind         NsEventKind
+	Context      string
+	Name         string
+	UID          types.UID
+	Phase        corev1.NamespacePhase // Active | Terminating
+	CreatedAt    time.Time
+	Labels       map[string]string
+	ResourceKind string // "Namespace" or "Project"
+	DisplayName  string
 }
 
 // NamespaceWatcher mirrors NodeWatcher: a cluster-scoped informer
@@ -62,6 +73,10 @@ func NewNamespaceWatcher(ctxName string, cap int) *NamespaceWatcher {
 // is decided by the supervisor's actual-access probe, not the
 // kubeconfig hint, so a microk8s admin (kubeconfig pins `default`)
 // still sees namespaces.
+//
+// We also skip when the cluster exposes project.openshift.io/v1 AND
+// the user can list projects: that's the case where the ProjectWatcher
+// is the source of truth, and running both would double-emit rows.
 func (w *NamespaceWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
@@ -73,6 +88,11 @@ func (w *NamespaceWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	}
 	if sup.ResolveScope(ctx, w.Context, clientset) != "" {
 		klog.Infof("nswatch[%s]: skipped (namespace-scoped context)", w.Context)
+		<-ctx.Done()
+		return nil
+	}
+	if projectsPreferred(ctx, sup, w.Context, restCfg) {
+		klog.Infof("nswatch[%s]: skipped (Projects API preferred on this cluster)", w.Context)
 		<-ctx.Done()
 		return nil
 	}
@@ -127,13 +147,14 @@ func (w *NamespaceWatcher) emit(kind NsEventKind, obj any) {
 		}
 	}
 	ev := NamespaceEvent{
-		Kind:      kind,
-		Context:   w.Context,
-		Name:      ns.Name,
-		UID:       ns.UID,
-		Phase:     ns.Status.Phase,
-		CreatedAt: ns.CreationTimestamp.Time,
-		Labels:    labels,
+		Kind:         kind,
+		Context:      w.Context,
+		Name:         ns.Name,
+		UID:          ns.UID,
+		Phase:        ns.Status.Phase,
+		CreatedAt:    ns.CreationTimestamp.Time,
+		Labels:       labels,
+		ResourceKind: "Namespace",
 	}
 	select {
 	case w.Out <- ev:

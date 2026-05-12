@@ -591,10 +591,23 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	// always spawn it — RBAC checks live one layer down rather than
 	// being duplicated here.
 	nsw := cluster.NewNamespaceWatcher(target, 256)
-	go forwardNsEvents(child, nsw, c.prog)
+	go forwardNsEvents(child, nsw.Out, c.prog)
 	go func() {
 		if err := nsw.Run(child, c.sup); err != nil {
 			klog.Errorf("namespace watcher (%s) exited: %v", target, err)
+		}
+	}()
+
+	// Project watcher (OpenShift). Self-gates inside Run(): no-ops
+	// when the cluster doesn't expose project.openshift.io/v1 or the
+	// user can't list projects. When it IS the source of truth, the
+	// namespace watcher above no-ops via its own projectsPreferred
+	// check, so the two are mutually exclusive at runtime.
+	projw := cluster.NewProjectWatcher(target, 256)
+	go forwardNsEvents(child, projw.Out, c.prog)
+	go func() {
+		if err := projw.Run(child, c.sup); err != nil {
+			klog.Errorf("project watcher (%s) exited: %v", target, err)
 		}
 	}()
 
@@ -663,12 +676,16 @@ func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p *tea.Progr
 	}
 }
 
-func forwardNsEvents(ctx context.Context, w *cluster.NamespaceWatcher, p *tea.Program) {
+// forwardNsEvents pumps NamespaceEvents (from either NamespaceWatcher
+// or ProjectWatcher — both emit the same shape) into the bubbletea
+// program. Taking the channel directly rather than the concrete
+// watcher type keeps the forwarder shared.
+func forwardNsEvents(ctx context.Context, out <-chan cluster.NamespaceEvent, p *tea.Program) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case ev := <-w.Out:
+		case ev := <-out:
 			p.Send(ui.NsEventMsg(ev))
 		}
 	}

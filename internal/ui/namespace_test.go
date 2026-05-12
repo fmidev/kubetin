@@ -6,6 +6,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/fmidev/kubetin/internal/cluster"
 )
 
 // TestCollectNsCounts pins the three documented invariants of the
@@ -131,6 +133,86 @@ func TestNsSortKeyNextCycle(t *testing.T) {
 		if k != w {
 			t.Errorf("step %d: got %v, want %v", i, k, w)
 		}
+	}
+}
+
+// TestApplyNsEvent_Project covers the OpenShift Project mapping —
+// the watcher carries ResourceKind="Project" and the openshift.io
+// display-name annotation; both must land on the row so the renderer
+// can swap the table title and show "name · display-name".
+func TestApplyNsEvent_Project(t *testing.T) {
+	m := map[types.UID]nsRow{}
+	applyNsEvent(m, cluster.NamespaceEvent{
+		Kind:         cluster.NsAdded,
+		Context:      "ocp",
+		UID:          "p1",
+		Name:         "smartmetserver",
+		Phase:        corev1.NamespaceActive,
+		CreatedAt:    time.Now(),
+		ResourceKind: "Project",
+		DisplayName:  "SmartMet Server",
+	})
+	r, ok := m["p1"]
+	if !ok {
+		t.Fatal("expected p1 in map after Added event")
+	}
+	if r.ResourceKind != "Project" {
+		t.Errorf("ResourceKind = %q, want Project", r.ResourceKind)
+	}
+	if r.DisplayName != "SmartMet Server" {
+		t.Errorf("DisplayName = %q, want %q", r.DisplayName, "SmartMet Server")
+	}
+}
+
+// TestNamespacesNoun returns "projects" if any cached row is a
+// Project, otherwise "namespaces" — drives the table title and the
+// empty-state placeholder.
+func TestNamespacesNoun(t *testing.T) {
+	t.Run("plain namespaces", func(t *testing.T) {
+		m := Model{namespaces: map[types.UID]nsRow{
+			"a": {UID: "a", Name: "default", ResourceKind: "Namespace"},
+		}}
+		if got := m.namespacesNoun(); got != "namespaces" {
+			t.Errorf("got %q, want namespaces", got)
+		}
+	})
+	t.Run("with project rows", func(t *testing.T) {
+		m := Model{namespaces: map[types.UID]nsRow{
+			"a": {UID: "a", Name: "default", ResourceKind: "Namespace"},
+			"b": {UID: "b", Name: "smartmet", ResourceKind: "Project"},
+		}}
+		if got := m.namespacesNoun(); got != "projects" {
+			t.Errorf("got %q, want projects", got)
+		}
+	})
+	t.Run("empty falls back to namespaces", func(t *testing.T) {
+		m := Model{namespaces: map[types.UID]nsRow{}}
+		if got := m.namespacesNoun(); got != "namespaces" {
+			t.Errorf("got %q, want namespaces", got)
+		}
+	})
+}
+
+// TestNsNameCell renders the NAME column. Plain namespaces show only
+// the name; Projects with a display-name show "name · display"; no
+// duplication when the display name equals the resource name.
+func TestNsNameCell(t *testing.T) {
+	cases := []struct {
+		name string
+		in   nsRow
+		want string
+	}{
+		{"plain namespace", nsRow{Name: "default"}, "default"},
+		{"project no display", nsRow{Name: "smartmet", ResourceKind: "Project"}, "smartmet"},
+		{"project with display", nsRow{Name: "smartmet", DisplayName: "SmartMet Server"}, "smartmet · SmartMet Server"},
+		{"display equals name", nsRow{Name: "smartmet", DisplayName: "smartmet"}, "smartmet"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nsNameCell(tc.in); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

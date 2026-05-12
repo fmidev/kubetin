@@ -11,15 +11,22 @@ import (
 	"github.com/fmidev/kubetin/internal/cluster"
 )
 
-// nsRow is the UI projection of a Namespace. The watcher copies
-// labels in defensively so we can sort/render without poking the
-// shared informer cache.
+// nsRow is the UI projection of a Namespace / Project. The watcher
+// copies labels in defensively so we can sort/render without poking
+// the shared informer cache.
+//
+// ResourceKind is "Namespace" or "Project" — drives the table title
+// ("namespaces" vs "projects") and the row formatting. DisplayName
+// is the openshift.io/display-name annotation that Projects routinely
+// carry; empty for plain Namespaces.
 type nsRow struct {
-	UID       types.UID
-	Name      string
-	Phase     corev1.NamespacePhase
-	CreatedAt time.Time
-	Labels    map[string]string
+	UID          types.UID
+	Name         string
+	Phase        corev1.NamespacePhase
+	CreatedAt    time.Time
+	Labels       map[string]string
+	ResourceKind string
+	DisplayName  string
 }
 
 func applyNsEvent(m map[types.UID]nsRow, ev cluster.NamespaceEvent) {
@@ -28,11 +35,13 @@ func applyNsEvent(m map[types.UID]nsRow, ev cluster.NamespaceEvent) {
 		delete(m, ev.UID)
 	default:
 		m[ev.UID] = nsRow{
-			UID:       ev.UID,
-			Name:      ev.Name,
-			Phase:     ev.Phase,
-			CreatedAt: ev.CreatedAt,
-			Labels:    ev.Labels,
+			UID:          ev.UID,
+			Name:         ev.Name,
+			Phase:        ev.Phase,
+			CreatedAt:    ev.CreatedAt,
+			Labels:       ev.Labels,
+			ResourceKind: ev.ResourceKind,
+			DisplayName:  ev.DisplayName,
 		}
 	}
 }
@@ -240,7 +249,7 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 	b.WriteByte('\n')
 
 	if len(rows) == 0 {
-		b.WriteString(m.emptyPlaceholder(m.syncedNamespaces, "namespaces"))
+		b.WriteString(m.emptyPlaceholder(m.syncedNamespaces, m.namespacesNoun()))
 		return b.String()
 	}
 
@@ -291,7 +300,7 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 		// pod / deploy / node tables use — namespaces don't have a
 		// useful "has-recent-warning" signal of their own.
 		line := " " +
-			padCol(r.Name, colName, m.Theme.Base) + "  " +
+			padCol(nsNameCell(r), colName, m.Theme.Base) + "  " +
 			padCol(string(r.Phase), colStatus, statusStyle) + "  " +
 			padColRight(formatAge(r.CreatedAt), colAge, m.Theme.Base) + "  " +
 			padColRight(itoa(c.pods), colPods, m.Theme.Base) + "  " +
@@ -314,6 +323,33 @@ type nsCount struct {
 	pods     int
 	deploys  int
 	warnings int
+}
+
+// namespacesNoun returns the table noun shown in the empty-state
+// placeholder — "projects" on OpenShift clusters, "namespaces"
+// otherwise. We look at any cached row's ResourceKind: by the time
+// the user has the view open, the watcher has populated at least one
+// row OR the cluster is genuinely empty (in which case "namespaces"
+// is the safe default — they wouldn't be using OpenShift if they
+// expected zero projects).
+func (m Model) namespacesNoun() string {
+	for _, r := range m.namespaces {
+		if r.ResourceKind == "Project" {
+			return "projects"
+		}
+	}
+	return "namespaces"
+}
+
+// nsNameCell returns the name to render in the NAME column. For
+// Projects with an openshift.io/display-name annotation we tack the
+// display name on after the resource name in a dim style — typical
+// OpenShift UX (oc projects shows both).
+func nsNameCell(r nsRow) string {
+	if r.DisplayName == "" || r.DisplayName == r.Name {
+		return r.Name
+	}
+	return r.Name + " · " + r.DisplayName
 }
 
 // collectNsCounts walks pods / deployments / events once and groups

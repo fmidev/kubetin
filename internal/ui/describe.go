@@ -63,6 +63,20 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 		}
 	case ViewNamespaces:
 		if r, ok := m.namespaces[m.cursor]; ok {
+			// OpenShift Projects describe (and delete) through the
+			// project.openshift.io/v1 API, not core/v1 namespaces.
+			// Pick the GVR + Kind to match the row's source so the
+			// action menu reads "Project Actions" / "Namespace Actions"
+			// correctly and Describe fetches the right object.
+			if r.ResourceKind == "Project" {
+				return cluster.DescribeRef{
+					Group:    "project.openshift.io",
+					Version:  "v1",
+					Resource: "projects",
+					Kind:     "Project",
+					Name:     r.Name,
+				}, true
+			}
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "namespaces", Kind: "Namespace",
 				Name: r.Name,

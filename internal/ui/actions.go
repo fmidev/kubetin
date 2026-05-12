@@ -73,10 +73,13 @@ func actionsFor(kind string) []Action {
 		return []Action{ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
 	case "Node":
 		return []Action{ActDescribe, ActEvents, ActCordon, ActUncordon, ActDrain}
-	case "Namespace":
+	case "Namespace", "Project":
 		// Set-as-active first because that's the by-far most-frequent
-		// action on a namespace row — the user already has the cursor
-		// on it, one Enter saves three keystrokes from the picker.
+		// action on a namespace / project row — the user already has
+		// the cursor on it, one Enter saves three keystrokes from the
+		// picker. Project (OpenShift) and Namespace get the same set;
+		// Project routes through the project.openshift.io API but the
+		// user-facing operations are identical.
 		return []Action{ActSetNamespace, ActDescribe, ActEvents, ActDelete}
 	}
 	return []Action{ActDescribe}
