@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/fmidev/kubetin/compare/v1.3.0...v1.4.0) (2026-05-12)
+
+
+### Features
+
+* OpenShift Project view (closes [#29](https://github.com/fmidev/kubetin/issues/29)) ([#35](https://github.com/fmidev/kubetin/issues/35)) ([be4617d](https://github.com/fmidev/kubetin/commit/be4617d462d49806347b985f0b8ad0da3bdf89ca))
+
 ## [1.3.0](https://github.com/fmidev/kubetin/compare/v1.2.0...v1.3.0) (2026-05-12)
 
 
