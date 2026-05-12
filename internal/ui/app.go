@@ -1655,7 +1655,7 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 		viewLabel = "events"
 		total = len(m.events)
 	case ViewNamespaces:
-		viewLabel = "namespaces"
+		viewLabel = m.namespacesNoun()
 		total = len(m.namespaces)
 	}
 	title := m.Theme.Title.Render(
