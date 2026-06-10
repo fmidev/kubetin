@@ -173,10 +173,29 @@ func containerDots(c nodeContainerCounts, width int, th Theme) string {
 	return b.String()
 }
 
+// nodeColumns in display order; the machine-identity tail (version,
+// IP, OS image, kernel, runtime) drops first on narrow panes, the
+// monitor core (node / status / cpu / mem) last. NODE never drops
+// and absorbs spare width.
+var nodeColumns = []column{
+	{min: 16, max: 28, prio: 0},  // NODE
+	{min: 10, max: 10, prio: 1},  // STATUS
+	{min: 8, max: 13, prio: 4},   // ROLES
+	{min: 7, max: 7, prio: 2},    // CPU
+	{min: 9, max: 9, prio: 3},    // MEM
+	{min: 12, max: 24, prio: 6},  // CONTAINERS
+	{min: 5, max: 5, prio: 5},    // AGE
+	{min: 16, max: 16, prio: 7},  // VERSION
+	{min: 15, max: 15, prio: 8},  // INTERNAL-IP
+	{min: 20, max: 32, prio: 9},  // OS-IMAGE
+	{min: 18, max: 18, prio: 10}, // KERNEL-VERSION
+	{min: 22, max: 22, prio: 11}, // CONTAINER-RUNTIME
+}
+
 // renderNodeTable mirrors renderTable() for nodes. Nodes have lower
 // cardinality than pods (typically 1–50) so we don't bother with the
 // windowing logic — just clip to maxRows.
-func (m Model) renderNodeTable(maxRows, _ int) string {
+func (m Model) renderNodeTable(maxRows, maxWidth int) string {
 	// Apply the same text filter visibleUIDs uses for the cursor —
 	// otherwise rows the cursor can't reach still appear.
 	all := sortedNodeRows(m.nodes)
@@ -189,35 +208,23 @@ func (m Model) renderNodeTable(maxRows, _ int) string {
 		rows = append(rows, r)
 	}
 
-	const (
-		colName       = 20
-		colSt         = 10
-		colRole       = 12
-		colCPU        = 7
-		colMem        = 9
-		colContainers = 24 // up to ~20 dots + overflow marker "+N"
-		colAge        = 5
-		colVer        = 16
-		colIP         = 15
-		colOSImage    = 24
-		colKernel     = 18
-		colRuntime    = 22
-	)
+	w := fitColumns(nodeColumns, maxWidth-1)
 
 	hdr := m.Theme.Header
-	header := " " +
-		padCol("NODE", colName, hdr) + "  " +
-		padCol("STATUS", colSt, hdr) + "  " +
-		padCol("ROLES", colRole, hdr) + "  " +
-		padColRight("CPU", colCPU, hdr) + "  " +
-		padColRight("MEM", colMem, hdr) + "  " +
-		padCol("CONTAINERS", colContainers, hdr) + "  " +
-		padColRight("AGE", colAge, hdr) + "  " +
-		padCol("VERSION", colVer, hdr) + "  " +
-		padCol("INTERNAL-IP", colIP, hdr) + "  " +
-		padCol("OS-IMAGE", colOSImage, hdr) + "  " +
-		padCol("KERNEL-VERSION", colKernel, hdr) + "  " +
-		padCol("CONTAINER-RUNTIME", colRuntime, hdr)
+	header := " " + joinCells(
+		padCol("NODE", w[0], hdr),
+		padCol("STATUS", w[1], hdr),
+		padCol("ROLES", w[2], hdr),
+		padColRight("CPU", w[3], hdr),
+		padColRight("MEM", w[4], hdr),
+		padCol("CONTAINERS", w[5], hdr),
+		padColRight("AGE", w[6], hdr),
+		padCol("VERSION", w[7], hdr),
+		padCol("INTERNAL-IP", w[8], hdr),
+		padCol("OS-IMAGE", w[9], hdr),
+		padCol("KERNEL-VERSION", w[10], hdr),
+		padCol("CONTAINER-RUNTIME", w[11], hdr),
+	)
 
 	var b strings.Builder
 	b.WriteString(header)
@@ -276,19 +283,20 @@ func (m Model) renderNodeTable(maxRows, _ int) string {
 		}
 		// Nodes are cluster-scoped — the involvedObject for node
 		// events has empty namespace, so use "" here too.
-		line := warnGlyph(warnIdx, "Node", "", r.Name, m.Theme) +
-			padCol(r.Name, colName, m.Theme.Base) + "  " +
-			padCol(nodeStatus(r), colSt, statusStyle) + "  " +
-			padCol(nodeRolesLabel(r), colRole, m.Theme.Base) + "  " +
-			padColRight(cpuStr, colCPU, m.Theme.Base) + "  " +
-			padColRight(memStr, colMem, m.Theme.Base) + "  " +
-			padCellANSI(containerDots(containers[r.Name], colContainers, m.Theme), colContainers) + "  " +
-			padColRight(formatAge(r.CreatedAt), colAge, m.Theme.Base) + "  " +
-			padCol(r.KubeletVer, colVer, m.Theme.Base) + "  " +
-			padCol(r.InternalIP, colIP, m.Theme.Base) + "  " +
-			padCol(r.OSImage, colOSImage, m.Theme.Base) + "  " +
-			padCol(r.KernelVer, colKernel, m.Theme.Base) + "  " +
-			padCol(r.Runtime, colRuntime, m.Theme.Base)
+		line := warnGlyph(warnIdx, "Node", "", r.Name, m.Theme) + joinCells(
+			padCol(r.Name, w[0], m.Theme.Base),
+			padCol(nodeStatus(r), w[1], statusStyle),
+			padCol(nodeRolesLabel(r), w[2], m.Theme.Base),
+			padColRight(cpuStr, w[3], m.Theme.Base),
+			padColRight(memStr, w[4], m.Theme.Base),
+			padCellANSI(containerDots(containers[r.Name], w[5], m.Theme), w[5]),
+			padColRight(formatAge(r.CreatedAt), w[6], m.Theme.Base),
+			padCol(r.KubeletVer, w[7], m.Theme.Base),
+			padCol(r.InternalIP, w[8], m.Theme.Base),
+			padCol(r.OSImage, w[9], m.Theme.Base),
+			padCol(r.KernelVer, w[10], m.Theme.Base),
+			padCol(r.Runtime, w[11], m.Theme.Base),
+		)
 		if r.UID == m.cursor {
 			line = renderSelected(line)
 		}

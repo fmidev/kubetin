@@ -1426,7 +1426,10 @@ func (m Model) View() string {
 		// Overview takes the whole row — it IS the cluster overview,
 		// the sidebar would be redundant.
 		body = m.renderOverview(bodyHeight, m.width)
-	case mainWidth < 20:
+	case mainWidth < 70:
+		// Below ~100 total cells the sidebar starves the table of the
+		// columns that make a monitor useful (CPU/MEM). Give the table
+		// the whole row; the cluster list is still reachable via Tab.
 		body = m.mainPane(bodyHeight, m.width)
 	default:
 		sidebar := m.renderSidebar(bodyHeight)
@@ -1830,29 +1833,30 @@ func (m Model) filterCounts() (matched, total int) {
 	return
 }
 
+// podColumns is the pod table in display order. min widths keep each
+// header label (plus a 1-cell sort arrow) intact; prio drives the
+// narrow-screen degradation order: network and node columns go first,
+// the monitor core (pod / status / namespace / cpu) goes last. POD
+// (prio 0) is never dropped and soaks up spare width on wide panes.
+var podColumns = []column{
+	{min: 12, max: 18, prio: 2}, // NAMESPACE
+	{min: 20, max: 48, prio: 0}, // POD
+	{min: 10, max: 12, prio: 1}, // STATUS
+	{min: 10, max: 10, prio: 7}, // CONTAINERS
+	{min: 9, max: 9, prio: 6},   // RESTARTS
+	{min: 5, max: 5, prio: 5},   // AGE
+	{min: 7, max: 7, prio: 3},   // CPU
+	{min: 9, max: 9, prio: 4},   // MEM
+	{min: 9, max: 9, prio: 9},   // ↓ NET
+	{min: 9, max: 9, prio: 10},  // ↑ NET
+	{min: 12, max: 24, prio: 8}, // NODE
+}
+
 func (m Model) renderTable(maxRows int, maxWidth int) string {
-	_ = maxWidth // future: column elasticity at narrow widths
 	rows := m.visibleRows()
 
-	const (
-		colNs    = 18
-		colName  = 36
-		colPhase = 12
-		// colCont fits "CONTAINERS" (10) so the header isn't truncated;
-		// 10 cells is also enough room for one dot per container in
-		// virtually all pods, with overflow "+N" if a sidecar-heavy
-		// pod has more.
-		colCont = 10
-		// colRst must fit "RESTARTS" (8) plus the optional sort arrow,
-		// otherwise the arrow gets ANSI-truncated off the right edge.
-		colRst   = 9
-		colCPU   = 7
-		colMem   = 9
-		colNetRX = 9
-		colNetTX = 9
-		colAge   = 5
-		colNode  = 20
-	)
+	// maxWidth-1: the warn-glyph column prefixes every line.
+	w := fitColumns(podColumns, maxWidth-1)
 
 	// Build a mixed-style header cell: bold-grey label + cyan arrow
 	// when this column is the active sort. We have to render label
@@ -1873,18 +1877,19 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 		}
 		return base + arrowStyle.Render(arrow)
 	}
-	header := " " +
-		padCellANSI(mark(SortNamespace, "NAMESPACE"), colNs) + "  " +
-		padCellANSI(mark(SortName, "POD"), colName) + "  " +
-		padCellANSI(mark(SortStatus, "STATUS"), colPhase) + "  " +
-		padCellANSI(hdr.Render("CONTAINERS"), colCont) + "  " +
-		padCellANSIRight(mark(SortRestarts, "RESTARTS"), colRst) + "  " +
-		padCellANSIRight(mark(SortAge, "AGE"), colAge) + "  " +
-		padCellANSIRight(mark(SortCPU, "CPU"), colCPU) + "  " +
-		padCellANSIRight(mark(SortMem, "MEM"), colMem) + "  " +
-		padCellANSIRight(mark(SortNetRX, "↓ NET"), colNetRX) + "  " +
-		padCellANSIRight(mark(SortNetTX, "↑ NET"), colNetTX) + "  " +
-		padCellANSI(mark(SortNode, "NODE"), colNode)
+	header := " " + joinCells(
+		padCellANSI(mark(SortNamespace, "NAMESPACE"), w[0]),
+		padCellANSI(mark(SortName, "POD"), w[1]),
+		padCellANSI(mark(SortStatus, "STATUS"), w[2]),
+		padCellANSI(hdr.Render("CONTAINERS"), w[3]),
+		padCellANSIRight(mark(SortRestarts, "RESTARTS"), w[4]),
+		padCellANSIRight(mark(SortAge, "AGE"), w[5]),
+		padCellANSIRight(mark(SortCPU, "CPU"), w[6]),
+		padCellANSIRight(mark(SortMem, "MEM"), w[7]),
+		padCellANSIRight(mark(SortNetRX, "↓ NET"), w[8]),
+		padCellANSIRight(mark(SortNetTX, "↑ NET"), w[9]),
+		padCellANSI(mark(SortNode, "NODE"), w[10]),
+	)
 
 	var b strings.Builder
 	b.WriteString(header)
@@ -1930,18 +1935,19 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 			rxStr = formatRate(r.NetRXBps)
 			txStr = formatRate(r.NetTXBps)
 		}
-		line := warnGlyph(warnIdx, "Pod", r.Namespace, r.Name, m.Theme) +
-			padCol(r.Namespace, colNs, m.Theme.Base) + "  " +
-			padCol(r.Name, colName, m.Theme.Base) + "  " +
-			padCol(string(r.Phase), colPhase, m.Theme.styleForPhase(r.Phase)) + "  " +
-			padCellANSI(podContainerDots(r, colCont, m.Theme), colCont) + "  " +
-			padColRight(fmt.Sprintf("%d", r.Restarts), colRst, m.Theme.Base) + "  " +
-			padColRight(formatAge(r.CreatedAt), colAge, m.Theme.Base) + "  " +
-			padColRight(cpuStr, colCPU, m.Theme.Base) + "  " +
-			padColRight(memStr, colMem, m.Theme.Base) + "  " +
-			padColRight(rxStr, colNetRX, m.Theme.Base) + "  " +
-			padColRight(txStr, colNetTX, m.Theme.Base) + "  " +
-			padCol(shortHost(r.Node), colNode, m.Theme.Base)
+		line := warnGlyph(warnIdx, "Pod", r.Namespace, r.Name, m.Theme) + joinCells(
+			padCol(r.Namespace, w[0], m.Theme.Base),
+			padCol(r.Name, w[1], m.Theme.Base),
+			padCol(string(r.Phase), w[2], m.Theme.styleForPhase(r.Phase)),
+			padCellANSI(podContainerDots(r, w[3], m.Theme), w[3]),
+			padColRight(fmt.Sprintf("%d", r.Restarts), w[4], m.Theme.Base),
+			padColRight(formatAge(r.CreatedAt), w[5], m.Theme.Base),
+			padColRight(cpuStr, w[6], m.Theme.Base),
+			padColRight(memStr, w[7], m.Theme.Base),
+			padColRight(rxStr, w[8], m.Theme.Base),
+			padColRight(txStr, w[9], m.Theme.Base),
+			padCol(shortHost(r.Node), w[10], m.Theme.Base),
+		)
 		if r.UID == m.cursor {
 			line = renderSelected(line)
 		}
