@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/fmidev/kubetin/compare/v1.4.0...v1.5.0) (2026-06-15)
+
+
+### Features
+
+* responsive table columns — degrade on narrow panes, grow on wide ([#37](https://github.com/fmidev/kubetin/issues/37)) ([f4f8353](https://github.com/fmidev/kubetin/commit/f4f8353c83f30d83ea0b4369a188b77c672023d5))
+
 ## [1.4.0](https://github.com/fmidev/kubetin/compare/v1.3.0...v1.4.0) (2026-05-12)
 
 
