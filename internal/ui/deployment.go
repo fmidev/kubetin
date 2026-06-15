@@ -56,8 +56,20 @@ func sortedDeployRows(m map[types.UID]deploymentRow) []deploymentRow {
 	return out
 }
 
+// deployColumns in display order; UP-TO-DATE and AVAILABLE drop
+// first (READY already carries the health signal), DEPLOYMENT never
+// drops and absorbs spare width.
+var deployColumns = []column{
+	{min: 12, max: 18, prio: 2}, // NAMESPACE
+	{min: 20, max: 48, prio: 0}, // DEPLOYMENT
+	{min: 8, max: 8, prio: 1},   // READY
+	{min: 10, max: 10, prio: 5}, // UP-TO-DATE
+	{min: 10, max: 10, prio: 4}, // AVAILABLE
+	{min: 5, max: 5, prio: 3},   // AGE
+}
+
 // renderDeployTable mirrors the pod / node tables.
-func (m Model) renderDeployTable(maxRows, _ int) string {
+func (m Model) renderDeployTable(maxRows, maxWidth int) string {
 	// Apply the same namespace + text filter the cursor logic in
 	// visibleUIDs uses, otherwise the rendered table includes rows the
 	// cursor can't reach and `n: <ns>` looks broken.
@@ -76,23 +88,17 @@ func (m Model) renderDeployTable(maxRows, _ int) string {
 		rows = append(rows, r)
 	}
 
-	const (
-		colNs    = 18
-		colName  = 36
-		colReady = 8
-		colUpd   = 10
-		colAvail = 10
-		colAge   = 5
-	)
+	w := fitColumns(deployColumns, maxWidth-1)
 
 	hdr := m.Theme.Header
-	header := " " +
-		padCol("NAMESPACE", colNs, hdr) + "  " +
-		padCol("DEPLOYMENT", colName, hdr) + "  " +
-		padColRight("READY", colReady, hdr) + "  " +
-		padColRight("UP-TO-DATE", colUpd, hdr) + "  " +
-		padColRight("AVAILABLE", colAvail, hdr) + "  " +
-		padColRight("AGE", colAge, hdr)
+	header := " " + joinCells(
+		padCol("NAMESPACE", w[0], hdr),
+		padCol("DEPLOYMENT", w[1], hdr),
+		padColRight("READY", w[2], hdr),
+		padColRight("UP-TO-DATE", w[3], hdr),
+		padColRight("AVAILABLE", w[4], hdr),
+		padColRight("AGE", w[5], hdr),
+	)
 
 	var b strings.Builder
 	b.WriteString(header)
@@ -146,13 +152,14 @@ func (m Model) renderDeployTable(maxRows, _ int) string {
 			readyStyle = m.Theme.StatusBad
 		}
 
-		line := warnGlyph(warnIdx, "Deployment", r.Namespace, r.Name, m.Theme) +
-			padCol(r.Namespace, colNs, m.Theme.Base) + "  " +
-			padCol(r.Name, colName, m.Theme.Base) + "  " +
-			padColRight(readyStr, colReady, readyStyle) + "  " +
-			padColRight(fmt.Sprintf("%d", r.UpToDate), colUpd, m.Theme.Base) + "  " +
-			padColRight(fmt.Sprintf("%d", r.Available), colAvail, m.Theme.Base) + "  " +
-			padColRight(formatAge(r.CreatedAt), colAge, m.Theme.Base)
+		line := warnGlyph(warnIdx, "Deployment", r.Namespace, r.Name, m.Theme) + joinCells(
+			padCol(r.Namespace, w[0], m.Theme.Base),
+			padCol(r.Name, w[1], m.Theme.Base),
+			padColRight(readyStr, w[2], readyStyle),
+			padColRight(fmt.Sprintf("%d", r.UpToDate), w[3], m.Theme.Base),
+			padColRight(fmt.Sprintf("%d", r.Available), w[4], m.Theme.Base),
+			padColRight(formatAge(r.CreatedAt), w[5], m.Theme.Base),
+		)
 		if r.UID == m.cursor {
 			line = renderSelected(line)
 		}
