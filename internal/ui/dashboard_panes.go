@@ -267,7 +267,8 @@ func shortImage(img string) string {
 }
 
 // dashEventColumns: MESSAGE soaks up the width, AGE and TYPE shed
-// first — the reason plus message is the payload.
+// first — the reason plus message is the payload. OBJECT sits between
+// them and is only present when the pane aggregates several objects.
 var dashEventColumns = []column{
 	{min: 4, max: 5, prio: 2},    // AGE
 	{min: 4, max: 7, prio: 3},    // TYPE
@@ -275,13 +276,28 @@ var dashEventColumns = []column{
 	{min: 14, max: 100, prio: 0}, // MESSAGE
 }
 
-// renderDashEvents lists the scoped events newest first.
-func (m Model) renderDashEvents(events []eventRow, w, h, scroll int) string {
+var dashEventObjectColumns = []column{
+	{min: 4, max: 5, prio: 3},    // AGE
+	{min: 4, max: 7, prio: 4},    // TYPE
+	{min: 12, max: 28, prio: 2},  // OBJECT
+	{min: 10, max: 20, prio: 1},  // REASON
+	{min: 14, max: 100, prio: 0}, // MESSAGE
+}
+
+// renderDashEvents lists the scoped events newest first. withObject
+// adds the involved object's name, which the pod pane doesn't need
+// (every row is the same pod) but the deployment pane does — knowing
+// *which* replica is backing off is most of the signal.
+func (m Model) renderDashEvents(events []eventRow, w, h, scroll int, withObject bool) string {
 	th := m.Theme
 	if len(events) == 0 {
 		return dashPaneBody([]string{" " + th.Dim.Render("no events")}, w, h, 0)
 	}
-	cw := fitColumns(dashEventColumns, w-1)
+	cols := dashEventColumns
+	if withObject {
+		cols = dashEventObjectColumns
+	}
+	cw := fitColumns(cols, w-1)
 
 	lines := make([]string, 0, len(events))
 	for _, e := range events {
@@ -293,12 +309,18 @@ func (m Model) renderDashEvents(events []eventRow, w, h, scroll int) string {
 		if e.Count > 1 {
 			count = fmt.Sprintf(" ×%d", e.Count)
 		}
-		lines = append(lines, " "+joinCells(
+		cells := []string{
 			padCol(formatAge(e.LastSeen), cw[0], th.Dim),
 			padCol(shortEventType(e.Type), cw[1], typeStyle),
-			padCol(e.Reason+count, cw[2], msgStyle),
-			padCol(oneLine(e.Message), cw[3], th.Base),
-		))
+		}
+		if withObject {
+			cells = append(cells, padCol(e.InvolvedName, cw[2], th.Dim))
+		}
+		cells = append(cells,
+			padCol(e.Reason+count, cw[len(cw)-2], msgStyle),
+			padCol(oneLine(e.Message), cw[len(cw)-1], th.Base),
+		)
+		lines = append(lines, " "+joinCells(cells...))
 	}
 
 	return dashPaneBody(lines, w, h, scroll)
@@ -407,4 +429,230 @@ func sortEventsNewestFirst(rows []eventRow) {
 		}
 		return a.UID < b.UID
 	})
+}
+
+// dashDeployStatusHeight mirrors dashPodStatusHeight: a third line
+// appears only when a condition explains why the rollout isn't
+// converging.
+func dashDeployStatusHeight(d deploymentRow) int {
+	if _, ok := deployBlockingCondition(d); ok {
+		return 3
+	}
+	return 2
+}
+
+// deployBlockingCondition returns the condition that explains a stuck
+// deployment. Progressing=True is the healthy steady state *and* the
+// mid-rollout state, so only False counts; Available=False means the
+// deployment is below its minimum ready replicas right now.
+func deployBlockingCondition(d deploymentRow) (cluster.DeployCondition, bool) {
+	for _, c := range d.Conditions {
+		if c.Type == "Available" && c.Status != "True" {
+			return c, true
+		}
+		if c.Type == "Progressing" && c.Status == "False" {
+			return c, true
+		}
+	}
+	return cluster.DeployCondition{}, false
+}
+
+// renderDashDeployStatus draws the replica counts on line one and the
+// rollout strategy on line two.
+func (m Model) renderDashDeployStatus(d deploymentRow, w, h int) string {
+	th := m.Theme
+
+	rs := readyStyle(int(d.Ready), int(d.Replicas), th)
+	line1 := []string{
+		rs.Render("●") + " " + rs.Render(fmt.Sprintf("%d/%d ready", d.Ready, d.Replicas)),
+		dashField("up-to-date", fmt.Sprintf("%d", d.UpToDate), th.Base, th),
+		dashField("available", fmt.Sprintf("%d", d.Available), th.Base, th),
+	}
+	if d.Unavailable > 0 {
+		line1 = append(line1, dashField("unavailable",
+			fmt.Sprintf("%d", d.Unavailable), th.StatusWrn, th))
+	}
+	line1 = append(line1,
+		dashField("age", formatAge(d.CreatedAt), th.Base, th),
+		dashField("ns", d.Namespace, th.Base, th))
+
+	line2 := []string{}
+	if d.StrategyType != "" {
+		line2 = append(line2, dashField("strategy", d.StrategyType, th.Base, th))
+	}
+	if d.MaxSurge != "" {
+		line2 = append(line2, dashField("surge", d.MaxSurge, th.Base, th))
+	}
+	if d.MaxUnavailable != "" {
+		line2 = append(line2, dashField("maxUnavail", d.MaxUnavailable, th.Base, th))
+	}
+	if sel := formatSelector(d.Selector); sel != "" {
+		line2 = append(line2, dashField("selector", sel, th.Base, th))
+	}
+
+	rows := []string{
+		padCellANSI(joinFields(line1, w), w),
+		padCellANSI(joinFields(line2, w), w),
+	}
+	if c, ok := deployBlockingCondition(d); ok {
+		rows = append(rows, padCellANSI(renderCondition(cluster.PodCondition{
+			Type: c.Type, Status: c.Status, Reason: c.Reason, Message: c.Message,
+		}, w, th), w))
+	}
+	return clampCanvas(strings.Join(rows, "\n"), w, h)
+}
+
+// formatSelector renders match labels in the k=v,k=v form kubectl
+// prints, sorted so the string is stable across renders.
+func formatSelector(sel map[string]string) string {
+	if len(sel) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(sel))
+	for k := range sel {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+sel[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+// dashPodColumns for the deployment's owned-pod list. POD never drops;
+// NODE goes first, then AGE — restarts and status are what you scan a
+// replica list for.
+var dashPodColumns = []column{
+	{min: 18, max: 40, prio: 0}, // POD
+	{min: 10, max: 16, prio: 1}, // STATUS
+	{min: 5, max: 5, prio: 2},   // READY
+	{min: 3, max: 4, prio: 3},   // RESTARTS
+	{min: 4, max: 5, prio: 4},   // AGE
+	{min: 10, max: 20, prio: 5}, // NODE
+}
+
+// renderDashPods lists the deployment's pods with a cursor, so the
+// user can drill into one. The window follows the cursor rather than
+// starting at row 0 — otherwise replicas past the pane height are
+// unreachable, the same bug the main tables had.
+func (m Model) renderDashPods(pods []podRow, w, h, cursor int) string {
+	th := m.Theme
+	if len(pods) == 0 {
+		return dashPaneBody([]string{" " + th.Dim.Render("no pods match this deployment")}, w, h, 0)
+	}
+	cw := fitColumns(dashPodColumns, w-1)
+
+	lines := make([]string, 0, len(pods))
+	for i, p := range pods {
+		ready, total := containerReadyCount(p)
+		line := " " + joinCells(
+			padCol(p.Name, cw[0], th.Base),
+			padCol(string(p.Phase), cw[1], th.styleForPhase(p.Phase)),
+			padColRight(fmt.Sprintf("%d/%d", ready, total), cw[2], readyStyle(ready, total, th)),
+			padColRight(fmt.Sprintf("%d", p.Restarts), cw[3], restartStyle(p.Restarts, th)),
+			padColRight(formatAge(p.CreatedAt), cw[4], th.Base),
+			padCol(shortHost(p.Node), cw[5], th.Dim),
+		)
+		if i == cursor {
+			line = renderSelected(padCellANSI(line, w))
+		}
+		lines = append(lines, line)
+	}
+
+	if h <= 0 {
+		return strings.Join(lines, "\n")
+	}
+	return clampCanvas(strings.Join(windowAround(lines, cursor, h), "\n"), w, h)
+}
+
+// windowAround returns the h-row slice of lines that keeps index
+// cursor visible, centred where possible and clamped at both ends.
+func windowAround(lines []string, cursor, h int) []string {
+	if h >= len(lines) {
+		return lines
+	}
+	start := cursor - h/2
+	if start < 0 {
+		start = 0
+	}
+	if start+h > len(lines) {
+		start = len(lines) - h
+	}
+	return lines[start : start+h]
+}
+
+// deployOwnedPods resolves the deployment's pods by label selector.
+// That's exact, unlike matching on the "<name>-" prefix, which also
+// catches a "payments-api-worker" deployment's pods when you're
+// looking at "payments-api". The prefix heuristic stays as a fallback
+// for the case where no selector was projected at all.
+func (m Model) deployOwnedPods(d deploymentRow) []podRow {
+	out := make([]podRow, 0, 8)
+	if len(d.Selector) > 0 {
+		for _, p := range m.pods {
+			if p.Namespace == d.Namespace && labelsMatch(p.Labels, d.Selector) {
+				out = append(out, p)
+			}
+		}
+	} else {
+		prefix := d.Name + "-"
+		for _, p := range m.pods {
+			if p.Namespace == d.Namespace && strings.HasPrefix(p.Name, prefix) {
+				out = append(out, p)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].UID < out[j].UID
+	})
+	return out
+}
+
+// labelsMatch reports whether labels satisfies every key/value in sel.
+func labelsMatch(labels, sel map[string]string) bool {
+	for k, v := range sel {
+		if labels[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// dashDeployEvents gathers the three event sources that matter for a
+// deployment: the object itself (scaling), its ReplicaSets (rollout
+// progress), and its pods — the last of which is where the failures
+// that actually block a rollout show up (FailedScheduling, BackOff).
+func (m Model) dashDeployEvents(d deploymentRow, owned []podRow) []eventRow {
+	podNames := make(map[string]struct{}, len(owned))
+	for _, p := range owned {
+		podNames[p.Name] = struct{}{}
+	}
+	rsPrefix := d.Name + "-"
+
+	out := make([]eventRow, 0, 16)
+	for _, e := range m.events {
+		if e.InvolvedNs != d.Namespace {
+			continue
+		}
+		switch e.InvolvedKind {
+		case "Deployment":
+			if e.InvolvedName == d.Name {
+				out = append(out, e)
+			}
+		case "ReplicaSet":
+			if strings.HasPrefix(e.InvolvedName, rsPrefix) {
+				out = append(out, e)
+			}
+		case "Pod":
+			if _, ok := podNames[e.InvolvedName]; ok {
+				out = append(out, e)
+			}
+		}
+	}
+	sortEventsNewestFirst(out)
+	return out
 }

@@ -1801,7 +1801,7 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 func (m Model) renderFooter() string {
 	hint := " ?:help  F1:overview  1:pods  2:deploy  3:nodes  4:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  F2:debug  q:quit "
 	if m.dashboard.open {
-		hint = " Tab:pane  j/k:scroll  g/G:top/bottom  f:follow  c:container  l:logs  d:describe  Enter:actions  Esc:back "
+		hint = " Tab:pane  j/k:move  g/G:top/bottom  f:follow  i:open pod  c:container  l:logs  d:describe  Enter:actions  Esc:back "
 	}
 	hint = m.Theme.Footer.Render(hint)
 

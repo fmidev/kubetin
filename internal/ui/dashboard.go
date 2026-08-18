@@ -16,7 +16,7 @@ import (
 type dashboardPane int
 
 const (
-	dashPaneContainers dashboardPane = iota
+	dashPaneMain dashboardPane = iota // containers (Pod) / replicas (Deployment)
 	dashPaneEvents
 	dashPaneLogs
 	dashPaneCount
@@ -43,11 +43,49 @@ type dashboardState struct {
 	// of the per-pane offsets when the panes are drawn in one column.
 	canvas int
 
+	// logRef is the pod actually being streamed. For a Pod target it
+	// equals the target; for a Deployment it's one chosen replica, so
+	// it has to be tracked separately.
+	logRef cluster.DescribeRef
+
 	// containers of the pod being streamed, plus which one we're on.
 	// Held here rather than read off the row each time so `c` cycles
 	// deterministically while the informer churns.
 	containers []string
 	containerI int
+
+	// podCursor indexes the Deployment view's owned-pod list. It's a
+	// cursor rather than a scroll offset because the row is a drill-in
+	// target, not just something to read.
+	podCursor int
+}
+
+// dashSubject is what the dashboard is currently showing. Panes,
+// status height and scroll bounds all switch on Kind rather than each
+// re-resolving the target off the stack.
+type dashSubject struct {
+	Kind   string
+	Pod    podRow
+	Deploy deploymentRow
+	Pods   []podRow // owned pods; Deployment only
+}
+
+func (s dashSubject) isDeploy() bool { return s.Kind == "Deployment" }
+
+// statusHeight is how many rows the banner needs for this subject.
+func (s dashSubject) statusHeight() int {
+	if s.isDeploy() {
+		return dashDeployStatusHeight(s.Deploy)
+	}
+	return dashPodStatusHeight(s.Pod)
+}
+
+// mainLabel names the left pane for this subject.
+func (s dashSubject) mainLabel() string {
+	if s.isDeploy() {
+		return "PODS"
+	}
+	return "CONTAINERS"
 }
 
 func (s dashboardState) target() (dashboardTarget, bool) {
@@ -61,27 +99,89 @@ func (s dashboardState) target() (dashboardTarget, bool) {
 // container pods stream container[0] rather than interrupting with the
 // picker modal — `c` cycles once the dashboard is up.
 func (m Model) openDashboard(ref cluster.DescribeRef, uid types.UID) (tea.Model, tea.Cmd) {
+	t := dashboardTarget{Ref: ref, UID: uid}
 	m.dashboard.open = true
-	m.dashboard.stack = append(m.dashboard.stack, dashboardTarget{Ref: ref, UID: uid})
+	m.dashboard.stack = append(m.dashboard.stack, t)
 	m.dashboard.focus = dashPaneLogs
 	m.dashboard.scroll = [dashPaneCount]int{}
 	m.dashboard.canvas = 0
+	m.dashboard.podCursor = 0
+	m.prepareLogTarget(t)
+	return m, m.startDashboardLogs()
+}
 
-	containers := []string{}
-	if r, ok := m.pods[uid]; ok {
-		containers = r.Containers
-	}
-	m.dashboard.containers = containers
+// prepareLogTarget picks which pod the log pane streams. A Deployment
+// streams its newest Running replica — the same choice
+// openLogsForDeployment makes, so a recent rollout surfaces over older
+// replicas. Drilling into a specific pod is how you read a different
+// one; selection in the PODS pane deliberately does not restart the
+// stream, because scrolling a list shouldn't tear down a connection.
+func (m *Model) prepareLogTarget(t dashboardTarget) {
+	m.dashboard.containers = nil
 	m.dashboard.containerI = 0
+	m.dashboard.logRef = cluster.DescribeRef{}
 
-	return m, m.startDashboardLogs(ref)
+	if t.Ref.Kind == "Deployment" {
+		d, ok := m.deployments[t.UID]
+		if !ok {
+			return
+		}
+		p, ok := newestRunningPod(m.deployOwnedPods(d))
+		if !ok {
+			return
+		}
+		m.dashboard.logRef = podRefFor(p)
+		m.dashboard.containers = p.Containers
+		return
+	}
+	if r, ok := m.pods[t.UID]; ok {
+		m.dashboard.containers = r.Containers
+	}
+	m.dashboard.logRef = t.Ref
+}
+
+// newestRunningPod prefers the most recently created Running replica,
+// falling back to the newest pod of any phase so a fully-broken
+// deployment still shows something rather than an empty pane.
+func newestRunningPod(pods []podRow) (podRow, bool) {
+	var running, any podRow
+	var haveRunning, haveAny bool
+	for _, p := range pods {
+		if !haveAny || p.CreatedAt.After(any.CreatedAt) {
+			any, haveAny = p, true
+		}
+		if string(p.Phase) != "Running" {
+			continue
+		}
+		if !haveRunning || p.CreatedAt.After(running.CreatedAt) {
+			running, haveRunning = p, true
+		}
+	}
+	if haveRunning {
+		return running, true
+	}
+	return any, haveAny
+}
+
+func podRefFor(p podRow) cluster.DescribeRef {
+	return cluster.DescribeRef{
+		Version: "v1", Resource: "pods", Kind: "Pod",
+		Namespace: p.Namespace, Name: p.Name,
+	}
 }
 
 // startDashboardLogs begins (or restarts) the stream for the current
 // target and container. Returns nil when the user is known to lack
 // pods/log — firing a request we know the apiserver will refuse just
 // trades a live pane for an error pane.
-func (m *Model) startDashboardLogs(ref cluster.DescribeRef) tea.Cmd {
+func (m *Model) startDashboardLogs() tea.Cmd {
+	ref := m.dashboard.logRef
+	if ref.Name == "" {
+		m.logs.lines = nil
+		m.logs.err = "no pod available to stream logs from"
+		m.logs.streaming = false
+		return nil
+	}
 	if st, ok := m.permissions[cluster.PermissionKey(m.WatchedContext, "get", "", "pods/log", ref.Namespace)]; ok && !st.Allowed {
 		m.logs.err = "no permission to read pod logs (get pods/log)"
 		m.logs.streaming = false
@@ -110,12 +210,8 @@ func (m Model) popDashboard() (tea.Model, tea.Cmd) {
 	m.dashboard.scroll = [dashPaneCount]int{}
 	m.dashboard.canvas = 0
 	t, _ := m.dashboard.target()
-	m.dashboard.containers = nil
-	m.dashboard.containerI = 0
-	if r, ok := m.pods[t.UID]; ok {
-		m.dashboard.containers = r.Containers
-	}
-	return m, m.startDashboardLogs(t.Ref)
+	m.prepareLogTarget(t)
+	return m, m.startDashboardLogs()
 }
 
 func (m *Model) stopDashboardLogs() tea.Cmd {
@@ -138,19 +234,36 @@ func (m Model) dashCanvasSize() (int, int) {
 	return m.width, h
 }
 
-// dashLayoutNow resolves the current geometry, or false when there's
-// no target to render.
-func (m Model) dashLayoutNow() (dashLayout, podRow, bool) {
+// dashSubjectNow resolves the target into renderable state, or false
+// when the object has gone from the informer cache.
+func (m Model) dashSubjectNow() (dashSubject, bool) {
 	t, ok := m.dashboard.target()
 	if !ok {
-		return dashLayout{}, podRow{}, false
+		return dashSubject{}, false
+	}
+	if t.Ref.Kind == "Deployment" {
+		d, ok := m.deployments[t.UID]
+		if !ok {
+			return dashSubject{}, false
+		}
+		return dashSubject{Kind: "Deployment", Deploy: d, Pods: m.deployOwnedPods(d)}, true
 	}
 	r, ok := m.pods[t.UID]
 	if !ok {
-		return dashLayout{}, podRow{}, false
+		return dashSubject{}, false
+	}
+	return dashSubject{Kind: "Pod", Pod: r}, true
+}
+
+// dashLayoutNow resolves the current geometry, or false when there's
+// no target to render.
+func (m Model) dashLayoutNow() (dashLayout, dashSubject, bool) {
+	s, ok := m.dashSubjectNow()
+	if !ok {
+		return dashLayout{}, dashSubject{}, false
 	}
 	w, h := m.dashCanvasSize()
-	return dashLayoutFor(w, h, dashPodStatusHeight(r), m.Theme), r, true
+	return dashLayoutFor(w, h, s.statusHeight(), m.Theme), s, true
 }
 
 func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -177,6 +290,8 @@ func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.logs.follow {
 			m.logs.scroll = 0
 		}
+	case "i":
+		return m.drillIntoSelectedPod()
 	case "c":
 		return m.cycleDashboardContainer()
 	case "l":
@@ -200,13 +315,20 @@ func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 // stacked column scrolls as one canvas, the wide frame scrolls the
 // focused pane.
 func (m *Model) scrollDashboard(delta int) {
-	lay, r, ok := m.dashLayoutNow()
+	lay, sub, ok := m.dashLayoutNow()
 	if !ok {
+		return
+	}
+	// The owned-pod list is a selection, so j/k moves the cursor there
+	// in both layouts — scrolling past a row you meant to drill into
+	// would make the pane useless.
+	if sub.isDeploy() && m.dashboard.focus == dashPaneMain {
+		m.movePodCursor(delta, len(sub.Pods))
 		return
 	}
 	if !lay.wide {
 		_, h := m.dashCanvasSize()
-		m.canvasScrollTo(m.dashboard.canvas+delta, r, h)
+		m.canvasScrollTo(m.dashboard.canvas+delta, sub, h)
 		return
 	}
 	// Logs share the viewer's offset: j/k move it and pause/resume
@@ -216,7 +338,7 @@ func (m *Model) scrollDashboard(delta int) {
 		m.scrollLogsBy(-delta, lay.logs.h)
 		return
 	}
-	max := m.dashScrollMax(m.dashboard.focus, lay, r)
+	max := m.dashScrollMax(m.dashboard.focus, lay, sub)
 	v := m.dashboard.scroll[m.dashboard.focus] + delta
 	if v < 0 {
 		v = 0
@@ -228,8 +350,16 @@ func (m *Model) scrollDashboard(delta int) {
 }
 
 func (m *Model) jumpDashboard(top bool) {
-	lay, r, ok := m.dashLayoutNow()
+	lay, sub, ok := m.dashLayoutNow()
 	if !ok {
+		return
+	}
+	if sub.isDeploy() && m.dashboard.focus == dashPaneMain {
+		if top {
+			m.dashboard.podCursor = 0
+		} else if n := len(sub.Pods); n > 0 {
+			m.dashboard.podCursor = n - 1
+		}
 		return
 	}
 	if !lay.wide {
@@ -237,7 +367,7 @@ func (m *Model) jumpDashboard(top bool) {
 		if top {
 			m.dashboard.canvas = 0
 		} else {
-			m.canvasScrollTo(1<<30, r, h)
+			m.canvasScrollTo(1<<30, sub, h)
 		}
 		return
 	}
@@ -253,7 +383,7 @@ func (m *Model) jumpDashboard(top bool) {
 		}
 		return
 	}
-	max := m.dashScrollMax(m.dashboard.focus, lay, r)
+	max := m.dashScrollMax(m.dashboard.focus, lay, sub)
 	switch {
 	case top:
 		m.dashboard.scroll[m.dashboard.focus] = 0
@@ -262,25 +392,40 @@ func (m *Model) jumpDashboard(top bool) {
 	}
 }
 
-func (m *Model) canvasScrollTo(want int, r podRow, h int) {
-	_, clamped := scrollWindow(m.stackedBody(r, m.width), want, h)
+func (m *Model) canvasScrollTo(want int, sub dashSubject, h int) {
+	_, clamped := scrollWindow(m.stackedBody(sub, m.width), want, h)
 	m.dashboard.canvas = clamped
+}
+
+// movePodCursor steps the owned-pod selection, clamped to the list.
+func (m *Model) movePodCursor(delta, n int) {
+	if n == 0 {
+		m.dashboard.podCursor = 0
+		return
+	}
+	v := m.dashboard.podCursor + delta
+	if v < 0 {
+		v = 0
+	}
+	if v > n-1 {
+		v = n - 1
+	}
+	m.dashboard.podCursor = v
 }
 
 // dashScrollMax is the largest useful offset for a pane: render its
 // content and count, so the bound can't drift from what's drawn.
-func (m Model) dashScrollMax(p dashboardPane, lay dashLayout, r podRow) int {
+func (m Model) dashScrollMax(p dashboardPane, lay dashLayout, sub dashSubject) int {
 	var content string
 	var h int
 	switch p {
-	case dashPaneContainers:
+	case dashPaneMain:
 		// Natural height (h=0): asking for a huge height would make
 		// clampCanvas pad the content out to that many rows.
-		content = m.renderDashContainers(r, lay.left.w, 0, 0)
+		content = m.renderDashMain(sub, lay.left.w, 0)
 		h = lay.left.h
 	case dashPaneEvents:
-		t, _ := m.dashboard.target()
-		content = m.renderDashEvents(m.dashEventsFor(t.Ref), lay.right.w, 0, 0)
+		content = m.renderDashEventsFor(sub, lay.right.w, 0, 0)
 		h = lay.right.h
 	case dashPaneLogs:
 		// Logs are bounded by clampLogsScrollTo against logsState, not
@@ -299,12 +444,11 @@ func (m Model) cycleDashboardContainer() (tea.Model, tea.Cmd) {
 	if len(m.dashboard.containers) < 2 {
 		return m, nil
 	}
-	t, ok := m.dashboard.target()
-	if !ok {
+	if _, ok := m.dashboard.target(); !ok {
 		return m, nil
 	}
 	m.dashboard.containerI = (m.dashboard.containerI + 1) % len(m.dashboard.containers)
-	cmd := m.startDashboardLogs(t.Ref)
+	cmd := m.startDashboardLogs()
 	return m, cmd
 }
 
@@ -315,7 +459,7 @@ func (m Model) renderDashboard(height, width int) string {
 	if !ok {
 		return clampCanvas("", width, height)
 	}
-	r, ok := m.pods[t.UID]
+	sub, ok := m.dashSubjectNow()
 	if !ok {
 		msg := m.Theme.StatusWrn.Render("  "+t.Ref.Kind+"/"+t.Ref.Name+
 			" is no longer present in this cluster") + "\n\n" +
@@ -323,30 +467,54 @@ func (m Model) renderDashboard(height, width int) string {
 		return clampCanvas(msg, width, height)
 	}
 
-	lay := dashLayoutFor(width, height, dashPodStatusHeight(r), m.Theme)
+	lay := dashLayoutFor(width, height, sub.statusHeight(), m.Theme)
 	if lay.wide {
-		return m.renderDashboardWide(r, t, lay, width, height)
+		return m.renderDashboardWide(sub, t, lay, width, height)
 	}
-	body, _ := scrollWindow(m.stackedBody(r, width), m.dashboard.canvas, height)
+	body, _ := scrollWindow(m.stackedBody(sub, width), m.dashboard.canvas, height)
 	return clampCanvas(body, width, height)
 }
 
-func (m Model) renderDashboardWide(r podRow, t dashboardTarget, lay dashLayout, w, h int) string {
+// renderDashStatus / renderDashMain / renderDashEventsFor dispatch the
+// three subject-dependent panes. The logs pane is subject-independent:
+// it renders one stream either way.
+func (m Model) renderDashStatus(sub dashSubject, w, h int) string {
+	if sub.isDeploy() {
+		return m.renderDashDeployStatus(sub.Deploy, w, h)
+	}
+	return m.renderDashPodStatus(sub.Pod, w, h)
+}
+
+func (m Model) renderDashMain(sub dashSubject, w, h int) string {
+	if sub.isDeploy() {
+		return m.renderDashPods(sub.Pods, w, h, m.dashboard.podCursor)
+	}
+	return m.renderDashContainers(sub.Pod, w, h, m.dashboard.scroll[dashPaneMain])
+}
+
+func (m Model) renderDashEventsFor(sub dashSubject, w, h, scroll int) string {
+	if sub.isDeploy() {
+		return m.renderDashEvents(m.dashDeployEvents(sub.Deploy, sub.Pods), w, h, scroll, true)
+	}
+	t, _ := m.dashboard.target()
+	return m.renderDashEvents(m.dashEventsFor(t.Ref), w, h, scroll, false)
+}
+
+func (m Model) renderDashboardWide(sub dashSubject, t dashboardTarget, lay dashLayout, w, h int) string {
 	canvas := lay.frame
 
 	canvas = dashPaneTitle(canvas, m.dashTitle(t), 2, 0)
-	canvas = dashPaneTitle(canvas, m.paneLabel("CONTAINERS", dashPaneContainers), 2, lay.left.y-1)
+	canvas = dashPaneTitle(canvas, m.paneLabel(sub.mainLabel(), dashPaneMain), 2, lay.left.y-1)
 	canvas = dashPaneTitle(canvas, m.paneLabel("EVENTS", dashPaneEvents), lay.right.x+1, lay.right.y-1)
 	canvas = dashPaneTitle(canvas, m.logsPaneLabel(), 2, lay.logs.y-1)
 
-	canvas = splicePane(canvas, m.renderDashPodStatus(r, lay.status.w, lay.status.h), lay.status)
-	canvas = splicePane(canvas, m.renderDashContainers(r, lay.left.w, lay.left.h,
-		m.dashboard.scroll[dashPaneContainers]), lay.left)
-	canvas = splicePane(canvas, m.renderDashEvents(m.dashEventsFor(t.Ref), lay.right.w, lay.right.h,
+	canvas = splicePane(canvas, m.renderDashStatus(sub, lay.status.w, lay.status.h), lay.status)
+	canvas = splicePane(canvas, m.renderDashMain(sub, lay.left.w, lay.left.h), lay.left)
+	canvas = splicePane(canvas, m.renderDashEventsFor(sub, lay.right.w, lay.right.h,
 		m.dashboard.scroll[dashPaneEvents]), lay.right)
 	canvas = splicePane(canvas, m.renderDashLogs(lay.logs.w, lay.logs.h), lay.logs)
 
-	if bottom := m.dashBottomLabel(); bottom != "" {
+	if bottom := m.dashBottomLabel(sub); bottom != "" {
 		canvas = dashPaneTitle(canvas, bottom, 2, h-1)
 	}
 	return clampCanvas(canvas, w, h)
@@ -355,7 +523,7 @@ func (m Model) renderDashboardWide(r podRow, t dashboardTarget, lay dashLayout, 
 // stackedBody builds the single-column form at full natural height.
 // The caller windows it — scrolling one tall string keeps every pane
 // reachable on a terminal that can't show them all at once.
-func (m Model) stackedBody(r podRow, w int) string {
+func (m Model) stackedBody(sub dashSubject, w int) string {
 	th := m.Theme
 	t, _ := m.dashboard.target()
 	// lipgloss Width(w-2) plus the two border columns renders at w, so
@@ -374,15 +542,14 @@ func (m Model) stackedBody(r podRow, w int) string {
 		return clampCanvas(content, inner, h)
 	}
 
-	events := m.dashEventsFor(t.Ref)
 	parts := []string{
 		dashStackedBox(m.dashTitle(t),
-			m.renderDashPodStatus(r, inner, dashPodStatusHeight(r)), w, false, th),
-		dashStackedBox(m.paneLabel("CONTAINERS", dashPaneContainers),
-			sized(m.renderDashContainers(r, inner, 0, 0), dashStackContainersMax),
-			w, m.dashboard.focus == dashPaneContainers, th),
+			m.renderDashStatus(sub, inner, sub.statusHeight()), w, false, th),
+		dashStackedBox(m.paneLabel(sub.mainLabel(), dashPaneMain),
+			sized(m.renderDashMain(sub, inner, 0), dashStackContainersMax),
+			w, m.dashboard.focus == dashPaneMain, th),
 		dashStackedBox(m.paneLabel("EVENTS", dashPaneEvents),
-			sized(m.renderDashEvents(events, inner, 0, 0), dashStackEventsMax),
+			sized(m.renderDashEventsFor(sub, inner, 0, 0), dashStackEventsMax),
 			w, m.dashboard.focus == dashPaneEvents, th),
 		dashStackedBox(m.logsPaneLabel(),
 			m.renderDashLogs(inner, dashStackLogHeight),
@@ -442,11 +609,18 @@ func (m Model) logsPaneLabel() string {
 	return label
 }
 
-func (m Model) dashBottomLabel() string {
-	if len(m.dashboard.stack) > 1 {
-		return m.Theme.Dim.Render("esc: back")
+func (m Model) dashBottomLabel(sub dashSubject) string {
+	hints := []string{}
+	if sub.isDeploy() && len(sub.Pods) > 0 {
+		hints = append(hints, "i: open pod")
 	}
-	return ""
+	if len(m.dashboard.stack) > 1 {
+		hints = append(hints, "esc: back")
+	}
+	if len(hints) == 0 {
+		return ""
+	}
+	return m.Theme.Dim.Render(strings.Join(hints, "  ·  "))
 }
 
 // openDescribeFor opens the describe overlay for an explicit ref,
@@ -467,11 +641,24 @@ func (m Model) openDescribeFor(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
 	return m, func() tea.Msg { return cb(req, focused) }
 }
 
+// drillIntoSelectedPod pushes the pod under the PODS-pane cursor onto
+// the stack, so Esc returns to the deployment.
+func (m Model) drillIntoSelectedPod() (tea.Model, tea.Cmd) {
+	sub, ok := m.dashSubjectNow()
+	if !ok || !sub.isDeploy() || len(sub.Pods) == 0 {
+		return m, nil
+	}
+	i := m.dashboard.podCursor
+	if i < 0 || i >= len(sub.Pods) {
+		return m, nil
+	}
+	p := sub.Pods[i]
+	return m.openDashboard(podRefFor(p), p.UID)
+}
+
 // openDashboardForCursor opens the dashboard for the selected row.
-// Pods only: the Deployment form needs its own replica/owned-pod panes
-// and lands separately.
 func (m Model) openDashboardForCursor() (tea.Model, tea.Cmd) {
-	if m.view != ViewPods {
+	if m.view != ViewPods && m.view != ViewDeployments {
 		return m, nil
 	}
 	ref, ok := m.refForCursor()
