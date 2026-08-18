@@ -90,6 +90,7 @@ var helpGroups = []helpGroup{
 			{"Tab / Shift-Tab", "next / previous pane"},
 			{"j / k", "scroll focused pane"},
 			{"g / G", "top / bottom of pane"},
+			{"f", "toggle log follow (scrolling pauses it)"},
 			{"c", "next container (logs)"},
 			{"l", "open logs full-screen"},
 			{"d", "describe this resource"},

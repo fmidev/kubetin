@@ -420,15 +420,22 @@ func (m *Model) scrollLogsToMatch(lineIdx int) {
 // a box that consumes 4 rows of header+footer+borders from the
 // overall canvas, so total overhead ≈ 8 rows).
 func clampLogsScroll(want, lineCount, terminalHeight int) int {
+	const overhead = 8
+	return clampLogsScrollTo(want, lineCount, terminalHeight-overhead)
+}
+
+// clampLogsScrollTo bounds a tail-relative offset against an explicit
+// viewport height. clampLogsScroll subtracts the full-screen viewer's
+// chrome to approximate one; the dashboard's log pane knows its exact
+// height from the layout and passes it straight through.
+func clampLogsScrollTo(want, lineCount, bodyHeight int) int {
 	if want < 0 {
 		return 0
 	}
-	const overhead = 8
-	approxBody := terminalHeight - overhead
-	if approxBody < 1 {
-		approxBody = 1
+	if bodyHeight < 1 {
+		bodyHeight = 1
 	}
-	max := lineCount - approxBody
+	max := lineCount - bodyHeight
 	if max < 0 {
 		max = 0
 	}
@@ -436,6 +443,17 @@ func clampLogsScroll(want, lineCount, terminalHeight int) int {
 		return max
 	}
 	return want
+}
+
+// scrollLogsBy moves the shared tail-relative offset by delta rows
+// (positive = back into history) against a viewport of bodyHeight, and
+// keeps follow in sync: any move off the tail pauses, returning to the
+// tail resumes. The dashboard's log pane and the full-screen viewer
+// drive the same state, so a pane that's scrolled back stays put as
+// new lines arrive and reports itself paused.
+func (m *Model) scrollLogsBy(delta, bodyHeight int) {
+	m.logs.scroll = clampLogsScrollTo(m.logs.scroll+delta, len(m.logs.lines), bodyHeight)
+	m.logs.follow = m.logs.scroll == 0
 }
 
 func (m Model) closeLogs() (tea.Model, tea.Cmd) {

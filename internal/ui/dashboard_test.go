@@ -156,23 +156,108 @@ func TestDashScrollClampsAtBothEnds(t *testing.T) {
 }
 
 // Logs count from the tail: 0 is "following", and j (down, towards
-// newest) must not push the offset negative.
+// newest) must not push the offset negative. The offset lives in
+// logsState, shared with the full-screen viewer.
 func TestDashLogScrollDirection(t *testing.T) {
 	m := dashModel(120, 24, nil)
 	m.dashboard.focus = dashPaneLogs
 
 	var mm tea.Model = m
 	mm, _ = mm.(Model).handleDashboardKey(key("k")) // up = older
-	if got := mm.(Model).dashboard.scroll[dashPaneLogs]; got != 1 {
+	if got := mm.(Model).logs.scroll; got != 1 {
 		t.Errorf("k should step back one line from the tail: got %d, want 1", got)
 	}
 	mm, _ = mm.(Model).handleDashboardKey(key("j")) // down = newer
-	if got := mm.(Model).dashboard.scroll[dashPaneLogs]; got != 0 {
+	if got := mm.(Model).logs.scroll; got != 0 {
 		t.Errorf("j should return to the tail: got %d, want 0", got)
 	}
 	mm, _ = mm.(Model).handleDashboardKey(key("j"))
-	if got := mm.(Model).dashboard.scroll[dashPaneLogs]; got != 0 {
+	if got := mm.(Model).logs.scroll; got != 0 {
 		t.Errorf("j at the tail should stay at 0, got %d", got)
+	}
+}
+
+// Scrolling back in the dashboard's log pane must pause the tail, the
+// way it does in the full-screen viewer. It didn't: the pane kept its
+// own offset and never touched logs.follow, so applyLogLines' pinning
+// never ran and the view slid forward under the user as lines arrived.
+func TestDashLogScrollPausesAndPinsPosition(t *testing.T) {
+	m := dashModel(120, 24, nil)
+	m.dashboard.focus = dashPaneLogs
+
+	// Scroll back a few lines.
+	var mm tea.Model = m
+	for i := 0; i < 3; i++ {
+		mm, _ = mm.(Model).handleDashboardKey(key("k"))
+	}
+	cur := mm.(Model)
+	if cur.logs.follow {
+		t.Error("scrolling back should pause follow")
+	}
+	if cur.logs.scroll != 3 {
+		t.Fatalf("scroll = %d, want 3", cur.logs.scroll)
+	}
+	if !strings.Contains(cur.logsPaneLabel(), "paused") {
+		t.Errorf("pane label should report paused, got %q", cur.logsPaneLabel())
+	}
+
+	// The visible window must not move when new lines land.
+	before := cur.renderDashLogs(60, 5)
+	cur.applyLogLines([]string{"NEW-1", "NEW-2", "NEW-3"})
+	if after := cur.renderDashLogs(60, 5); after != before {
+		t.Errorf("paused pane slid with the tail:\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+	if cur.logs.scroll != 6 {
+		t.Errorf("scroll = %d, want 6 (3 back + 3 new lines to stay pinned)", cur.logs.scroll)
+	}
+
+	// G resumes following and jumps back to the tail.
+	back, _ := cur.handleDashboardKey(key("G"))
+	resumed := back.(Model)
+	if !resumed.logs.follow || resumed.logs.scroll != 0 {
+		t.Errorf("G should resume follow at the tail, got follow=%v scroll=%d",
+			resumed.logs.follow, resumed.logs.scroll)
+	}
+	if !strings.Contains(resumed.renderDashLogs(60, 5), "NEW-3") {
+		t.Error("after resuming, the pane should show the newest line")
+	}
+}
+
+// f toggles follow from inside the dashboard, matching the viewer.
+func TestDashLogFollowToggle(t *testing.T) {
+	m := dashModel(120, 24, nil)
+	m.dashboard.focus = dashPaneLogs
+
+	off, _ := m.handleDashboardKey(key("f"))
+	if off.(Model).logs.follow {
+		t.Error("f should pause follow")
+	}
+	on, _ := off.(Model).handleDashboardKey(key("f"))
+	if !on.(Model).logs.follow || on.(Model).logs.scroll != 0 {
+		t.Errorf("f should resume follow at the tail, got follow=%v scroll=%d",
+			on.(Model).logs.follow, on.(Model).logs.scroll)
+	}
+}
+
+// Position carries into the full-screen viewer and back, since both
+// render the same buffer at the same offset.
+func TestDashLogScrollSurvivesViewerRoundTrip(t *testing.T) {
+	m := dashModel(120, 24, nil)
+	m.dashboard.focus = dashPaneLogs
+
+	var mm tea.Model = m
+	for i := 0; i < 4; i++ {
+		mm, _ = mm.(Model).handleDashboardKey(key("k"))
+	}
+	want := mm.(Model).logs.scroll
+
+	opened, _ := mm.(Model).handleDashboardKey(key("l"))
+	if got := opened.(Model).logs.scroll; got != want {
+		t.Errorf("viewer opened at scroll %d, want %d", got, want)
+	}
+	closed, _ := opened.(Model).closeLogs()
+	if got := closed.(Model).logs.scroll; got != want {
+		t.Errorf("back in the dashboard at scroll %d, want %d", got, want)
 	}
 }
 

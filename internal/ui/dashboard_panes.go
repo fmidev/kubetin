@@ -345,9 +345,11 @@ func oneLine(s string) string {
 }
 
 // renderDashLogs draws the log tail. It reads the same logsState ring
-// buffer the full-screen viewer uses — the dashboard pane is a second
-// renderer over one stream, not a second stream.
-func (m Model) renderDashLogs(w, h, scroll int) string {
+// buffer *and the same scroll offset* the full-screen viewer uses —
+// the dashboard pane is a second renderer over one stream, not a
+// second stream with its own position.
+func (m Model) renderDashLogs(w, h int) string {
+	scroll := m.logs.scroll
 	th := m.Theme
 	if m.logs.err != "" && len(m.logs.lines) == 0 {
 		return clampCanvas(" "+th.StatusBad.Render("✕ "+summariseStreamErr(m.logs.err)), w, h)

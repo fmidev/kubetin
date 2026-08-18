@@ -33,9 +33,10 @@ type dashboardState struct {
 	stack []dashboardTarget
 	focus dashboardPane
 
-	// scroll is per-pane. Containers and events count rows from the
-	// top; logs count from the *bottom* so 0 means "following the
-	// tail", matching logsState.scroll.
+	// scroll is per-pane, counting rows from the top. The logs pane is
+	// deliberately absent: its offset lives in logsState next to
+	// follow, so the buffer's pin-on-new-lines logic and the paused
+	// indicator behave exactly as they do in the full-screen viewer.
 	scroll [dashPaneCount]int
 
 	// canvas is the stacked layout's whole-body offset, used instead
@@ -171,6 +172,11 @@ func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.jumpDashboard(true)
 	case "G", "end":
 		m.jumpDashboard(false)
+	case "f":
+		m.logs.follow = !m.logs.follow
+		if m.logs.follow {
+			m.logs.scroll = 0
+		}
 	case "c":
 		return m.cycleDashboardContainer()
 	case "l":
@@ -203,9 +209,12 @@ func (m *Model) scrollDashboard(delta int) {
 		m.canvasScrollTo(m.dashboard.canvas+delta, r, h)
 		return
 	}
-	// Logs count from the bottom, so "down" means towards the tail.
+	// Logs share the viewer's offset: j/k move it and pause/resume
+	// follow, so a scrolled-back pane holds its position as new lines
+	// arrive instead of sliding with the tail.
 	if m.dashboard.focus == dashPaneLogs {
-		delta = -delta
+		m.scrollLogsBy(-delta, lay.logs.h)
+		return
 	}
 	max := m.dashScrollMax(m.dashboard.focus, lay, r)
 	v := m.dashboard.scroll[m.dashboard.focus] + delta
@@ -232,14 +241,20 @@ func (m *Model) jumpDashboard(top bool) {
 		}
 		return
 	}
-	max := m.dashScrollMax(m.dashboard.focus, lay, r)
 	// For logs, offset counts from the tail: g is the oldest line we
-	// still hold, G is back to following.
+	// still hold (paused), G is back to following.
+	if m.dashboard.focus == dashPaneLogs {
+		if top {
+			m.logs.scroll = clampLogsScrollTo(len(m.logs.lines), len(m.logs.lines), lay.logs.h)
+			m.logs.follow = false
+		} else {
+			m.logs.scroll = 0
+			m.logs.follow = true
+		}
+		return
+	}
+	max := m.dashScrollMax(m.dashboard.focus, lay, r)
 	switch {
-	case m.dashboard.focus == dashPaneLogs && top:
-		m.dashboard.scroll[dashPaneLogs] = max
-	case m.dashboard.focus == dashPaneLogs:
-		m.dashboard.scroll[dashPaneLogs] = 0
 	case top:
 		m.dashboard.scroll[m.dashboard.focus] = 0
 	default:
@@ -268,11 +283,9 @@ func (m Model) dashScrollMax(p dashboardPane, lay dashLayout, r podRow) int {
 		content = m.renderDashEvents(m.dashEventsFor(t.Ref), lay.right.w, 0, 0)
 		h = lay.right.h
 	case dashPaneLogs:
-		max := len(m.logs.lines) - lay.logs.h
-		if max < 0 {
-			return 0
-		}
-		return max
+		// Logs are bounded by clampLogsScrollTo against logsState, not
+		// by this pane's offset array.
+		return 0
 	}
 	if max := lineCount(content) - h; max > 0 {
 		return max
@@ -291,7 +304,6 @@ func (m Model) cycleDashboardContainer() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.dashboard.containerI = (m.dashboard.containerI + 1) % len(m.dashboard.containers)
-	m.dashboard.scroll[dashPaneLogs] = 0
 	cmd := m.startDashboardLogs(t.Ref)
 	return m, cmd
 }
@@ -332,8 +344,7 @@ func (m Model) renderDashboardWide(r podRow, t dashboardTarget, lay dashLayout, 
 		m.dashboard.scroll[dashPaneContainers]), lay.left)
 	canvas = splicePane(canvas, m.renderDashEvents(m.dashEventsFor(t.Ref), lay.right.w, lay.right.h,
 		m.dashboard.scroll[dashPaneEvents]), lay.right)
-	canvas = splicePane(canvas, m.renderDashLogs(lay.logs.w, lay.logs.h,
-		m.dashboard.scroll[dashPaneLogs]), lay.logs)
+	canvas = splicePane(canvas, m.renderDashLogs(lay.logs.w, lay.logs.h), lay.logs)
 
 	if bottom := m.dashBottomLabel(); bottom != "" {
 		canvas = dashPaneTitle(canvas, bottom, 2, h-1)
@@ -374,7 +385,7 @@ func (m Model) stackedBody(r podRow, w int) string {
 			sized(m.renderDashEvents(events, inner, 0, 0), dashStackEventsMax),
 			w, m.dashboard.focus == dashPaneEvents, th),
 		dashStackedBox(m.logsPaneLabel(),
-			m.renderDashLogs(inner, dashStackLogHeight, m.dashboard.scroll[dashPaneLogs]),
+			m.renderDashLogs(inner, dashStackLogHeight),
 			w, m.dashboard.focus == dashPaneLogs, th),
 	}
 	return strings.Join(parts, "\n")
