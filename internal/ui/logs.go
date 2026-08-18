@@ -14,7 +14,11 @@ import (
 // logsState owns the live logs view: the streaming buffer, scroll
 // position, follow flag, and the most recent error if any.
 type logsState struct {
+	// open means the full-screen viewer is on screen. streaming means
+	// a stream is live — the dashboard's log pane renders this same
+	// buffer inline with open=false, so the two can't be one flag.
 	open       bool
+	streaming  bool
 	ref        cluster.DescribeRef
 	container  string
 	containers []string // for the picker; populated when len > 1
@@ -117,11 +121,27 @@ const (
 // Bumps logs.session so any messages still draining from a previously-
 // cancelled stream get filtered out by their stale session id.
 func (m Model) startLogs(ref cluster.DescribeRef, container string) (tea.Model, tea.Cmd) {
-	if m.OnLogsStart == nil {
+	cmd := m.beginLogStream(ref, container)
+	if cmd == nil {
 		return m, nil
 	}
-	m.logs.session++
 	m.logs.open = true
+	return m, cmd
+}
+
+// beginLogStream resets the buffer and asks main to start streaming,
+// without deciding whether anything is shown. startLogs opens the
+// full-screen viewer on top of it; the dashboard leaves open=false and
+// renders the same buffer in its log pane.
+//
+// Bumps logs.session so any messages still draining from a previously-
+// cancelled stream get filtered out by their stale session id.
+func (m *Model) beginLogStream(ref cluster.DescribeRef, container string) tea.Cmd {
+	if m.OnLogsStart == nil {
+		return nil
+	}
+	m.logs.session++
+	m.logs.streaming = true
 	m.logs.ref = ref
 	m.logs.container = container
 	m.logs.lines = make([]string, 0, 256)
@@ -138,7 +158,26 @@ func (m Model) startLogs(ref cluster.DescribeRef, container string) (tea.Model, 
 	cb := m.OnLogsStart
 	focused := m.WatchedContext
 	req := LogStartMsg{Session: m.logs.session, Ref: ref, Container: container}
-	return m, func() tea.Msg { return cb(focused, req) }
+	return func() tea.Msg { return cb(focused, req) }
+}
+
+// logStatusIndicator renders the stream's state badge. Precedence:
+// error (and not yet ended) > finished > reconnecting > paused > live.
+// "reconnecting" wins over "paused" because the user's paused state
+// still applies to the buffer they're reading; the network-level state
+// matters more in that moment.
+func (m Model) logStatusIndicator() string {
+	switch {
+	case m.logs.err != "" && !m.logs.finished:
+		return m.Theme.StatusBad.Render("✕ " + summariseStreamErr(m.logs.err))
+	case m.logs.finished:
+		return m.Theme.StatusDim.Render("◼ ended")
+	case m.logs.reconnecting:
+		return m.Theme.StatusWrn.Render("↻ reconnecting")
+	case !m.logs.follow:
+		return m.Theme.StatusWrn.Render("❚❚ paused")
+	}
+	return m.Theme.StatusOK.Render("● live")
 }
 
 // openLogsForCursor handles the "Logs" action selection. For a Pod
@@ -402,6 +441,13 @@ func clampLogsScroll(want, lineCount, terminalHeight int) int {
 func (m Model) closeLogs() (tea.Model, tea.Cmd) {
 	m.logs.open = false
 	m.logs.pickerOpen = false
+	// The dashboard renders this same buffer in its log pane, so
+	// closing the full-screen viewer drops back to it rather than
+	// killing the stream out from under it.
+	if m.dashboard.open {
+		return m, nil
+	}
+	m.logs.streaming = false
 	if m.OnLogsStop != nil {
 		cb := m.OnLogsStop
 		return m, func() tea.Msg { cb(); return nil }
@@ -679,25 +725,7 @@ func (m Model) renderLogs(canvasWidth, canvasHeight int) string {
 		b.WriteByte('\n')
 	}
 
-	// State precedence:
-	//   error (and not yet ended) > finished > reconnecting > paused > live.
-	// "reconnecting" wins over "paused" because the user paused
-	// state still applies to the buffer they're reading; the network-
-	// level state matters more in that moment. Long errors get
-	// summarised so they don't crowd the search prompt and key hints.
-	var status string
-	switch {
-	case m.logs.err != "" && !m.logs.finished:
-		status = m.Theme.StatusBad.Render("✕ " + summariseStreamErr(m.logs.err))
-	case m.logs.finished:
-		status = m.Theme.StatusDim.Render("◼ ended")
-	case m.logs.reconnecting:
-		status = m.Theme.StatusWrn.Render("↻ reconnecting")
-	case !m.logs.follow:
-		status = m.Theme.StatusWrn.Render("❚❚ paused")
-	default:
-		status = m.Theme.StatusOK.Render("● live")
-	}
+	status := m.logStatusIndicator()
 
 	// Search prompt: when focused, show "/term█"; when active but
 	// unfocused, show "/term  M/N" plus the n/N hint.

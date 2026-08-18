@@ -12,7 +12,8 @@ import (
 type Action int
 
 const (
-	ActDescribe Action = iota
+	ActDashboard Action = iota
+	ActDescribe
 	ActLogs
 	ActExec
 	ActEvents
@@ -27,6 +28,8 @@ const (
 
 func (a Action) Label() string {
 	switch a {
+	case ActDashboard:
+		return "Dashboard"
 	case ActDescribe:
 		return "Describe"
 	case ActLogs:
@@ -68,7 +71,7 @@ func (a Action) destructive() bool { return a == ActDelete || a == ActDrain }
 func actionsFor(kind string) []Action {
 	switch kind {
 	case "Pod":
-		return []Action{ActDescribe, ActLogs, ActExec, ActEvents, ActDelete}
+		return []Action{ActDashboard, ActDescribe, ActLogs, ActExec, ActEvents, ActDelete}
 	case "Deployment":
 		return []Action{ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
 	case "Node":

@@ -3,8 +3,10 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
@@ -168,6 +170,63 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.scaleConfirm.current = 3
 			m.scaleConfirm.typed = "5"
 		}},
+		{"dashboard/wide", 200, 50, ViewPods, dashSetup(nil)},
+		{"dashboard/min-wide", 120, 20, ViewPods, dashSetup(nil)},
+		{"dashboard/just-under-wide", 119, 40, ViewPods, dashSetup(nil)},
+		{"dashboard/short", 160, 19, ViewPods, dashSetup(nil)},
+		{"dashboard/narrow", 80, 24, ViewPods, dashSetup(nil)},
+		{"dashboard/very-narrow", 60, 20, ViewPods, dashSetup(nil)},
+		{"dashboard/tiny", 40, 12, ViewPods, dashSetup(nil)},
+		{"dashboard/blocking-condition", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			r := m.pods["dash-uid"]
+			r.Phase = "Pending"
+			r.Conditions = []cluster.PodCondition{{
+				Type: "PodScheduled", Status: "False", Reason: "Unschedulable",
+				Message: "0/5 nodes are available: 5 Insufficient cpu.\nsome trailing detail",
+			}}
+			m.pods["dash-uid"] = r
+		})},
+		{"dashboard/no-containers-reported", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			r := m.pods["dash-uid"]
+			r.ContainerInfo = nil
+			r.InitContainerInfo = nil
+			m.pods["dash-uid"] = r
+		})},
+		{"dashboard/no-events", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			m.events = map[types.UID]eventRow{}
+		})},
+		{"dashboard/log-error", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			m.logs.lines = nil
+			m.logs.err = "the server rejected our request: pods \"x\" not found"
+		})},
+		{"dashboard/long-everything", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			r := m.pods["dash-uid"]
+			r.Name = strings.Repeat("x", 120)
+			r.PodIP = "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
+			r.ContainerInfo[0].Image = "registry.example.com/" + strings.Repeat("y", 90) + ":1.0"
+			m.pods["dash-uid"] = r
+			m.logs.lines = []string{strings.Repeat("L", 400)}
+		})},
+		{"dashboard/scrolled", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			m.dashboard.scroll[dashPaneEvents] = 3
+			m.dashboard.scroll[dashPaneLogs] = 2
+			m.dashboard.focus = dashPaneEvents
+		})},
+		{"dashboard/stacked-scrolled", 80, 24, ViewPods, dashSetup(func(m *Model) {
+			m.dashboard.canvas = 7
+		})},
+		{"dashboard/target-gone", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			m.pods = map[types.UID]podRow{}
+		})},
+		{"dashboard/logs-over-dashboard", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			m.logs.open = true
+		})},
+		{"dashboard/menu-over-dashboard", 200, 50, ViewPods, dashSetup(func(m *Model) {
+			m.actionMenu.open = true
+			m.actionMenu.ref = clusterRef("Pod", "default", "dash-pod")
+			m.actionMenu.options = []actionItem{{Action: ActDashboard, Status: actionAllowed}}
+		})},
+
 		{"restart-confirm", 120, 40, ViewDeployments, func(m *Model) {
 			m.restartConfirm.open = true
 			m.restartConfirm.ref.Name = "my-deploy"
@@ -229,6 +288,76 @@ func TestClampCanvasContract(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// dashSetup seeds a realistic dashboard: a two-container pod mid
+// CrashLoopBackOff, a handful of events, and a live log buffer. extra
+// runs afterwards so individual cases can distort one dimension
+// without restating the whole fixture.
+func dashSetup(extra func(*Model)) func(*Model) {
+	return func(m *Model) {
+		now := time.Now()
+		m.pods["dash-uid"] = podRow{
+			UID:            "dash-uid",
+			Namespace:      "default",
+			Name:           "dash-pod",
+			Phase:          "Running",
+			Restarts:       3,
+			Node:           "worker-03.example.com",
+			Containers:     []string{"api", "envoy"},
+			CreatedAt:      now.Add(-4 * time.Hour),
+			StartedAt:      now.Add(-4 * time.Hour),
+			PodIP:          "10.42.3.17",
+			HostIP:         "192.168.1.10",
+			QOSClass:       "Burstable",
+			ServiceAccount: "payments",
+			CPUMilli:       142,
+			MemBytes:       384 << 20,
+			HasMetrics:     true,
+			HasNetwork:     true,
+			NetRXBps:       1200,
+			NetTXBps:       840,
+			ContainerInfo: []cluster.ContainerInfo{
+				{Name: "api", Image: "ghcr.io/x/api:1.2", Ready: true, State: cluster.ContainerReady},
+				{Name: "envoy", Image: "envoy:v1.29", State: cluster.ContainerError,
+					Restarts: 3, Reason: "CrashLoopBackOff", ExitCode: 137},
+			},
+			InitContainerInfo: []cluster.ContainerInfo{
+				{Name: "wait-db", Image: "busybox:1.36", State: cluster.ContainerTerminated, Reason: "Completed"},
+			},
+			Conditions: []cluster.PodCondition{{Type: "Ready", Status: "True"}},
+		}
+		m.cursor = "dash-uid"
+		m.events = map[types.UID]eventRow{}
+		for i := 0; i < 8; i++ {
+			uid := types.UID("evt-" + string(rune('a'+i)))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Warning",
+				Reason:       "BackOff",
+				Message:      "Back-off restarting failed container envoy in pod dash-pod_default",
+				Count:        int32(i + 1),
+				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
+				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+			}
+		}
+		m.logs.streaming = true
+		m.logs.follow = true
+		m.logs.container = "envoy"
+		m.logs.cap = 1000
+		for i := 0; i < 40; i++ {
+			m.logs.lines = append(m.logs.lines, "12:04:11 GET /health 200 1.2ms")
+		}
+		m.dashboard.open = true
+		m.dashboard.stack = []dashboardTarget{{
+			Ref: cluster.DescribeRef{Version: "v1", Resource: "pods", Kind: "Pod",
+				Namespace: "default", Name: "dash-pod"},
+			UID: "dash-uid",
+		}}
+		m.dashboard.containers = []string{"api", "envoy"}
+		if extra != nil {
+			extra(m)
+		}
 	}
 }
 
