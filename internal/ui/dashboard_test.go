@@ -356,3 +356,57 @@ func TestPodBlockingCondition(t *testing.T) {
 		t.Error("DisruptionTarget should not count as blocking")
 	}
 }
+
+// The dashboard's log pane must render log text exactly as the
+// full-screen viewer does: default foreground. It regressed to grey
+// because the pane was spliced into a dim border frame and inherited
+// its colour — this pins the symptom, not just the spliceLine fix.
+func TestDashboardLogTextMatchesViewer(t *testing.T) {
+	withColour(t)
+
+	m := dashModel(160, 40, nil)
+	const needle = "GET /health"
+
+	dashPrefix, ok := sgrBefore(m.renderDashboard(30, 160), needle)
+	if !ok {
+		t.Fatal("log line not found in the dashboard render")
+	}
+	viewerPrefix, ok := sgrBefore(m.renderLogs(160, 30), needle)
+	if !ok {
+		t.Fatal("log line not found in the viewer render")
+	}
+
+	if dashPrefix != viewerPrefix {
+		t.Errorf("log text styled differently:\n dashboard = %q\n viewer    = %q",
+			dashPrefix, viewerPrefix)
+	}
+	if strings.Contains(dashPrefix, "38;5;244") {
+		t.Errorf("dashboard log text is dimmed by the frame colour: %q", dashPrefix)
+	}
+}
+
+// sgrBefore returns the SGR escapes still open immediately before
+// needle on the line containing it, tracking resets.
+func sgrBefore(render, needle string) (string, bool) {
+	for _, line := range strings.Split(render, "\n") {
+		i := strings.Index(line, needle)
+		if i < 0 {
+			continue
+		}
+		var open []string
+		for _, chunk := range strings.SplitAfter(line[:i], "m") {
+			j := strings.LastIndex(chunk, "\x1b[")
+			if j < 0 || !strings.HasSuffix(chunk, "m") {
+				continue
+			}
+			code := chunk[j:]
+			if code == "\x1b[0m" {
+				open = open[:0]
+				continue
+			}
+			open = append(open, code)
+		}
+		return strings.Join(open, ""), true
+	}
+	return "", false
+}
