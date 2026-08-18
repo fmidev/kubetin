@@ -6,6 +6,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/fmidev/kubetin/internal/cluster"
 )
 
 // makePods returns a deterministic map of pods we can re-seed across
@@ -89,4 +91,69 @@ func TestApplyPodEvent_PreservesUIDOrdering(t *testing.T) {
 	// Re-using applyPodEvent with synthetic events; we don't actually
 	// drive the cluster package here.
 	_ = makePods // referenced; avoids 'unused' if test package shrinks
+}
+
+// An informer UPDATE must not blank the metrics/network fields. Pods
+// emit status updates far more often than metrics-server is polled, so
+// a whole-row replace made the CPU/MEM columns flicker to "—" and back
+// on any busy pod.
+func TestApplyPodEvent_PreservesMetricsAcrossUpdate(t *testing.T) {
+	m := map[types.UID]podRow{}
+
+	applyPodEvent(m, cluster.PodEvent{
+		Kind: cluster.PodAdded, UID: "p1", Namespace: "default", Name: "api",
+		Phase: corev1.PodRunning, NodeName: "node-1",
+	})
+
+	// The metrics + network receivers merge into the existing row.
+	r := m["p1"]
+	r.CPUMilli, r.MemBytes, r.HasMetrics = 142, 384<<20, true
+	r.NetRXBps, r.NetTXBps, r.HasNetwork = 1200, 840, true
+	m["p1"] = r
+
+	applyPodEvent(m, cluster.PodEvent{
+		Kind: cluster.PodUpdated, UID: "p1", Namespace: "default", Name: "api",
+		Phase: corev1.PodRunning, NodeName: "node-1", Restarts: 1,
+	})
+
+	got := m["p1"]
+	if !got.HasMetrics || got.CPUMilli != 142 || got.MemBytes != 384<<20 {
+		t.Errorf("metrics lost across informer UPDATE: cpu=%d mem=%d has=%v",
+			got.CPUMilli, got.MemBytes, got.HasMetrics)
+	}
+	if !got.HasNetwork || got.NetRXBps != 1200 || got.NetTXBps != 840 {
+		t.Errorf("network rates lost across informer UPDATE: rx=%d tx=%d has=%v",
+			got.NetRXBps, got.NetTXBps, got.HasNetwork)
+	}
+	// The informer's own fields must still be applied.
+	if got.Restarts != 1 {
+		t.Errorf("Restarts = %d, want 1 — informer fields must still update", got.Restarts)
+	}
+}
+
+// A pod recreated under the same name gets a fresh UID, so nothing
+// should carry over: stale CPU numbers on a brand-new pod would be
+// worse than showing "—" until the next scrape.
+func TestApplyPodEvent_NewUIDStartsClean(t *testing.T) {
+	m := map[types.UID]podRow{
+		"old": {UID: "old", Name: "api", CPUMilli: 999, HasMetrics: true},
+	}
+	applyPodEvent(m, cluster.PodEvent{
+		Kind: cluster.PodAdded, UID: "new", Namespace: "default", Name: "api",
+		Phase: corev1.PodRunning,
+	})
+
+	if got := m["new"]; got.HasMetrics || got.CPUMilli != 0 {
+		t.Errorf("new UID inherited metrics: cpu=%d has=%v", got.CPUMilli, got.HasMetrics)
+	}
+}
+
+// Delete still removes the row outright — field-ownership applies to
+// updates, not to tombstones.
+func TestApplyPodEvent_DeleteRemoves(t *testing.T) {
+	m := map[types.UID]podRow{"p1": {UID: "p1", Name: "api", HasMetrics: true}}
+	applyPodEvent(m, cluster.PodEvent{Kind: cluster.PodDeleted, UID: "p1"})
+	if _, ok := m["p1"]; ok {
+		t.Error("deleted pod still present in the map")
+	}
 }

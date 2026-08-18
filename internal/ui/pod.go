@@ -96,24 +96,35 @@ func (k SortKey) label() string {
 }
 
 // applyPodEvent mutates the pod map in response to one informer event.
+//
+// It writes only the fields the informer owns. CPU/MEM arrive on
+// MetricsSnapshotMsg and the rx/tx rates on NetworkSnapshotMsg, each
+// merged into the row by its own receiver; replacing the whole row
+// here blanked them until the next scrape. Pods emit status updates
+// far more often than metrics-server is polled, so on a busy pod the
+// CPU/MEM/net columns visibly flickered to "—" and back.
+//
+// Same field-ownership rule model.Store.ApplyProbe / ApplyMetrics
+// follow for per-cluster state, and for the same reason: two writers
+// on different clocks must not clobber each other.
 func applyPodEvent(m map[types.UID]podRow, ev cluster.PodEvent) {
 	switch ev.Kind {
 	case cluster.PodDeleted:
 		delete(m, ev.UID)
 	default:
-		m[ev.UID] = podRow{
-			UID:             ev.UID,
-			Namespace:       ev.Namespace,
-			Name:            ev.Name,
-			Phase:           ev.Phase,
-			Restarts:        ev.Restarts,
-			Node:            ev.NodeName,
-			Containers:      ev.Containers,
-			ContainerReady:  ev.ContainerReady,
-			ContainerStates: ev.ContainerStates,
-			CreatedAt:       ev.CreatedAt,
-			Updated:         time.Now(),
-		}
+		r := m[ev.UID]
+		r.UID = ev.UID
+		r.Namespace = ev.Namespace
+		r.Name = ev.Name
+		r.Phase = ev.Phase
+		r.Restarts = ev.Restarts
+		r.Node = ev.NodeName
+		r.Containers = ev.Containers
+		r.ContainerReady = ev.ContainerReady
+		r.ContainerStates = ev.ContainerStates
+		r.CreatedAt = ev.CreatedAt
+		r.Updated = time.Now()
+		m[ev.UID] = r
 	}
 }
 
