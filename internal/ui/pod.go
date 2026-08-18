@@ -31,6 +31,17 @@ type podRow struct {
 	CreatedAt       time.Time
 	Updated         time.Time
 
+	// Dashboard detail. Not read by the table renderers.
+	ContainerInfo     []cluster.ContainerInfo
+	InitContainerInfo []cluster.ContainerInfo
+	PodIP             string
+	HostIP            string
+	QOSClass          string
+	ServiceAccount    string
+	StartedAt         time.Time
+	Labels            map[string]string
+	Conditions        []cluster.PodCondition
+
 	// Filled by MetricsSnapshotMsg. Zero values mean "no reading yet".
 	CPUMilli   int64
 	MemBytes   int64
@@ -124,6 +135,15 @@ func applyPodEvent(m map[types.UID]podRow, ev cluster.PodEvent) {
 		r.ContainerStates = ev.ContainerStates
 		r.CreatedAt = ev.CreatedAt
 		r.Updated = time.Now()
+		r.ContainerInfo = ev.ContainerInfo
+		r.InitContainerInfo = ev.InitContainerInfo
+		r.PodIP = ev.PodIP
+		r.HostIP = ev.HostIP
+		r.QOSClass = ev.QOSClass
+		r.ServiceAccount = ev.ServiceAccount
+		r.StartedAt = ev.StartedAt
+		r.Labels = ev.Labels
+		r.Conditions = ev.Conditions
 		m[ev.UID] = r
 	}
 }

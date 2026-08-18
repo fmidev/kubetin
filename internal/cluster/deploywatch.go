@@ -22,6 +22,18 @@ const (
 	DeployDeleted
 )
 
+// DeployCondition projects one entry of deployment.Status.Conditions.
+// Available / Progressing carry the reason a rollout is stuck
+// ("ProgressDeadlineExceeded", "ReplicaSetUpdated") — the dashboard
+// shows it verbatim because the replica counts alone don't explain
+// *why* a deployment isn't converging.
+type DeployCondition struct {
+	Type    string
+	Status  string
+	Reason  string
+	Message string
+}
+
 // DeployEvent is the thin projection used by the UI.
 type DeployEvent struct {
 	Kind         DeployEventKind
@@ -36,6 +48,18 @@ type DeployEvent struct {
 	Unavailable  int32
 	CreatedAt    time.Time
 	StrategyType string // RollingUpdate | Recreate
+
+	// Selector backs the dashboard's owned-pod lookup. Only
+	// MatchLabels is projected — MatchExpressions is legal in the API
+	// but Deployments created by any normal path use MatchLabels, and
+	// the dashboard falls back to the name-prefix heuristic when this
+	// is empty.
+	Selector map[string]string
+
+	MaxSurge       string
+	MaxUnavailable string
+
+	Conditions []DeployCondition
 }
 
 // DeployWatcher mirrors PodWatcher / NodeWatcher.
@@ -106,23 +130,56 @@ func (w *DeployWatcher) emit(kind DeployEventKind, obj any) {
 	if d.Spec.Replicas != nil {
 		desired = *d.Spec.Replicas
 	}
+	var selector map[string]string
+	if d.Spec.Selector != nil {
+		selector = copyLabels(d.Spec.Selector.MatchLabels)
+	}
+	maxSurge, maxUnavail := "", ""
+	if ru := d.Spec.Strategy.RollingUpdate; ru != nil {
+		if ru.MaxSurge != nil {
+			maxSurge = ru.MaxSurge.String()
+		}
+		if ru.MaxUnavailable != nil {
+			maxUnavail = ru.MaxUnavailable.String()
+		}
+	}
 	ev := DeployEvent{
-		Kind:         kind,
-		Context:      w.Context,
-		Namespace:    d.Namespace,
-		Name:         d.Name,
-		UID:          d.UID,
-		Replicas:     desired,
-		Ready:        d.Status.ReadyReplicas,
-		UpToDate:     d.Status.UpdatedReplicas,
-		Available:    d.Status.AvailableReplicas,
-		Unavailable:  d.Status.UnavailableReplicas,
-		CreatedAt:    d.CreationTimestamp.Time,
-		StrategyType: string(d.Spec.Strategy.Type),
+		Kind:           kind,
+		Context:        w.Context,
+		Namespace:      d.Namespace,
+		Name:           d.Name,
+		UID:            d.UID,
+		Replicas:       desired,
+		Ready:          d.Status.ReadyReplicas,
+		UpToDate:       d.Status.UpdatedReplicas,
+		Available:      d.Status.AvailableReplicas,
+		Unavailable:    d.Status.UnavailableReplicas,
+		CreatedAt:      d.CreationTimestamp.Time,
+		StrategyType:   string(d.Spec.Strategy.Type),
+		Selector:       selector,
+		MaxSurge:       maxSurge,
+		MaxUnavailable: maxUnavail,
+		Conditions:     projectDeployConditions(d.Status.Conditions),
 	}
 	select {
 	case w.Out <- ev:
 	default:
 		w.DroppedEvents.Add(1)
 	}
+}
+
+func projectDeployConditions(conds []appsv1.DeploymentCondition) []DeployCondition {
+	if len(conds) == 0 {
+		return nil
+	}
+	out := make([]DeployCondition, 0, len(conds))
+	for _, c := range conds {
+		out = append(out, DeployCondition{
+			Type:    string(c.Type),
+			Status:  string(c.Status),
+			Reason:  c.Reason,
+			Message: c.Message,
+		})
+	}
+	return out
 }

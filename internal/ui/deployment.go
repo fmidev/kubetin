@@ -21,6 +21,14 @@ type deploymentRow struct {
 	Available int32
 	CreatedAt time.Time
 	Updated   time.Time
+
+	// Dashboard detail. Not read by the table renderer.
+	Unavailable    int32
+	StrategyType   string
+	MaxSurge       string
+	MaxUnavailable string
+	Selector       map[string]string
+	Conditions     []cluster.DeployCondition
 }
 
 func applyDeployEvent(m map[types.UID]deploymentRow, ev cluster.DeployEvent) {
@@ -29,15 +37,21 @@ func applyDeployEvent(m map[types.UID]deploymentRow, ev cluster.DeployEvent) {
 		delete(m, ev.UID)
 	default:
 		m[ev.UID] = deploymentRow{
-			UID:       ev.UID,
-			Namespace: ev.Namespace,
-			Name:      ev.Name,
-			Replicas:  ev.Replicas,
-			Ready:     ev.Ready,
-			UpToDate:  ev.UpToDate,
-			Available: ev.Available,
-			CreatedAt: ev.CreatedAt,
-			Updated:   time.Now(),
+			UID:            ev.UID,
+			Namespace:      ev.Namespace,
+			Name:           ev.Name,
+			Replicas:       ev.Replicas,
+			Ready:          ev.Ready,
+			UpToDate:       ev.UpToDate,
+			Available:      ev.Available,
+			CreatedAt:      ev.CreatedAt,
+			Updated:        time.Now(),
+			Unavailable:    ev.Unavailable,
+			StrategyType:   ev.StrategyType,
+			MaxSurge:       ev.MaxSurge,
+			MaxUnavailable: ev.MaxUnavailable,
+			Selector:       ev.Selector,
+			Conditions:     ev.Conditions,
 		}
 	}
 }
