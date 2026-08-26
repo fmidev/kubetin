@@ -46,6 +46,7 @@ var helpGroups = []helpGroup{
 		Bindings: [][2]string{
 			{"Tab", "next reachable cluster"},
 			{"Shift-Tab", "previous reachable cluster"},
+			{"C", "show / hide the cluster rail"},
 		},
 	},
 	{
