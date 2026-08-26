@@ -13,8 +13,11 @@ agent, no installed CRDs.
 
 - **Multi-cluster fleet view.** Every context in your kubeconfig is probed
   in the background; switch focus with Tab.
-- **Live tables** for pods, deployments, nodes, and events — sortable,
-  filterable in-place.
+- **Live tables** for pods, deployments, nodes, events, namespaces,
+  services and ingresses — sortable, filterable in-place.
+- **Endpoint health on services.** The `READY` column counts ready
+  endpoints across every EndpointSlice, so a Service whose selector
+  matches nothing reads `0/0` in red instead of looking healthy.
 - **Resource metrics** (CPU / memory) from metrics-server, when present.
 - **Per-pod network rates** scraped from kubelet/cAdvisor through the
   apiserver proxy. Hidden gracefully when RBAC denies `nodes/proxy`.
@@ -134,7 +137,7 @@ kubetin -trust
 | Cluster | `Tab` / `Shift-Tab` | next / previous reachable cluster |
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
-| | `1` – `4` | pods / deployments / nodes / events |
+| | `1` – `7` | pods / deployments / nodes / events / namespaces / services / ingresses |
 | Filter | `/` | filter by name / namespace |
 | | `n` | namespace picker |
 | | `0` | all namespaces |

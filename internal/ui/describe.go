@@ -61,6 +61,21 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 				Name: r.Name,
 			}, true
 		}
+	case ViewServices:
+		if r, ok := m.services[m.cursor]; ok {
+			return cluster.DescribeRef{
+				Version: "v1", Resource: "services", Kind: "Service",
+				Namespace: r.Namespace, Name: r.Name,
+			}, true
+		}
+	case ViewIngresses:
+		if r, ok := m.ingresses[m.cursor]; ok {
+			return cluster.DescribeRef{
+				Group: "networking.k8s.io", Version: "v1",
+				Resource: "ingresses", Kind: "Ingress",
+				Namespace: r.Namespace, Name: r.Name,
+			}, true
+		}
 	case ViewNamespaces:
 		if r, ok := m.namespaces[m.cursor]; ok {
 			// OpenShift Projects describe (and delete) through the

@@ -30,6 +30,17 @@ type EvtEventMsg cluster.EventEvent
 // NsEventMsg wraps a cluster.NamespaceEvent for tea.Program.Send.
 type NsEventMsg cluster.NamespaceEvent
 
+// SvcEventMsg wraps a cluster.ServiceEvent for tea.Program.Send.
+type SvcEventMsg cluster.ServiceEvent
+
+// IngEventMsg wraps a cluster.IngressEvent for tea.Program.Send.
+type IngEventMsg cluster.IngressEvent
+
+// EndpointSliceEventMsg wraps a cluster.EndpointSliceEvent. Feeds the
+// Services table's READY column, aggregated per Service at render time
+// rather than merged into the service row.
+type EndpointSliceEventMsg cluster.EndpointSliceEvent
+
 // MetricsSnapshotMsg wraps a focused-cluster metrics snapshot.
 type MetricsSnapshotMsg cluster.MetricsSnapshot
 
@@ -82,6 +93,8 @@ const (
 	ViewNodes
 	ViewEvents
 	ViewNamespaces
+	ViewServices
+	ViewIngresses
 	ViewOverview // fleet overview, full-screen cards
 )
 
@@ -157,18 +170,24 @@ type Model struct {
 	// reason logs do.
 	OnDrainStart func(focusedCtx, node string) tea.Msg
 
-	pods          map[types.UID]podRow
-	nodes         map[types.UID]nodeRow
-	deployments   map[types.UID]deploymentRow
-	events        map[types.UID]eventRow
-	namespaces    map[types.UID]nsRow
-	view          View
-	cursor        types.UID
-	width         int
-	height        int
-	debugMode     bool
-	filterText    string // active filter; empty = no filter
-	filterFocused bool   // capturing keystrokes into filterText
+	pods        map[types.UID]podRow
+	nodes       map[types.UID]nodeRow
+	deployments map[types.UID]deploymentRow
+	events      map[types.UID]eventRow
+	namespaces  map[types.UID]nsRow
+	services    map[types.UID]serviceRow
+	ingresses   map[types.UID]ingressRow
+	// endpointSlices is keyed by slice UID, not by Service: one Service
+	// owns several slices and they are summed at render time. See
+	// collectEndpointCounts.
+	endpointSlices map[types.UID]endpointSliceRow
+	view           View
+	cursor         types.UID
+	width          int
+	height         int
+	debugMode      bool
+	filterText     string // active filter; empty = no filter
+	filterFocused  bool   // capturing keystrokes into filterText
 
 	// Per-view "first event received" flags. Reset when the focused
 	// cluster changes (PodsClearedMsg), set to true on the first event
@@ -176,6 +195,7 @@ type Model struct {
 	// "still syncing" from "synced with zero rows" — otherwise a Tab to
 	// a cluster with no pods looks identical to a stuck informer.
 	syncedPods, syncedNodes, syncedDeploys, syncedEvents, syncedNamespaces bool
+	syncedServices, syncedIngresses                                        bool
 	syncStartedAt                                                          time.Time
 
 	// Cluster-aggregate network rates, last sample. clusterNetOK is
@@ -248,6 +268,9 @@ func New(context string, store *model.Store, contexts []string) Model {
 		deployments:         make(map[types.UID]deploymentRow),
 		events:              make(map[types.UID]eventRow),
 		namespaces:          make(map[types.UID]nsRow),
+		services:            make(map[types.UID]serviceRow),
+		ingresses:           make(map[types.UID]ingressRow),
+		endpointSlices:      make(map[types.UID]endpointSliceRow),
 		permissions:         make(map[string]permState),
 		permissionsInFlight: make(map[string]struct{}),
 	}
@@ -373,6 +396,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		applyNsEvent(m.namespaces, cluster.NamespaceEvent(msg))
 		m.syncedNamespaces = true
+		return m, nil
+
+	case SvcEventMsg:
+		if msg.Context != m.WatchedContext {
+			return m, nil
+		}
+		applyServiceEvent(m.services, cluster.ServiceEvent(msg))
+		m.syncedServices = true
+		if _, ok := m.services[m.cursor]; !ok && m.view == ViewServices {
+			m.cursor = ""
+		}
+		return m, nil
+
+	case IngEventMsg:
+		if msg.Context != m.WatchedContext {
+			return m, nil
+		}
+		applyIngressEvent(m.ingresses, cluster.IngressEvent(msg))
+		m.syncedIngresses = true
+		if _, ok := m.ingresses[m.cursor]; !ok && m.view == ViewIngresses {
+			m.cursor = ""
+		}
+		return m, nil
+
+	case EndpointSliceEventMsg:
+		if msg.Context != m.WatchedContext {
+			return m, nil
+		}
+		// No synced flag and no cursor guard: slices are never rows,
+		// only a column on the Services table.
+		applyEndpointSliceEvent(m.endpointSlices, cluster.EndpointSliceEvent(msg))
 		return m, nil
 
 	case DescribeResultMsg:
@@ -649,8 +703,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.deployments = make(map[types.UID]deploymentRow)
 		m.events = make(map[types.UID]eventRow)
 		m.namespaces = make(map[types.UID]nsRow)
+		m.services = make(map[types.UID]serviceRow)
+		m.ingresses = make(map[types.UID]ingressRow)
+		m.endpointSlices = make(map[types.UID]endpointSliceRow)
 		m.cursor = ""
 		m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents, m.syncedNamespaces = false, false, false, false, false
+		m.syncedServices, m.syncedIngresses = false, false
 		m.syncStartedAt = time.Now()
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
 		// A scoped object on the previous cluster doesn't exist on the
@@ -790,6 +848,20 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.eventScope = nil
 			m.anchorCursorToVisible()
 		}
+	case "6":
+		if m.view != ViewServices {
+			m.view = ViewServices
+			m.cursor = ""
+			m.eventScope = nil
+			m.anchorCursorToVisible()
+		}
+	case "7":
+		if m.view != ViewIngresses {
+			m.view = ViewIngresses
+			m.cursor = ""
+			m.eventScope = nil
+			m.anchorCursorToVisible()
+		}
 	case "/":
 		m.filterFocused = true
 	case "n":
@@ -805,6 +877,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.view {
 		case ViewNamespaces:
 			m.nsSortKey = m.nsSortKey.next()
+		case ViewServices, ViewIngresses:
+			// Fixed namespace/name order, no sort state to cycle.
 		default:
 			m.sortKey = m.sortKey.next()
 		}
@@ -813,6 +887,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.view {
 		case ViewNamespaces:
 			m.nsSortDesc = !m.nsSortDesc
+		case ViewServices, ViewIngresses:
+			// See `s` above.
 		default:
 			m.sortDesc = !m.sortDesc
 		}
@@ -1552,6 +1628,10 @@ func (m Model) mainPane(height, width int) string {
 		return m.renderEventsView(height, width)
 	case ViewNamespaces:
 		return m.renderNamespacesView(height, width)
+	case ViewServices:
+		return m.renderServiceTable(height, width)
+	case ViewIngresses:
+		return m.renderIngressTable(height, width)
 	}
 	return m.renderTable(height, width)
 }
@@ -1611,6 +1691,22 @@ func (m Model) visibleUIDs() []types.UID {
 			if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
 				continue
 			}
+			out = append(out, r.UID)
+		}
+		return out
+	case ViewServices:
+		// Reuse the renderer's own filter so the cursor and the table
+		// can never disagree about which rows exist.
+		rows := m.visibleServiceRows()
+		out := make([]types.UID, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, r.UID)
+		}
+		return out
+	case ViewIngresses:
+		rows := m.visibleIngressRows()
+		out := make([]types.UID, 0, len(rows))
+		for _, r := range rows {
 			out = append(out, r.UID)
 		}
 		return out
@@ -1708,6 +1804,12 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 	case ViewNamespaces:
 		viewLabel = m.namespacesNoun()
 		total = len(m.namespaces)
+	case ViewServices:
+		viewLabel = "services"
+		total = len(m.services)
+	case ViewIngresses:
+		viewLabel = "ingresses"
+		total = len(m.ingresses)
 	}
 	title := m.Theme.Title.Render(
 		fmt.Sprintf(" kubetin %s · ns:%s · %s ", strings.TrimSpace(display), ns, viewLabel),
@@ -1827,7 +1929,7 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 }
 
 func (m Model) renderFooter() string {
-	hint := " ?:help  F1:overview  1:pods  2:deploy  3:nodes  4:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  F2:debug  q:quit "
+	hint := " ?:help  F1:overview  1:pods  2:deploy  3:nodes  4:events  5:ns  6:svc  7:ing  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
 	if len(m.Contexts) <= 1 {
 		// Nothing to Tab to, and the rail that would have hinted at
 		// other clusters isn't drawn either.
@@ -1882,6 +1984,10 @@ func (m Model) filterCounts() (matched, total int) {
 		total = len(m.events)
 	case ViewNamespaces:
 		total = len(m.namespaces)
+	case ViewServices:
+		total = len(m.services)
+	case ViewIngresses:
+		total = len(m.ingresses)
 	default:
 		total = len(m.pods)
 	}

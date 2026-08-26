@@ -1,6 +1,10 @@
 package ui
 
-import "strings"
+import (
+	"strings"
+
+	"k8s.io/apimachinery/pkg/types"
+)
 
 // column describes one table column for fitColumns: the narrowest
 // width at which it's still useful (min must fit the header label
@@ -85,4 +89,33 @@ func joinCells(cells ...string) string {
 		b.WriteString(c)
 	}
 	return b.String()
+}
+
+// windowRows slices rows down to the maxRows-1 that fit under a header,
+// centred on the cursor. Head-truncating instead would make every row
+// past the fold unreachable — the bug the pod and deployment tables
+// each fixed separately, and which the newer views get for free here.
+//
+// uid extracts the row's identity; the cursor is UID-anchored so the
+// window survives re-sorts and informer churn.
+func windowRows[T any](rows []T, cursor types.UID, maxRows int, uid func(T) types.UID) []T {
+	body := maxRows - 1 // header line
+	if body < 1 || len(rows) <= body {
+		return rows
+	}
+	idx := 0
+	for i, r := range rows {
+		if uid(r) == cursor {
+			idx = i
+			break
+		}
+	}
+	start := idx - body/2
+	if start < 0 {
+		start = 0
+	}
+	if start+body > len(rows) {
+		start = len(rows) - body
+	}
+	return rows[start : start+body]
 }
