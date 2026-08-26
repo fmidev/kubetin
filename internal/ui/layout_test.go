@@ -38,8 +38,38 @@ func TestViewFitsCanvas(t *testing.T) {
 		{"nodes/very-narrow", 60, 20, ViewNodes, nil},
 		{"deploy/wide", 200, 50, ViewDeployments, nil},
 		{"deploy/very-narrow", 60, 20, ViewDeployments, nil},
-		{"events/wide", 200, 50, ViewEvents, nil},
-		{"events/narrow", 60, 20, ViewEvents, nil},
+		// Events are an overlay now, not a view — exercised over each
+		// of the underlying views rather than as one of them.
+		{"events-lens/wide", 200, 50, ViewPods, eventsLens(nil)},
+		{"events-lens/narrow", 60, 20, ViewPods, eventsLens(nil)},
+		{"events-lens/tiny", 40, 12, ViewPods, eventsLens(nil)},
+		{"events-lens/scoped", 120, 30, ViewPods, eventsLens(func(m *Model) {
+			m.eventsLens.scope = &eventScopeRef{
+				Kind: "Pod", Namespace: "default", Name: "payments-api-7f9c8-x2k4l",
+			}
+		})},
+		{"events-lens/scoped-empty", 120, 30, ViewPods, eventsLens(func(m *Model) {
+			m.eventsLens.scope = &eventScopeRef{Kind: "Pod", Namespace: "default", Name: "nothing-here"}
+		})},
+		{"events-lens/namespace-scoped", 120, 30, ViewPods, eventsLens(func(m *Model) {
+			m.namespace = "kube-system"
+		})},
+		{"events-lens/cluster-empty", 120, 30, ViewPods, func(m *Model) {
+			m.eventsLens.open = true
+		}},
+		{"events-lens/scrolled", 120, 24, ViewPods, eventsLens(func(m *Model) {
+			m.eventsLens.scroll = 6
+		})},
+		{"events-lens/long-message", 120, 30, ViewPods, eventsLens(func(m *Model) {
+			m.events["evt-long"] = eventRow{
+				UID: "evt-long", Namespace: "default", Type: "Warning",
+				Reason:  strings.Repeat("R", 60),
+				Message: strings.Repeat("m", 400) + "\nsecond line",
+				Count:   1, LastSeen: time.Now(),
+				InvolvedKind: "Pod", InvolvedName: strings.Repeat("p", 90), InvolvedNs: "default",
+			}
+		})},
+		{"events-lens/over-deployments", 120, 30, ViewDeployments, eventsLens(nil)},
 		{"namespaces/wide", 200, 50, ViewNamespaces, nil},
 		{"namespaces/narrow", 80, 24, ViewNamespaces, nil},
 		{"overview/wide", 200, 50, ViewOverview, nil},
@@ -604,6 +634,32 @@ func netFixture(extra func(*Model)) func(*Model) {
 		}
 		m.syncedIngresses = true
 
+		if extra != nil {
+			extra(m)
+		}
+	}
+}
+
+// eventsLens opens the events overlay over a seeded event set.
+func eventsLens(extra func(*Model)) func(*Model) {
+	return func(m *Model) {
+		now := time.Now()
+		for i := 0; i < 6; i++ {
+			uid := types.UID("lens-evt-" + string(rune('a'+i)))
+			ns := "default"
+			if i%2 == 1 {
+				ns = "kube-system"
+			}
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: ns, Type: "Warning", Reason: "BackOff",
+				Message:      "Back-off restarting failed container envoy in pod payments-api",
+				Count:        int32(i + 1),
+				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
+				InvolvedKind: "Pod", InvolvedName: "payments-api-7f9c8-x2k4l", InvolvedNs: ns,
+			}
+		}
+		m.syncedEvents = true
+		m.eventsLens.open = true
 		if extra != nil {
 			extra(m)
 		}

@@ -55,11 +55,10 @@ var helpGroups = []helpGroup{
 			{"F1", "fleet overview"},
 			{"1", "pods"},
 			{"2", "deployments"},
-			{"3", "nodes"},
-			{"4", "events"},
-			{"5", "namespaces"},
-			{"6", "services"},
-			{"7", "ingresses"},
+			{"3", "services"},
+			{"4", "ingresses"},
+			{"5", "nodes"},
+			{"6", "namespaces"},
 		},
 	},
 	{
@@ -76,6 +75,16 @@ var helpGroups = []helpGroup{
 		Bindings: [][2]string{
 			{"s", "cycle sort column"},
 			{"S", "reverse sort direction"},
+		},
+	},
+	{
+		Title: "Events",
+		Bindings: [][2]string{
+			{"e", "events for the selected resource"},
+			{"E", "events for the namespace / cluster"},
+			{"e / Esc", "(inside) close"},
+			{"E", "(inside) widen to everything"},
+			{"j / k, g / G", "(inside) scroll"},
 		},
 	},
 	{

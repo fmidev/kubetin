@@ -88,13 +88,17 @@ type PodsClearedMsg struct{}
 type View int
 
 const (
+	// Order matches the number keys, which walk the object graph:
+	// the pod, the deployment managing it, the service fronting it,
+	// the ingress exposing it — then the cluster furniture you browse
+	// rather than watch. Events are deliberately absent: they are a
+	// lens over a resource, not a resource, and live on `e`.
 	ViewPods View = iota
 	ViewDeployments
-	ViewNodes
-	ViewEvents
-	ViewNamespaces
 	ViewServices
 	ViewIngresses
+	ViewNodes
+	ViewNamespaces
 	ViewOverview // fleet overview, full-screen cards
 )
 
@@ -229,6 +233,7 @@ type Model struct {
 	drainConfirm        drainConfirmState
 	drainProgress       drainProgressState
 	logs                logsState
+	eventsLens          eventsLensState
 	exec                execState
 	dashboard           dashboardState
 	permissions         map[string]permState // cached SSAR results, keyed via cluster.PermissionKey
@@ -237,15 +242,6 @@ type Model struct {
 	overviewScroll      int
 	toast               string // ephemeral one-line status (e.g. "Deleted Pod/foo")
 	toastUntil          time.Time
-
-	// eventScope, when non-nil, restricts ViewEvents to events whose
-	// involvedObject matches the given Kind/Namespace/Name. Set by the
-	// action menu's "Events" item so the user can drill from a single
-	// pod / deployment / node into its events. Cleared on Esc inside
-	// ViewEvents and on every switch *away* from ViewEvents — the
-	// scope shouldn't survive into the next visit, otherwise it gets
-	// confusing fast.
-	eventScope *eventScopeRef
 
 	quitMsg string
 }
@@ -316,6 +312,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.describe.open {
 			return m.handleDescribeKey(msg)
+		}
+		if m.eventsLens.open {
+			return m.handleEventsKey(msg)
 		}
 		if m.actionMenu.open {
 			return m.handleActionMenuKey(msg)
@@ -712,11 +711,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncStartedAt = time.Now()
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
 		// A scoped object on the previous cluster doesn't exist on the
-		// new one — clear so the next render isn't filtered down to
-		// zero matches with no obvious way to recover. The dashboard's
-		// target is the same story, and it owns a log stream that has
-		// to stop with it.
-		m.eventScope = nil
+		// new one — close the lens rather than leave it filtered down
+		// to zero matches with no obvious way to recover. The
+		// dashboard's target is the same story, and it owns a log
+		// stream that has to stop with it.
+		m.eventsLens = eventsLensState{}
 		if m.dashboard.open {
 			m.dashboard = dashboardState{}
 			m.stopDashboardLogs()
@@ -779,7 +778,6 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "f1":
 		m.view = ViewOverview
 		m.cursor = ""
-		m.eventScope = nil
 	case "f2":
 		m.debugMode = !m.debugMode
 	case "?":
@@ -808,60 +806,24 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		return m.openActionMenu()
 	case "1":
-		// Pressing the current view's key while already in that view
-		// used to reset the cursor unconditionally. Skip the reset
-		// when there's no actual view change so the cursor stays put.
-		if m.view != ViewPods {
-			m.view = ViewPods
-			m.cursor = ""
-			m.eventScope = nil
-			m.anchorCursorToVisible()
-		}
+		return m.switchView(ViewPods)
 	case "2":
-		if m.view != ViewDeployments {
-			m.view = ViewDeployments
-			m.cursor = ""
-			m.eventScope = nil
-			m.anchorCursorToVisible()
-		}
+		return m.switchView(ViewDeployments)
 	case "3":
-		if m.view != ViewNodes {
-			m.view = ViewNodes
-			m.cursor = ""
-			m.eventScope = nil
-			m.anchorCursorToVisible()
-		}
+		return m.switchView(ViewServices)
 	case "4":
-		// Pressing 4 is "show me events" (unscoped). If the user got
-		// here via the action menu's Events item the scope is set;
-		// pressing 4 again is the way to clear it without leaving
-		// the events view.
-		if m.view != ViewEvents {
-			m.view = ViewEvents
-			m.cursor = ""
-		}
-		m.eventScope = nil
+		return m.switchView(ViewIngresses)
 	case "5":
-		if m.view != ViewNamespaces {
-			m.view = ViewNamespaces
-			m.cursor = ""
-			m.eventScope = nil
-			m.anchorCursorToVisible()
-		}
+		return m.switchView(ViewNodes)
 	case "6":
-		if m.view != ViewServices {
-			m.view = ViewServices
-			m.cursor = ""
-			m.eventScope = nil
-			m.anchorCursorToVisible()
-		}
-	case "7":
-		if m.view != ViewIngresses {
-			m.view = ViewIngresses
-			m.cursor = ""
-			m.eventScope = nil
-			m.anchorCursorToVisible()
-		}
+		return m.switchView(ViewNamespaces)
+	case "e":
+		// Events for the highlighted row. Scope is snapshotted on
+		// press rather than tracking the cursor, so the list doesn't
+		// churn underneath you while you read it.
+		return m.openEventsForCursor()
+	case "E":
+		return m.openEventsAll()
 	case "/":
 		m.filterFocused = true
 	case "n":
@@ -900,13 +862,25 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.filterText = ""
 		m.namespace = ""
-		m.eventScope = nil
 		m.anchorCursorToVisible()
 	}
 	return m, nil
 }
 
 // handleNsPickerKey routes input while the namespace picker is open.
+// switchView moves to v, leaving the cursor alone when it's already
+// the active view — pressing a view's own key used to reset the cursor
+// for nothing.
+func (m Model) switchView(v View) (tea.Model, tea.Cmd) {
+	if m.view == v {
+		return m, nil
+	}
+	m.view = v
+	m.cursor = ""
+	m.anchorCursorToVisible()
+	return m, nil
+}
+
 func (m Model) handleNsPickerKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "esc", "q":
@@ -1217,14 +1191,7 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 	case ActEvents:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
-		m.eventScope = &eventScopeRef{
-			Kind:      ref.Kind,
-			Namespace: ref.Namespace,
-			Name:      ref.Name,
-		}
-		m.view = ViewEvents
-		m.cursor = ""
-		return m, nil
+		return m.openEventsFor(ref)
 	case ActScale:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1579,6 +1546,8 @@ func (m Model) View() string {
 		body = m.renderDrainConfirm(m.width, bodyHeight)
 	case m.describe.open:
 		body = m.renderDescribe(m.width, bodyHeight)
+	case m.eventsLens.open:
+		body = m.renderEventsLens(m.width, bodyHeight)
 	case m.actionMenu.open:
 		// Floating overlay: keep the underlying table visible around
 		// the menu so the user can still see the row they came from.
@@ -1624,8 +1593,6 @@ func (m Model) mainPane(height, width int) string {
 		return m.renderNodeTable(height, width)
 	case ViewDeployments:
 		return m.renderDeployTable(height, width)
-	case ViewEvents:
-		return m.renderEventsView(height, width)
 	case ViewNamespaces:
 		return m.renderNamespacesView(height, width)
 	case ViewServices:
@@ -1664,18 +1631,6 @@ func (m Model) visibleUIDs() []types.UID {
 				continue
 			}
 			out = append(out, r.UID)
-		}
-		return out
-	case ViewEvents:
-		out := make([]types.UID, 0, len(m.events))
-		for uid, r := range m.events {
-			if needle != "" &&
-				!strings.Contains(strings.ToLower(r.Reason), needle) &&
-				!strings.Contains(strings.ToLower(r.Message), needle) &&
-				!strings.Contains(strings.ToLower(r.InvolvedName), needle) {
-				continue
-			}
-			out = append(out, uid)
 		}
 		return out
 	case ViewNamespaces:
@@ -1798,9 +1753,6 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 	case ViewDeployments:
 		viewLabel = "deployments"
 		total = len(m.deployments)
-	case ViewEvents:
-		viewLabel = "events"
-		total = len(m.events)
 	case ViewNamespaces:
 		viewLabel = m.namespacesNoun()
 		total = len(m.namespaces)
@@ -1929,7 +1881,7 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 }
 
 func (m Model) renderFooter() string {
-	hint := " ?:help  F1:overview  1:pods  2:deploy  3:nodes  4:events  5:ns  6:svc  7:ing  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
+	hint := " ?:help  F1:overview  1:pods  2:deploy  3:svc  4:ing  5:nodes  6:ns  e:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
 	if len(m.Contexts) <= 1 {
 		// Nothing to Tab to, and the rail that would have hinted at
 		// other clusters isn't drawn either.
@@ -1955,7 +1907,7 @@ func (m Model) renderFooter() string {
 	// to log streams or describe output, and a stale "/ <text>" line
 	// at the bottom of the screen while the user is reading logs is
 	// just noise.
-	overlayOpen := m.logs.open || m.describe.open || m.deleteConfirm.open ||
+	overlayOpen := m.logs.open || m.describe.open || m.eventsLens.open || m.deleteConfirm.open ||
 		m.scaleConfirm.open || m.restartConfirm.open || m.actionMenu.open ||
 		m.helpOpen || m.nsPickerOpen || m.rbacOpen || m.dashboard.open
 	if !overlayOpen && (m.filterFocused || m.filterText != "") {
@@ -1980,8 +1932,6 @@ func (m Model) filterCounts() (matched, total int) {
 		total = len(m.nodes)
 	case ViewDeployments:
 		total = len(m.deployments)
-	case ViewEvents:
-		total = len(m.events)
 	case ViewNamespaces:
 		total = len(m.namespaces)
 	case ViewServices:

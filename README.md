@@ -137,7 +137,9 @@ kubetin -trust
 | Cluster | `Tab` / `Shift-Tab` | next / previous reachable cluster |
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
-| | `1` – `7` | pods / deployments / nodes / events / namespaces / services / ingresses |
+| | `1` – `6` | pods / deployments / services / ingresses / nodes / namespaces |
+| Events | `e` | events for the selected resource |
+| | `E` | events for the namespace (or cluster, with `ns: all`) |
 | Filter | `/` | filter by name / namespace |
 | | `n` | namespace picker |
 | | `0` | all namespaces |
