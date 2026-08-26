@@ -46,6 +46,36 @@ const (
 	ContainerTerminated
 )
 
+// ContainerInfo is the per-container projection the status dashboard
+// renders. ContainerReady / ContainerStates are derived from this same
+// slice in emit, so the table's dot colours and the dashboard's
+// container rows can never disagree about a container's state.
+type ContainerInfo struct {
+	Name     string
+	Image    string
+	Ready    bool
+	State    ContainerState
+	Restarts int32
+	// Reason is kubelet's waiting/terminated reason
+	// ("CrashLoopBackOff", "OOMKilled", "Completed"); empty while the
+	// container is running normally.
+	Reason string
+	// ExitCode is only meaningful when the container terminated.
+	ExitCode int32
+}
+
+// PodCondition projects one entry of pod.Status.Conditions. Reason and
+// Message carry the scheduler's explanation for a False condition
+// ("Unschedulable" / "0/5 nodes are available…") — the single most
+// useful text when a pod is stuck Pending, and not derivable from
+// Phase alone.
+type PodCondition struct {
+	Type    string
+	Status  string
+	Reason  string
+	Message string
+}
+
 func (k PodEventKind) String() string {
 	switch k {
 	case PodAdded:
@@ -86,6 +116,26 @@ type PodEvent struct {
 	// aggregate cares only about ready/not-ready and we don't want
 	// every consumer to re-project from a richer enum.
 	ContainerStates []ContainerState
+
+	// Rich per-container detail for the status dashboard. Same
+	// ordering and length as ContainerReady / ContainerStates (both
+	// are derived from this), so it is likewise shorter than
+	// Containers until kubelet reports every status.
+	ContainerInfo     []ContainerInfo
+	InitContainerInfo []ContainerInfo
+
+	PodIP          string
+	HostIP         string
+	QOSClass       string
+	ServiceAccount string
+	StartedAt      time.Time // pod.Status.StartTime; zero before scheduling
+
+	// Labels back the Deployment dashboard's owned-pod lookup, which
+	// matches on the deployment's selector rather than the name-prefix
+	// heuristic.
+	Labels map[string]string
+
+	Conditions []PodCondition
 }
 
 // PodWatcher runs a SharedInformerFactory for v1.Pods against one
@@ -176,31 +226,106 @@ func (w *PodWatcher) emit(kind PodEventKind, obj any) {
 	// readiness/state for entries we actually have. The slice may be
 	// shorter than Containers; consumers treat missing entries as
 	// "not yet known".
-	ready := make([]bool, 0, len(pod.Status.ContainerStatuses))
-	states := make([]ContainerState, 0, len(pod.Status.ContainerStatuses))
-	for _, cs := range pod.Status.ContainerStatuses {
-		ready = append(ready, cs.Ready)
-		states = append(states, projectContainerState(cs))
+	info := projectContainerInfo(pod.Status.ContainerStatuses)
+	ready := make([]bool, 0, len(info))
+	states := make([]ContainerState, 0, len(info))
+	for _, ci := range info {
+		ready = append(ready, ci.Ready)
+		states = append(states, ci.State)
+	}
+	var started time.Time
+	if pod.Status.StartTime != nil {
+		started = pod.Status.StartTime.Time
 	}
 	ev := PodEvent{
-		Kind:            kind,
-		Context:         w.Context,
-		Namespace:       pod.Namespace,
-		Name:            pod.Name,
-		UID:             pod.UID,
-		Phase:           pod.Status.Phase,
-		NodeName:        pod.Spec.NodeName,
-		Restarts:        totalRestarts(pod),
-		CreatedAt:       pod.CreationTimestamp.Time,
-		Containers:      containers,
-		ContainerReady:  ready,
-		ContainerStates: states,
+		Kind:              kind,
+		Context:           w.Context,
+		Namespace:         pod.Namespace,
+		Name:              pod.Name,
+		UID:               pod.UID,
+		Phase:             pod.Status.Phase,
+		NodeName:          pod.Spec.NodeName,
+		Restarts:          totalRestarts(pod),
+		CreatedAt:         pod.CreationTimestamp.Time,
+		Containers:        containers,
+		ContainerReady:    ready,
+		ContainerStates:   states,
+		ContainerInfo:     info,
+		InitContainerInfo: projectContainerInfo(pod.Status.InitContainerStatuses),
+		PodIP:             pod.Status.PodIP,
+		HostIP:            pod.Status.HostIP,
+		QOSClass:          string(pod.Status.QOSClass),
+		ServiceAccount:    pod.Spec.ServiceAccountName,
+		StartedAt:         started,
+		Labels:            copyLabels(pod.Labels),
+		Conditions:        projectPodConditions(pod.Status.Conditions),
 	}
 	select {
 	case w.Out <- ev:
 	default:
 		w.DroppedEvents.Add(1)
 	}
+}
+
+// projectContainerInfo builds the rich per-container projection from
+// a status slice. Used for both regular and init containers.
+func projectContainerInfo(statuses []corev1.ContainerStatus) []ContainerInfo {
+	if len(statuses) == 0 {
+		return nil
+	}
+	out := make([]ContainerInfo, 0, len(statuses))
+	for _, cs := range statuses {
+		ci := ContainerInfo{
+			Name:     cs.Name,
+			Image:    cs.Image,
+			Ready:    cs.Ready,
+			State:    projectContainerState(cs),
+			Restarts: cs.RestartCount,
+		}
+		switch {
+		case cs.State.Waiting != nil:
+			ci.Reason = cs.State.Waiting.Reason
+		case cs.State.Terminated != nil:
+			ci.Reason = cs.State.Terminated.Reason
+			ci.ExitCode = cs.State.Terminated.ExitCode
+		}
+		out = append(out, ci)
+	}
+	return out
+}
+
+// projectPodConditions keeps the conditions verbatim. We don't filter
+// to a known set here — an unrecognised condition type (custom
+// readiness gates) is still worth showing in the dashboard.
+func projectPodConditions(conds []corev1.PodCondition) []PodCondition {
+	if len(conds) == 0 {
+		return nil
+	}
+	out := make([]PodCondition, 0, len(conds))
+	for _, c := range conds {
+		out = append(out, PodCondition{
+			Type:    string(c.Type),
+			Status:  string(c.Status),
+			Reason:  c.Reason,
+			Message: c.Message,
+		})
+	}
+	return out
+}
+
+// copyLabels detaches the label map from the informer's cached object.
+// Objects in the store must not be mutated and are replaced wholesale
+// on update, so aliasing would be safe today — but the whole point of
+// these event structs is that they don't hold informer memory.
+func copyLabels(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // projectContainerState collapses the apiserver's State (oneof
