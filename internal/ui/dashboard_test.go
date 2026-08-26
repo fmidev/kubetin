@@ -3,6 +3,7 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -264,10 +265,10 @@ func TestDashLogScrollSurvivesViewerRoundTrip(t *testing.T) {
 // Tab cycles panes and wraps in both directions.
 func TestDashTabCyclesPanes(t *testing.T) {
 	m := dashModel(160, 40, nil)
-	m.dashboard.focus = dashPaneContainers
+	m.dashboard.focus = dashPaneMain
 	var mm tea.Model = m
 
-	want := []dashboardPane{dashPaneEvents, dashPaneLogs, dashPaneContainers}
+	want := []dashboardPane{dashPaneEvents, dashPaneLogs, dashPaneMain}
 	for i, w := range want {
 		mm, _ = mm.(Model).handleDashboardKey(key("tab"))
 		if got := mm.(Model).dashboard.focus; got != w {
@@ -494,4 +495,226 @@ func sgrBefore(render, needle string) (string, bool) {
 		return strings.Join(open, ""), true
 	}
 	return "", false
+}
+
+func dashDeployModel(w, h int, extra func(*Model)) Model {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.width, m.height = w, h
+	m.view = ViewDeployments
+	dashDeploySetup(extra)(&m)
+	return m
+}
+
+// Owned pods come from the label selector, not the name prefix: a
+// "payments-api-worker" deployment's pods share the "payments-api-"
+// prefix but not the selector, and must not appear in the list.
+func TestDeployOwnedPodsUseSelector(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	d := m.deployments["dep-uid"]
+
+	got := m.deployOwnedPods(d)
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3; got %v", len(got), podNames(got))
+	}
+	for _, p := range got {
+		if p.Name == "payments-api-worker-1234-zzzzz" {
+			t.Errorf("prefix-sharing pod from another deployment leaked in: %v", podNames(got))
+		}
+	}
+	// Stable ordering so the cursor doesn't jump between renders.
+	if !sortedByName(got) {
+		t.Errorf("owned pods not sorted by name: %v", podNames(got))
+	}
+}
+
+// With no selector projected we fall back to the prefix heuristic
+// rather than showing an empty pane. The fallback is deliberately
+// imprecise — "payments-api-worker-…" shares the "payments-api-"
+// prefix and does get pulled in — which is exactly why the selector
+// path above is preferred whenever a selector exists. This test pins
+// that trade-off so the fallback isn't mistaken for an exact match.
+func TestDeployOwnedPodsPrefixFallback(t *testing.T) {
+	m := dashDeployModel(200, 50, func(m *Model) {
+		d := m.deployments["dep-uid"]
+		d.Selector = nil
+		m.deployments["dep-uid"] = d
+	})
+	got := podNames(m.deployOwnedPods(m.deployments["dep-uid"]))
+
+	// Every real replica is found: the pane is never empty when pods exist.
+	for _, want := range []string{
+		"payments-api-7f9c8-aaaaa",
+		"payments-api-7f9c8-bbbbb",
+		"payments-api-7f9c8-x2k4l",
+	} {
+		if !contains(got, want) {
+			t.Errorf("fallback missed replica %q; got %v", want, got)
+		}
+	}
+	// And the known over-match is present, unlike the selector path.
+	if !contains(got, "payments-api-worker-1234-zzzzz") {
+		t.Log("prefix fallback no longer over-matches; if that was deliberate, " +
+			"update this test and the deployOwnedPods comment together")
+	}
+}
+
+func contains(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
+// The events pane must aggregate the deployment, its ReplicaSets and
+// its pods — the pod-level failures are the ones that explain a stuck
+// rollout — while excluding anything from a neighbouring workload.
+func TestDashDeployEventsAggregates(t *testing.T) {
+	m := dashDeployModel(200, 50, func(m *Model) {
+		m.events["foreign-evt"] = eventRow{
+			UID: "foreign-evt", Namespace: "default", Type: "Warning", Reason: "BackOff",
+			InvolvedKind: "Pod", InvolvedName: "payments-api-worker-1234-zzzzz",
+			InvolvedNs: "default",
+		}
+	})
+	d := m.deployments["dep-uid"]
+	got := m.dashDeployEvents(d, m.deployOwnedPods(d))
+
+	kinds := map[string]int{}
+	for _, e := range got {
+		kinds[e.InvolvedKind]++
+		if e.InvolvedName == "payments-api-worker-1234-zzzzz" {
+			t.Error("event from a neighbouring deployment's pod leaked in")
+		}
+	}
+	for _, k := range []string{"Deployment", "ReplicaSet", "Pod"} {
+		if kinds[k] == 0 {
+			t.Errorf("no %s events in the aggregate (got %v)", k, kinds)
+		}
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1].LastSeen.Before(got[i].LastSeen) {
+			t.Fatalf("aggregate not sorted newest-first at index %d", i)
+		}
+	}
+}
+
+// j/k in the PODS pane moves a selection, and i drills into it so Esc
+// comes back to the deployment.
+func TestDeployPodCursorAndDrillIn(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	m.dashboard.focus = dashPaneMain
+	sub, _ := m.dashSubjectNow()
+	n := len(sub.Pods)
+
+	var mm tea.Model = m
+	for i := 0; i < n+5; i++ {
+		mm, _ = mm.(Model).handleDashboardKey(key("j"))
+	}
+	if got := mm.(Model).dashboard.podCursor; got != n-1 {
+		t.Errorf("cursor = %d, want %d (clamped to the last replica)", got, n-1)
+	}
+
+	mm, _ = mm.(Model).handleDashboardKey(key("i"))
+	got := mm.(Model).dashboard
+	if len(got.stack) != 2 {
+		t.Fatalf("stack depth = %d, want 2 after drilling in", len(got.stack))
+	}
+	top, _ := got.target()
+	if top.Ref.Kind != "Pod" || top.Ref.Name != sub.Pods[n-1].Name {
+		t.Errorf("drilled into %+v, want pod %q", top.Ref, sub.Pods[n-1].Name)
+	}
+
+	back, _ := mm.(Model).handleDashboardKey(key("esc"))
+	if d := back.(Model).dashboard; len(d.stack) != 1 || !d.open {
+		t.Errorf("esc should pop back to the deployment, got depth %d open=%v",
+			len(d.stack), d.open)
+	}
+}
+
+// The log pane streams the newest Running replica; a deployment whose
+// replicas are all broken still streams something rather than nothing.
+func TestNewestRunningPod(t *testing.T) {
+	base := time.Now()
+	pods := []podRow{
+		{Name: "old-running", Phase: "Running", CreatedAt: base.Add(-2 * time.Hour)},
+		{Name: "new-running", Phase: "Running", CreatedAt: base.Add(-1 * time.Hour)},
+		{Name: "newest-pending", Phase: "Pending", CreatedAt: base},
+	}
+	got, ok := newestRunningPod(pods)
+	if !ok || got.Name != "new-running" {
+		t.Errorf("got %q (ok=%v), want new-running", got.Name, ok)
+	}
+
+	allBroken := []podRow{
+		{Name: "old-pending", Phase: "Pending", CreatedAt: base.Add(-time.Hour)},
+		{Name: "new-pending", Phase: "Pending", CreatedAt: base},
+	}
+	got, ok = newestRunningPod(allBroken)
+	if !ok || got.Name != "new-pending" {
+		t.Errorf("all-broken fallback: got %q (ok=%v), want new-pending", got.Name, ok)
+	}
+
+	if _, ok := newestRunningPod(nil); ok {
+		t.Error("empty list should report no pod")
+	}
+}
+
+// Progressing=True is both the healthy steady state and the mid-
+// rollout state, so only False counts as blocking.
+func TestDeployBlockingCondition(t *testing.T) {
+	healthy := deploymentRow{Conditions: []cluster.DeployCondition{
+		{Type: "Available", Status: "True"},
+		{Type: "Progressing", Status: "True", Reason: "NewReplicaSetAvailable"},
+	}}
+	if c, ok := deployBlockingCondition(healthy); ok {
+		t.Errorf("healthy deployment reported blocking condition %+v", c)
+	}
+
+	stalled := deploymentRow{Conditions: []cluster.DeployCondition{
+		{Type: "Available", Status: "True"},
+		{Type: "Progressing", Status: "False", Reason: "ProgressDeadlineExceeded"},
+	}}
+	c, ok := deployBlockingCondition(stalled)
+	if !ok || c.Reason != "ProgressDeadlineExceeded" {
+		t.Errorf("got %+v (ok=%v), want the stalled Progressing condition", c, ok)
+	}
+
+	down := deploymentRow{Conditions: []cluster.DeployCondition{
+		{Type: "Available", Status: "False", Reason: "MinimumReplicasUnavailable"},
+	}}
+	if c, ok := deployBlockingCondition(down); !ok || c.Reason != "MinimumReplicasUnavailable" {
+		t.Errorf("got %+v (ok=%v), want MinimumReplicasUnavailable", c, ok)
+	}
+}
+
+func TestFormatSelectorIsStable(t *testing.T) {
+	sel := map[string]string{"tier": "backend", "app": "payments", "env": "prod"}
+	want := "app=payments,env=prod,tier=backend"
+	for i := 0; i < 10; i++ {
+		if got := formatSelector(sel); got != want {
+			t.Fatalf("formatSelector = %q, want %q (map order must not leak)", got, want)
+		}
+	}
+	if got := formatSelector(nil); got != "" {
+		t.Errorf("formatSelector(nil) = %q, want empty", got)
+	}
+}
+
+func podNames(pods []podRow) []string {
+	out := make([]string, 0, len(pods))
+	for _, p := range pods {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+func sortedByName(pods []podRow) bool {
+	for i := 1; i < len(pods); i++ {
+		if pods[i-1].Name > pods[i].Name {
+			return false
+		}
+	}
+	return true
 }

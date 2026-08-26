@@ -78,7 +78,7 @@ var helpGroups = []helpGroup{
 	{
 		Title: "Inspect",
 		Bindings: [][2]string{
-			{"i", "status dashboard for the selected pod"},
+			{"i", "status dashboard for the selected pod / deployment"},
 			{"Enter", "action menu (Dashboard / Describe / Logs / Exec / Events / Cordon / Drain / Delete)"},
 			{"d", "describe selected resource"},
 			{"Shift-Y", "(inside Secret describe) reveal data"},
@@ -91,6 +91,7 @@ var helpGroups = []helpGroup{
 			{"j / k", "scroll focused pane"},
 			{"g / G", "top / bottom of pane"},
 			{"f", "toggle log follow (scrolling pauses it)"},
+			{"i", "(Deployment) open the selected pod's dashboard"},
 			{"c", "next container (logs)"},
 			{"l", "open logs full-screen"},
 			{"d", "describe this resource"},

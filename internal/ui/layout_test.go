@@ -227,6 +227,34 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.actionMenu.options = []actionItem{{Action: ActDashboard, Status: actionAllowed}}
 		})},
 
+		{"dash-deploy/wide", 200, 50, ViewDeployments, dashDeploySetup(nil)},
+		{"dash-deploy/min-wide", 120, 20, ViewDeployments, dashDeploySetup(nil)},
+		{"dash-deploy/narrow", 80, 24, ViewDeployments, dashDeploySetup(nil)},
+		{"dash-deploy/tiny", 40, 12, ViewDeployments, dashDeploySetup(nil)},
+		{"dash-deploy/no-pods", 200, 50, ViewDeployments, dashDeploySetup(func(m *Model) {
+			m.pods = map[types.UID]podRow{}
+		})},
+		{"dash-deploy/stalled-rollout", 200, 50, ViewDeployments, dashDeploySetup(func(m *Model) {
+			d := m.deployments["dep-uid"]
+			d.Ready, d.Available, d.Unavailable = 0, 0, 3
+			d.Conditions = []cluster.DeployCondition{{
+				Type: "Progressing", Status: "False", Reason: "ProgressDeadlineExceeded",
+				Message: "ReplicaSet \"payments-api-7f9c8\" has timed out progressing.",
+			}}
+			m.deployments["dep-uid"] = d
+		})},
+		{"dash-deploy/cursor-at-end", 200, 50, ViewDeployments, dashDeploySetup(func(m *Model) {
+			m.dashboard.focus = dashPaneMain
+			m.dashboard.podCursor = 2
+		})},
+		{"dash-deploy/drilled-into-pod", 200, 50, ViewDeployments, dashDeploySetup(func(m *Model) {
+			m.dashboard.stack = append(m.dashboard.stack, dashboardTarget{
+				Ref: cluster.DescribeRef{Version: "v1", Resource: "pods", Kind: "Pod",
+					Namespace: "default", Name: "dash-pod"},
+				UID: "dash-uid",
+			})
+		})},
+
 		{"restart-confirm", 120, 40, ViewDeployments, func(m *Model) {
 			m.restartConfirm.open = true
 			m.restartConfirm.ref.Name = "my-deploy"
@@ -355,6 +383,83 @@ func dashSetup(extra func(*Model)) func(*Model) {
 			UID: "dash-uid",
 		}}
 		m.dashboard.containers = []string{"api", "envoy"}
+		if extra != nil {
+			extra(m)
+		}
+	}
+}
+
+// dashDeploySetup seeds a deployment dashboard: three replicas sharing
+// the deployment's selector, one of which is the CrashLoopBackOff pod
+// from dashSetup, plus deployment- and replicaset-level events.
+func dashDeploySetup(extra func(*Model)) func(*Model) {
+	return func(m *Model) {
+		dashSetup(nil)(m)
+
+		sel := map[string]string{"app": "payments"}
+		now := time.Now()
+
+		// The pod dashSetup created is one of this deployment's replicas.
+		p := m.pods["dash-uid"]
+		p.Name = "payments-api-7f9c8-x2k4l"
+		p.Labels = sel
+		m.pods["dash-uid"] = p
+		for i, name := range []string{"payments-api-7f9c8-aaaaa", "payments-api-7f9c8-bbbbb"} {
+			uid := types.UID("rep-" + name)
+			m.pods[uid] = podRow{
+				UID: uid, Namespace: "default", Name: name, Phase: "Running",
+				Labels: sel, Containers: []string{"api", "envoy"},
+				CreatedAt: now.Add(-time.Duration(i+1) * time.Hour),
+				ContainerInfo: []cluster.ContainerInfo{
+					{Name: "api", Ready: true, State: cluster.ContainerReady, Image: "ghcr.io/x/api:1.2"},
+					{Name: "envoy", Ready: true, State: cluster.ContainerReady, Image: "envoy:v1.29"},
+				},
+			}
+		}
+
+		// A neighbouring deployment whose name shares the prefix — the
+		// selector match must not pull its pods in.
+		m.pods["foreign"] = podRow{
+			UID: "foreign", Namespace: "default", Name: "payments-api-worker-1234-zzzzz",
+			Phase: "Running", Labels: map[string]string{"app": "payments-worker"},
+		}
+
+		m.deployments["dep-uid"] = deploymentRow{
+			UID: "dep-uid", Namespace: "default", Name: "payments-api",
+			Replicas: 3, Ready: 2, UpToDate: 3, Available: 2, Unavailable: 1,
+			CreatedAt:    now.Add(-12 * 24 * time.Hour),
+			StrategyType: "RollingUpdate", MaxSurge: "25%", MaxUnavailable: "25%",
+			Selector:   sel,
+			Conditions: []cluster.DeployCondition{{Type: "Available", Status: "True"}},
+		}
+		m.events["dep-evt"] = eventRow{
+			UID: "dep-evt", Namespace: "default", Type: "Normal", Reason: "ScalingReplicaSet",
+			Message: "Scaled up replica set payments-api-7f9c8 to 3", Count: 1,
+			LastSeen:     now.Add(-9 * time.Minute),
+			InvolvedKind: "Deployment", InvolvedName: "payments-api", InvolvedNs: "default",
+		}
+		m.events["rs-evt"] = eventRow{
+			UID: "rs-evt", Namespace: "default", Type: "Normal", Reason: "SuccessfulCreate",
+			Message: "Created pod: payments-api-7f9c8-x2k4l", Count: 1,
+			LastSeen:     now.Add(-8 * time.Minute),
+			InvolvedKind: "ReplicaSet", InvolvedName: "payments-api-7f9c8", InvolvedNs: "default",
+		}
+		// The pod events dashSetup created point at "dash-pod"; repoint
+		// them at the renamed replica so they belong to this deployment.
+		for uid, e := range m.events {
+			if e.InvolvedKind == "Pod" && e.InvolvedName == "dash-pod" {
+				e.InvolvedName = "payments-api-7f9c8-x2k4l"
+				m.events[uid] = e
+			}
+		}
+
+		m.cursor = "dep-uid"
+		m.dashboard.stack = []dashboardTarget{{
+			Ref: cluster.DescribeRef{Group: "apps", Version: "v1", Resource: "deployments",
+				Kind: "Deployment", Namespace: "default", Name: "payments-api"},
+			UID: "dep-uid",
+		}}
+		m.dashboard.podCursor = 0
 		if extra != nil {
 			extra(m)
 		}

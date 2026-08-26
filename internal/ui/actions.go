@@ -73,7 +73,7 @@ func actionsFor(kind string) []Action {
 	case "Pod":
 		return []Action{ActDashboard, ActDescribe, ActLogs, ActExec, ActEvents, ActDelete}
 	case "Deployment":
-		return []Action{ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
+		return []Action{ActDashboard, ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
 	case "Node":
 		return []Action{ActDescribe, ActEvents, ActCordon, ActUncordon, ActDrain}
 	case "Namespace", "Project":
