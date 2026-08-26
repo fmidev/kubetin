@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.7.0](https://github.com/fmidev/kubetin/compare/v1.6.0...v1.7.0) (2026-08-26)
+
+
+### Features
+
+* hide the cluster rail when it earns nothing ([#47](https://github.com/fmidev/kubetin/issues/47)) ([555bb72](https://github.com/fmidev/kubetin/commit/555bb72aedacf051b79e0abdee54101442c8b32a))
+* services and ingresses views ([#49](https://github.com/fmidev/kubetin/issues/49)) ([dd296e8](https://github.com/fmidev/kubetin/commit/dd296e8f5756b53a56673d7213628215a9f1028f))
+
 ## [1.6.0](https://github.com/fmidev/kubetin/compare/v1.5.0...v1.6.0) (2026-08-26)
 
 
