@@ -617,6 +617,36 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 		}
 	}()
 
+	// Services, Ingresses and their EndpointSlices are all namespaced,
+	// so each scopes itself through Supervisor.ResolveScope inside
+	// Run() — same as the pod and deployment watchers.
+	svcw := cluster.NewServiceWatcher(target, 256)
+	go forwardSvcEvents(child, svcw, c.prog)
+	go func() {
+		if err := svcw.Run(child, c.sup); err != nil {
+			klog.Errorf("service watcher (%s) exited: %v", target, err)
+		}
+	}()
+
+	ingw := cluster.NewIngressWatcher(target, 256)
+	go forwardIngEvents(child, ingw, c.prog)
+	go func() {
+		if err := ingw.Run(child, c.sup); err != nil {
+			klog.Errorf("ingress watcher (%s) exited: %v", target, err)
+		}
+	}()
+
+	// Feeds only the Services table's READY column. A failure here
+	// leaves that column showing "—"; every other cell still comes off
+	// the Service itself.
+	esw := cluster.NewEndpointSliceWatcher(target, 512)
+	go forwardEndpointSliceEvents(child, esw, c.prog)
+	go func() {
+		if err := esw.Run(child, c.sup); err != nil {
+			klog.Errorf("endpointslice watcher (%s) exited: %v", target, err)
+		}
+	}()
+
 	mp := cluster.NewFocusedMetricsPoller(target, 4)
 	go forwardMetrics(child, mp, c.prog)
 	go func() {
@@ -636,6 +666,39 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 			klog.Errorf("network poller (%s) exited: %v", target, err)
 		}
 	}()
+}
+
+func forwardSvcEvents(ctx context.Context, w *cluster.ServiceWatcher, p *tea.Program) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-w.Out:
+			p.Send(ui.SvcEventMsg(ev))
+		}
+	}
+}
+
+func forwardIngEvents(ctx context.Context, w *cluster.IngressWatcher, p *tea.Program) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-w.Out:
+			p.Send(ui.IngEventMsg(ev))
+		}
+	}
+}
+
+func forwardEndpointSliceEvents(ctx context.Context, w *cluster.EndpointSliceWatcher, p *tea.Program) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-w.Out:
+			p.Send(ui.EndpointSliceEventMsg(ev))
+		}
+	}
 }
 
 func forwardPodEvents(ctx context.Context, w *cluster.PodWatcher, p *tea.Program) {

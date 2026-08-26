@@ -76,6 +76,10 @@ func actionsFor(kind string) []Action {
 		return []Action{ActDashboard, ActDescribe, ActScale, ActRestart, ActLogs, ActEvents, ActDelete}
 	case "Node":
 		return []Action{ActDescribe, ActEvents, ActCordon, ActUncordon, ActDrain}
+	case "Service", "Ingress":
+		// No scale/restart analogue exists for these; Describe and
+		// Events are the read paths, Delete the only mutation.
+		return []Action{ActDescribe, ActEvents, ActDelete}
 	case "Namespace", "Project":
 		// Set-as-active first because that's the by-far most-frequent
 		// action on a namespace / project row — the user already has
@@ -175,6 +179,8 @@ func rbacProbeSet() []rbacProbe {
 		{"Nodes", "Cordon / Uncordon", "patch", "", "nodes"},
 		{"Nodes", "Drain (evict pods)", "create", "", "pods/eviction"},
 		{"Nodes", "Delete", "delete", "", "nodes"},
+		{"Services", "Delete", "delete", "", "services"},
+		{"Ingresses", "Delete", "delete", "networking.k8s.io", "ingresses"},
 		{"Namespaces", "Delete", "delete", "", "namespaces"},
 	}
 }

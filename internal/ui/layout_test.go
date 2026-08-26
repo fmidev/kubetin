@@ -276,6 +276,39 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.HideSidebar = false
 		})},
 
+		{"services/wide", 200, 50, ViewServices, netFixture(nil)},
+		{"services/mid", 120, 40, ViewServices, netFixture(nil)},
+		{"services/narrow", 80, 24, ViewServices, netFixture(nil)},
+		{"services/very-narrow", 60, 20, ViewServices, netFixture(nil)},
+		{"services/tiny", 40, 12, ViewServices, netFixture(nil)},
+		{"services/unsynced-empty", 120, 30, ViewServices, func(m *Model) {}},
+		{"services/synced-empty", 120, 30, ViewServices, func(m *Model) { m.syncedServices = true }},
+		{"services/long-names", 120, 30, ViewServices, netFixture(func(m *Model) {
+			r := m.services["svc-lb"]
+			r.Name = strings.Repeat("s", 90)
+			r.Namespace = strings.Repeat("n", 40)
+			r.ExternalIPs = []string{"2001:0db8:85a3:0000:0000:8a2e:0370:7334", "10.0.0.1", "10.0.0.2"}
+			m.services["svc-lb"] = r
+		})},
+		{"services/filtered", 120, 30, ViewServices, netFixture(func(m *Model) {
+			m.namespace = "staging"
+			m.filterText = "orders"
+		})},
+
+		{"ingresses/wide", 200, 50, ViewIngresses, netFixture(nil)},
+		{"ingresses/mid", 120, 40, ViewIngresses, netFixture(nil)},
+		{"ingresses/narrow", 80, 24, ViewIngresses, netFixture(nil)},
+		{"ingresses/very-narrow", 60, 20, ViewIngresses, netFixture(nil)},
+		{"ingresses/tiny", 40, 12, ViewIngresses, netFixture(nil)},
+		{"ingresses/unsynced-empty", 120, 30, ViewIngresses, func(m *Model) {}},
+		{"ingresses/synced-empty", 120, 30, ViewIngresses, func(m *Model) { m.syncedIngresses = true }},
+		{"ingresses/long-hosts", 120, 30, ViewIngresses, netFixture(func(m *Model) {
+			r := m.ingresses["ing-multi"]
+			r.Hosts = []string{strings.Repeat("h", 120) + ".example.com", "b.example.com"}
+			r.Address = ""
+			m.ingresses["ing-multi"] = r
+		})},
+
 		{"restart-confirm", 120, 40, ViewDeployments, func(m *Model) {
 			m.restartConfirm.open = true
 			m.restartConfirm.ref.Name = "my-deploy"
@@ -493,6 +526,84 @@ func singleContext(extra func(*Model)) func(*Model) {
 	return func(m *Model) {
 		m.Contexts = []string{"alpha"}
 		m.HideSidebar = true
+		if extra != nil {
+			extra(m)
+		}
+	}
+}
+
+// netFixture seeds the Services and Ingresses views with the states
+// worth rendering: a plain ClusterIP, a LoadBalancer with an address, a
+// LoadBalancer still pending one, a Service selecting nothing, and a
+// Service whose endpoints are split across two slices.
+func netFixture(extra func(*Model)) func(*Model) {
+	return func(m *Model) {
+		now := time.Now()
+		m.services["svc-api"] = serviceRow{
+			UID: "svc-api", Namespace: "default", Name: "payments-api",
+			Type: "ClusterIP", ClusterIP: "10.43.12.8",
+			Selector:  map[string]string{"app": "payments"},
+			Ports:     []cluster.ServicePort{{Port: 80, Protocol: "TCP"}},
+			CreatedAt: now.Add(-12 * 24 * time.Hour),
+		}
+		m.services["svc-lb"] = serviceRow{
+			UID: "svc-lb", Namespace: "default", Name: "payments-lb",
+			Type: "LoadBalancer", ClusterIP: "10.43.9.101",
+			ExternalIPs: []string{"34.88.10.4"},
+			Selector:    map[string]string{"app": "payments"},
+			Ports:       []cluster.ServicePort{{Port: 80, NodePort: 30821, Protocol: "TCP"}},
+			CreatedAt:   now.Add(-4 * 24 * time.Hour),
+		}
+		m.services["svc-pending"] = serviceRow{
+			UID: "svc-pending", Namespace: "prod", Name: "web-lb",
+			Type: "LoadBalancer", ClusterIP: "10.43.7.7",
+			Selector:  map[string]string{"app": "web"},
+			Ports:     []cluster.ServicePort{{Port: 443, NodePort: 31000, Protocol: "TCP"}},
+			CreatedAt: now.Add(-9 * time.Minute),
+		}
+		m.services["svc-orphan"] = serviceRow{
+			UID: "svc-orphan", Namespace: "staging", Name: "orders-api",
+			Type: "ClusterIP", ClusterIP: "10.43.44.2",
+			Selector:  map[string]string{"app": "orders"},
+			Ports:     []cluster.ServicePort{{Port: 8080, Protocol: "TCP"}},
+			CreatedAt: now.Add(-3 * time.Hour),
+		}
+		m.services["svc-headless"] = serviceRow{
+			UID: "svc-headless", Namespace: "default", Name: "cassandra",
+			Type: "ClusterIP", ClusterIP: "None",
+			CreatedAt: now.Add(-30 * 24 * time.Hour),
+		}
+		m.syncedServices = true
+
+		// payments-api's endpoints arrive split across two slices, the
+		// shape the controller produces past 100 endpoints or on a
+		// dual-stack cluster.
+		m.endpointSlices["es-api-1"] = endpointSliceRow{Namespace: "default", ServiceName: "payments-api", Ready: 2, Total: 3}
+		m.endpointSlices["es-api-2"] = endpointSliceRow{Namespace: "default", ServiceName: "payments-api", Ready: 1, Total: 1}
+		m.endpointSlices["es-lb"] = endpointSliceRow{Namespace: "default", ServiceName: "payments-lb", Ready: 2, Total: 2}
+		m.endpointSlices["es-orphan"] = endpointSliceRow{Namespace: "staging", ServiceName: "orders-api", Ready: 0, Total: 0}
+		m.endpointSlices["es-web"] = endpointSliceRow{Namespace: "prod", ServiceName: "web-lb", Ready: 3, Total: 3}
+
+		m.ingresses["ing-pay"] = ingressRow{
+			UID: "ing-pay", Namespace: "default", Name: "payments", Class: "nginx",
+			Hosts: []string{"pay.example.com"}, Address: "34.88.10.4", TLSHosts: 1,
+			Backends:  []cluster.IngressBackend{{Service: "payments-api", Port: "80"}},
+			CreatedAt: now.Add(-12 * 24 * time.Hour),
+		}
+		m.ingresses["ing-multi"] = ingressRow{
+			UID: "ing-multi", Namespace: "default", Name: "orders", Class: "nginx",
+			Hosts:   []string{"orders.example.com", "o2.example.com", "o3.example.com"},
+			Address: "34.88.10.4", TLSHosts: 3,
+			Backends:  []cluster.IngressBackend{{Service: "orders-api", Port: "8080"}, {Service: "orders-ui", Port: "80"}},
+			CreatedAt: now.Add(-6 * 24 * time.Hour),
+		}
+		m.ingresses["ing-pending"] = ingressRow{
+			UID: "ing-pending", Namespace: "staging", Name: "internal",
+			Backends:  []cluster.IngressBackend{{Service: "web", Port: "80"}},
+			CreatedAt: now.Add(-3 * time.Hour),
+		}
+		m.syncedIngresses = true
+
 		if extra != nil {
 			extra(m)
 		}
