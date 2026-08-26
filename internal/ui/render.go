@@ -169,11 +169,15 @@ func spliceLine(base, panel string, col int) string {
 		left += strings.Repeat(" ", col-leftCells)
 	}
 	rest := visibleSuffix(base, col+panelW)
-	// Explicit reset between panel and rest so panel's trailing colour
-	// (if any) doesn't bleed into base. `rest` already carries the
-	// accumulated SGR state from before the cut, so the table picks up
-	// where it left off.
-	return left + panel + "\x1b[0m" + rest
+	// Resets on BOTH sides of the panel. The trailing one stops the
+	// panel's colour bleeding into base. The leading one is what makes
+	// the panel actually opaque: `left` carries whatever SGR state was
+	// open at the cut, and without a reset the panel's *unstyled* text
+	// inherits it — a dashboard log line spliced into a dim border
+	// frame renders grey instead of default-foreground. `rest` still
+	// re-emits the accumulated state, so base picks up where it left
+	// off either way.
+	return left + "\x1b[0m" + panel + "\x1b[0m" + rest
 }
 
 // visiblePrefix returns the prefix of s spanning at most n visible

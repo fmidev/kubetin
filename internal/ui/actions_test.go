@@ -30,11 +30,12 @@ func TestClassifiedActions(t *testing.T) {
 	got := m.classifiedActions(ref)
 
 	want := map[Action]actionStatus{
-		ActDescribe: actionAllowed, // ungated
-		ActLogs:     actionAllowed,
-		ActExec:     actionDenied,
-		ActEvents:   actionPending, // not in cache and not in flight → still pending UX-wise
-		ActDelete:   actionPending,
+		ActDashboard: actionAllowed, // ungated: renders from informer cache
+		ActDescribe:  actionAllowed, // ungated
+		ActLogs:      actionAllowed,
+		ActExec:      actionDenied,
+		ActEvents:    actionPending, // not in cache and not in flight → still pending UX-wise
+		ActDelete:    actionPending,
 	}
 
 	if len(got) != len(want) {

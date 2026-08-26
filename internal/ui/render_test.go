@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // padCol must guarantee a consistent visible width regardless of
@@ -130,13 +131,15 @@ func TestOverlayAt(t *testing.T) {
 			t.Errorf("row 0 changed unexpectedly: %q", lines[0])
 		}
 		// Row 1 has panel at col 5: 5 Y's, [ABC], remaining Y's.
-		// `overlayAt` adds a trailing \x1b[0m between panel and rest.
-		wantRow1 := strings.Repeat("Y", 5) + "[ABC]" + "\x1b[0m" + strings.Repeat("Y", 10)
+		// `overlayAt` brackets the panel with resets — the leading one
+		// keeps the panel opaque to any SGR state open at the cut, the
+		// trailing one stops the panel bleeding into the rest.
+		wantRow1 := strings.Repeat("Y", 5) + "\x1b[0m" + "[ABC]" + "\x1b[0m" + strings.Repeat("Y", 10)
 		if lines[1] != wantRow1 {
 			t.Errorf("row 1: got %q, want %q", lines[1], wantRow1)
 		}
 		// Row 2 has panel at col 5: same shape for "[DEF]" + Z's.
-		wantRow2 := strings.Repeat("Z", 5) + "[DEF]" + "\x1b[0m" + strings.Repeat("Z", 10)
+		wantRow2 := strings.Repeat("Z", 5) + "\x1b[0m" + "[DEF]" + "\x1b[0m" + strings.Repeat("Z", 10)
 		if lines[2] != wantRow2 {
 			t.Errorf("row 2: got %q, want %q", lines[2], wantRow2)
 		}
@@ -184,10 +187,68 @@ func TestOverlayAt(t *testing.T) {
 		base := "ABC" // 3 cells
 		panel := "X"  // 1 cell
 		got := overlayAt(base, panel, 10, 0)
-		// First 3 chars are ABC, then 7 spaces of padding, then panel, then reset.
-		want := "ABC" + strings.Repeat(" ", 7) + "X" + "\x1b[0m"
+		// ABC, 7 spaces of padding, then the reset-bracketed panel.
+		want := "ABC" + strings.Repeat(" ", 7) + "\x1b[0m" + "X" + "\x1b[0m"
 		if got != want {
 			t.Errorf("padding wrong: got %q, want %q", got, want)
 		}
 	})
+}
+
+// withColour forces a colour profile so styling assertions are
+// deterministic — lipgloss strips all escapes when it can't detect a
+// TTY, which silently turns colour tests into no-ops.
+func withColour(t *testing.T) {
+	t.Helper()
+	old := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(old) })
+}
+
+// A spliced panel must be opaque: `left` carries whatever SGR state was
+// open at the cut, and without a leading reset the panel's *unstyled*
+// text inherits it. That's how dashboard log lines came out grey —
+// they were spliced into a dim border frame and picked up its
+// foreground.
+func TestSpliceLineDoesNotLeakBaseColour(t *testing.T) {
+	withColour(t)
+
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	base := dim.Render("│" + strings.Repeat(" ", 20) + "│")
+
+	out := spliceLine(base, "PLAIN", 1)
+
+	i := strings.Index(out, "PLAIN")
+	if i < 0 {
+		t.Fatalf("panel text missing from %q", out)
+	}
+	if !strings.HasSuffix(out[:i], "\x1b[0m") {
+		t.Errorf("panel text is not preceded by a reset, so it inherits the base colour.\n"+
+			"prefix = %q\nfull   = %q", out[:i], out)
+	}
+
+	// The base's own trailing cells must still be dim — the reset
+	// applies to the panel, not to the rest of the line.
+	if !strings.Contains(out[i+len("PLAIN"):], "38;5;244") {
+		t.Errorf("base lost its colour after the splice: %q", out[i+len("PLAIN"):])
+	}
+	// And the splice must not change the line's visible width.
+	if got, want := lipgloss.Width(out), lipgloss.Width(base); got != want {
+		t.Errorf("width = %d, want %d", got, want)
+	}
+}
+
+// A styled panel keeps its own colours through the splice — the
+// leading reset must not flatten the panel's styling.
+func TestSpliceLinePreservesPanelStyle(t *testing.T) {
+	withColour(t)
+
+	base := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).
+		Render("│" + strings.Repeat(" ", 20) + "│")
+	panel := lipgloss.NewStyle().Foreground(lipgloss.Color("#4ade80")).Render("OK")
+
+	out := spliceLine(base, panel, 2)
+	if !strings.Contains(out, panel) {
+		t.Errorf("panel did not survive the splice verbatim.\npanel = %q\nout   = %q", panel, out)
+	}
 }

@@ -203,6 +203,7 @@ type Model struct {
 	drainProgress       drainProgressState
 	logs                logsState
 	exec                execState
+	dashboard           dashboardState
 	permissions         map[string]permState // cached SSAR results, keyed via cluster.PermissionKey
 	permissionsInFlight map[string]struct{}  // dispatched but not yet returned; lets the RBAC overlay render "?" without re-firing
 	rbacOpen            bool
@@ -295,6 +296,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.rbacOpen {
 			return m.handleRBACKey(msg)
+		}
+		if m.dashboard.open {
+			return m.handleDashboardKey(msg)
 		}
 		if m.filterFocused {
 			return m.handleFilterKey(msg)
@@ -639,8 +643,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
 		// A scoped object on the previous cluster doesn't exist on the
 		// new one — clear so the next render isn't filtered down to
-		// zero matches with no obvious way to recover.
+		// zero matches with no obvious way to recover. The dashboard's
+		// target is the same story, and it owns a log stream that has
+		// to stop with it.
 		m.eventScope = nil
+		if m.dashboard.open {
+			m.dashboard = dashboardState{}
+			m.stopDashboardLogs()
+		}
 		return m, nil
 
 	case ProbeTickMsg:
@@ -712,6 +722,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 		}
+	case "i":
+		return m.openDashboardForCursor()
 	case "d":
 		return m.openDescribe(false)
 	// Note: Shift-Y at the table level used to dispatch describe
@@ -1084,6 +1096,10 @@ func (m Model) handleActionMenuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 // fetch flow; Logs/Delete are placeholders for now (next iterations).
 func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 	switch a {
+	case ActDashboard:
+		ref := m.actionMenu.ref
+		m.actionMenu.open = false
+		return m.openDashboard(ref, m.cursor)
 	case ActDescribe:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1422,6 +1438,10 @@ func (m Model) View() string {
 	mainWidth := m.width - SidebarWidth
 	var body string
 	switch {
+	case m.dashboard.open:
+		// Full width, no sidebar: the dashboard is about one workload,
+		// and the cluster rail would just crowd the panes.
+		body = m.renderDashboard(bodyHeight, m.width)
 	case m.view == ViewOverview:
 		// Overview takes the whole row — it IS the cluster overview,
 		// the sidebar would be redundant.
@@ -1779,7 +1799,10 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 }
 
 func (m Model) renderFooter() string {
-	hint := " ?:help  F1:overview  1:pods  2:deploy  3:nodes  4:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  F2:debug  q:quit "
+	hint := " ?:help  F1:overview  1:pods  2:deploy  3:nodes  4:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  F2:debug  q:quit "
+	if m.dashboard.open {
+		hint = " Tab:pane  j/k:scroll  g/G:top/bottom  f:follow  c:container  l:logs  d:describe  Enter:actions  Esc:back "
+	}
 	hint = m.Theme.Footer.Render(hint)
 
 	// Toast precedence over the hint when present.
@@ -1799,7 +1822,7 @@ func (m Model) renderFooter() string {
 	// just noise.
 	overlayOpen := m.logs.open || m.describe.open || m.deleteConfirm.open ||
 		m.scaleConfirm.open || m.restartConfirm.open || m.actionMenu.open ||
-		m.helpOpen || m.nsPickerOpen || m.rbacOpen
+		m.helpOpen || m.nsPickerOpen || m.rbacOpen || m.dashboard.open
 	if !overlayOpen && (m.filterFocused || m.filterText != "") {
 		caret := ""
 		if m.filterFocused {
