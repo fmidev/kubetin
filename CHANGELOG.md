@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.6.0](https://github.com/fmidev/kubetin/compare/v1.5.0...v1.6.0) (2026-08-26)
+
+
+### Features
+
+* project richer pod/deployment fields from informers ([#39](https://github.com/fmidev/kubetin/issues/39)) ([16ca9dc](https://github.com/fmidev/kubetin/commit/16ca9dca39513b6743d5a88455563a5c5666d8cc))
+* status dashboard for deployments ([#41](https://github.com/fmidev/kubetin/issues/41)) ([fa6c147](https://github.com/fmidev/kubetin/commit/fa6c147920348a9c3eb69d63508265344ff7c016))
+* status dashboard for pods ([#40](https://github.com/fmidev/kubetin/issues/40)) ([5d3711b](https://github.com/fmidev/kubetin/commit/5d3711bc579e76fec334e72b3db74911786c7ee7))
+
+
+### Bug Fixes
+
+* stop informer updates blanking pod CPU/MEM and network rates ([#42](https://github.com/fmidev/kubetin/issues/42)) ([59215f1](https://github.com/fmidev/kubetin/commit/59215f19b1e80cfd8c648fb4ceb82cd72100a878))
+
 ## [1.5.0](https://github.com/fmidev/kubetin/compare/v1.4.0...v1.5.0) (2026-06-15)
 
 
