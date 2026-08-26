@@ -255,6 +255,27 @@ func TestViewFitsCanvas(t *testing.T) {
 			})
 		})},
 
+		// Single-context models render without the cluster rail, so the
+		// main pane owns the full width — a different geometry from
+		// every other case here, which uses three contexts.
+		{"single-cluster/wide", 200, 50, ViewPods, singleContext(nil)},
+		{"single-cluster/narrow", 80, 24, ViewPods, singleContext(nil)},
+		{"single-cluster/tiny", 40, 12, ViewPods, singleContext(nil)},
+		{"single-cluster/nodes", 120, 30, ViewNodes, singleContext(nil)},
+		{"single-cluster/overview", 120, 30, ViewOverview, singleContext(nil)},
+		{"single-cluster/with-filter", 120, 30, ViewPods, singleContext(func(m *Model) {
+			m.filterFocused = true
+			m.filterText = "kube"
+		})},
+		{"zero-contexts", 120, 30, ViewPods, func(m *Model) { m.Contexts = nil; m.HideSidebar = true }},
+		// Rail hidden by choice on a fleet: multiple contexts, no rail.
+		{"rail-hidden/fleet-wide", 200, 50, ViewPods, func(m *Model) { m.HideSidebar = true }},
+		{"rail-hidden/fleet-narrow", 80, 24, ViewPods, func(m *Model) { m.HideSidebar = true }},
+		// Rail forced on with a lone cluster, the inverse of the default.
+		{"rail-shown/single-cluster", 120, 30, ViewPods, singleContext(func(m *Model) {
+			m.HideSidebar = false
+		})},
+
 		{"restart-confirm", 120, 40, ViewDeployments, func(m *Model) {
 			m.restartConfirm.open = true
 			m.restartConfirm.ref.Name = "my-deploy"
@@ -460,6 +481,18 @@ func dashDeploySetup(extra func(*Model)) func(*Model) {
 			UID: "dep-uid",
 		}}
 		m.dashboard.podCursor = 0
+		if extra != nil {
+			extra(m)
+		}
+	}
+}
+
+// singleContext trims the model down to one configured cluster, which
+// is what New would have defaulted HideSidebar from.
+func singleContext(extra func(*Model)) func(*Model) {
+	return func(m *Model) {
+		m.Contexts = []string{"alpha"}
+		m.HideSidebar = true
 		if extra != nil {
 			extra(m)
 		}

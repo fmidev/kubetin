@@ -90,6 +90,15 @@ kubetin
 First launch prompts you to bless the kubeconfig files it discovers — see
 [Trust list](#trust-list) below.
 
+The cluster rail on the left is hidden automatically when your kubeconfig
+holds a single context — the header already carries that cluster's name,
+version, node counts and resource bars, so the rail would only cost the
+table 30 columns. Toggle it any time with `C`, or start without it:
+
+```sh
+kubetin -no-sidebar
+```
+
 Press `?` once running for the full keybinding list.
 
 ## Trust list
@@ -123,6 +132,7 @@ kubetin -trust
 | | `k` / `↑` | previous row |
 | | `g` / `G` | first / last row |
 | Cluster | `Tab` / `Shift-Tab` | next / previous reachable cluster |
+| | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
 | | `1` – `4` | pods / deployments / nodes / events |
 | Filter | `/` | filter by name / namespace |

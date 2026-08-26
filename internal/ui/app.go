@@ -99,6 +99,13 @@ type Model struct {
 	// this; left empty when not provided (the help renders without it).
 	Build string
 
+	// HideSidebar suppresses the cluster rail. New defaults it to true
+	// for a single-cluster kubeconfig, where the rail would list the
+	// one cluster you're already looking at; `C` toggles it and
+	// -no-sidebar forces it on at startup. Exported so main can apply
+	// the flag, like Build.
+	HideSidebar bool
+
 	// OnFocusChange is called from a tea.Cmd when the user switches
 	// the focused cluster (Tab/Shift-Tab). Main wires this to the
 	// watcher swap coordinator.
@@ -227,10 +234,15 @@ type Model struct {
 // we render; store provides multi-cluster probe state for the header.
 func New(context string, store *model.Store, contexts []string) Model {
 	return Model{
-		WatchedContext:      context,
-		Store:               store,
-		Theme:               DefaultTheme(),
-		Contexts:            contexts,
+		WatchedContext: context,
+		Store:          store,
+		Theme:          DefaultTheme(),
+		Contexts:       contexts,
+		// Seeded rather than enforced, so `C` toggles from whatever the
+		// user actually sees on their first launch: a lone cluster
+		// starts hidden and C reveals it, a fleet starts shown and C
+		// hides it. Either way the key does something visible.
+		HideSidebar:         len(contexts) <= 1,
 		pods:                make(map[types.UID]podRow),
 		nodes:               make(map[types.UID]nodeRow),
 		deployments:         make(map[types.UID]deploymentRow),
@@ -714,6 +726,10 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.debugMode = !m.debugMode
 	case "?":
 		m.helpOpen = !m.helpOpen
+	case "C":
+		// Tab still switches clusters with the rail hidden; this only
+		// controls whether the list is drawn.
+		m.HideSidebar = !m.HideSidebar
 	case "R":
 		m.rbacOpen = !m.rbacOpen
 		if m.rbacOpen {
@@ -1318,7 +1334,12 @@ func (m Model) handleFilterKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 // cycleFocus moves focus to the next/previous context with a healthy
 // or degraded probe state. Falls back to any context if none qualify.
 func (m *Model) cycleFocus(delta int) tea.Cmd {
-	if len(m.Contexts) == 0 || m.OnFocusChange == nil {
+	// <=1 rather than ==0: with a single context the loop below lands
+	// back on the context already focused and "switches" to it, which
+	// cancels every watcher, blanks the tables via PodsClearedMsg and
+	// pays for a full re-list — a visible resync in exchange for no
+	// navigation at all.
+	if len(m.Contexts) <= 1 || m.OnFocusChange == nil {
 		return nil
 	}
 	idx := -1
@@ -1446,6 +1467,13 @@ func (m Model) View() string {
 		// Overview takes the whole row — it IS the cluster overview,
 		// the sidebar would be redundant.
 		body = m.renderOverview(bodyHeight, m.width)
+	case m.HideSidebar:
+		// The rail costs 30 columns. Dropping it loses nothing the
+		// header doesn't already carry — cluster name, reach, version,
+		// node counts and resource bars — and the table gains the
+		// width. Defaults on for a single-cluster kubeconfig; `C`
+		// toggles it for a fleet.
+		body = m.mainPane(bodyHeight, m.width)
 	case mainWidth < 70:
 		// Below ~100 total cells the sidebar starves the table of the
 		// columns that make a monitor useful (CPU/MEM). Give the table
@@ -1800,6 +1828,11 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 
 func (m Model) renderFooter() string {
 	hint := " ?:help  F1:overview  1:pods  2:deploy  3:nodes  4:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  F2:debug  q:quit "
+	if len(m.Contexts) <= 1 {
+		// Nothing to Tab to, and the rail that would have hinted at
+		// other clusters isn't drawn either.
+		hint = strings.Replace(hint, "Tab:cluster  ", "", 1)
+	}
 	if m.dashboard.open {
 		hint = " Tab:pane  j/k:move  g/G:top/bottom  f:follow  i:open pod  c:container  l:logs  d:describe  Enter:actions  Esc:back "
 	}
