@@ -138,7 +138,10 @@ kubetin -trust
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
 | | `1` – `6` | pods / deployments / services / ingresses / nodes / namespaces |
-| Events | `e` | events for the selected resource |
+| Inspect | `i` | status dashboard for the selected row |
+| | `l` | logs for the selected row |
+| | `e` | events for the selected row |
+| | `d` | describe the selected row |
 | | `E` | events for the namespace (or cluster, with `ns: all`) |
 | Filter | `/` | filter by name / namespace |
 | | `n` | namespace picker |

@@ -226,6 +226,7 @@ type Model struct {
 	nsSortDesc bool
 
 	helpOpen            bool
+	helpScroll          int
 	describe            describeState
 	actionMenu          actionMenuState
 	deleteConfirm       deleteConfirmState
@@ -823,6 +824,10 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// press rather than tracking the cursor, so the list doesn't
 		// churn underneath you while you read it.
 		return m.openEventsForCursor()
+	case "l":
+		// Logs for the highlighted row — the same one-key shape `e`
+		// gives events and `i` gives the dashboard.
+		return m.openLogsForCursorKey()
 	case "E":
 		return m.openEventsAll()
 	case "/":

@@ -808,3 +808,25 @@ func (m Model) renderContainerPicker(canvasWidth, canvasHeight int) string {
 
 	return lipgloss.Place(canvasWidth, canvasHeight, lipgloss.Center, lipgloss.Center, box)
 }
+
+// openLogsForCursorKey is the `l` shortcut: logs for the highlighted
+// row, the same one-key shape `e` gives events and `i` gives the
+// dashboard. Previously logs were only reachable through the action
+// menu.
+//
+// Only pods and deployments have logs. Anything else says so rather
+// than falling through to openLogsForPod, which would stream the
+// cursor's containers against a ref of the wrong kind.
+func (m Model) openLogsForCursorKey() (tea.Model, tea.Cmd) {
+	ref, ok := m.refForCursor()
+	if !ok {
+		return m, nil
+	}
+	switch ref.Kind {
+	case "Pod", "Deployment":
+		return m.openLogsForCursor(ref)
+	}
+	m.toast = "✕ No logs for " + ref.Kind + "/" + ref.Name
+	m.toastUntil = time.Now().Add(3 * time.Second)
+	return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
+}
