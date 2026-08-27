@@ -70,6 +70,16 @@ func TestViewFitsCanvas(t *testing.T) {
 			}
 		})},
 		{"events-lens/over-deployments", 120, 30, ViewDeployments, eventsLens(nil)},
+		{"events-lens/wide-runes", 50, 14, ViewPods, eventsLens(func(m *Model) {
+			m.events["cjk"] = eventRow{
+				UID: "cjk", Namespace: "デフォルト", Type: "Warning",
+				Reason:  strings.Repeat("失敗", 40),
+				Message: strings.Repeat("コンテナの起動に失敗しました", 20),
+				Count:   7, LastSeen: time.Now(),
+				InvolvedKind: "Pod", InvolvedName: strings.Repeat("名前", 30),
+				InvolvedNs: "デフォルト",
+			}
+		})},
 		{"namespaces/wide", 200, 50, ViewNamespaces, nil},
 		{"namespaces/narrow", 80, 24, ViewNamespaces, nil},
 		{"overview/wide", 200, 50, ViewOverview, nil},

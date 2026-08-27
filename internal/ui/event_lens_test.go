@@ -382,3 +382,49 @@ func TestEventsLensScrollLimitMatchesRender(t *testing.T) {
 			e.eventsLens.scroll, want, total)
 	}
 }
+
+// The reviewer's case: 44 CJK characters are 88 cells, so a
+// rune-counting truncate left the row wider than the pane even after
+// the earlier length fix. Everything the lens prints comes from the
+// cluster and can be any Unicode.
+func TestEventsLensWideRunesDoNotWrap(t *testing.T) {
+	m := lensModel(eventsLensMinWidth, 20, func(m *Model) {
+		m.events = map[types.UID]eventRow{"cjk": {
+			UID: "cjk", Namespace: "デフォルト", Type: "Warning",
+			Reason:  strings.Repeat("失敗", 40),
+			Message: strings.Repeat("コンテナの起動に失敗しました", 20),
+			Count:   7, LastSeen: time.Now(),
+			InvolvedKind: "Pod", InvolvedName: strings.Repeat("名前", 30),
+			InvolvedNs: "デフォルト",
+		}}
+		m.eventsLens.scope = &eventScopeRef{
+			Kind: "Pod", Namespace: "デフォルト", Name: strings.Repeat("名前", 30),
+		}
+	})
+
+	const pane = eventsLensMinWidth - 2
+	lines := m.eventGroupLines(groupEvents(m.events), pane)
+	if len(lines) != 4 {
+		t.Fatalf("one group produced %d lines, want exactly 4", len(lines))
+	}
+	for i, l := range lines {
+		if got := lipgloss.Width(l); got > pane {
+			t.Errorf("line %d is %d cells in a %d-cell pane; it will wrap", i, got, pane)
+		}
+	}
+
+	// End to end, including the scope label in the title.
+	out := m.renderEventsLens(eventsLensMinWidth, 12)
+	if got := lipgloss.Height(out); got != 12 {
+		t.Errorf("box height = %d, want 12", got)
+	}
+	for i, line := range strings.Split(out, "\n") {
+		if got := lipgloss.Width(line); got > eventsLensMinWidth {
+			t.Errorf("row %d is %d cells wide, want <= %d", i, got, eventsLensMinWidth)
+		}
+	}
+	rows := strings.Split(out, "\n")
+	if !strings.Contains(rows[len(rows)-1], "└") {
+		t.Error("wide runes pushed the bottom border off the canvas")
+	}
+}

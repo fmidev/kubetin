@@ -35,7 +35,15 @@ The View pipeline guarantees every render is exactly `(m.width, m.height)` cells
 
 If you see yourself calling `style.Render(...)` *before* a padding helper, you need the ANSI-aware variant. If the padding helper applies the style, plain text is fine.
 
-`truncate()` itself operates on runes (not bytes) and adds an "…" trailer when truncated.
+`truncate()` measures **terminal cells** (via go-runewidth, the same
+library lipgloss measures with) and adds an "…" trailer when it cuts.
+Not runes: a CJK ideograph or emoji occupies two columns, so a
+rune-counting truncate let a 44-rune string claim 88 cells — `padCol`
+returned 39 cells when asked for 20, and inside a lipgloss box that
+wraps rather than clips, which breaks every fixed-height layout
+downstream. Anything sourced from the cluster (event messages and
+reasons, OpenShift display names, ingress hosts) can be arbitrary
+Unicode.
 
 ## Async messages: per-cluster identity
 

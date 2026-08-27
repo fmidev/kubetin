@@ -252,3 +252,75 @@ func TestSpliceLinePreservesPanelStyle(t *testing.T) {
 		t.Errorf("panel did not survive the splice verbatim.\npanel = %q\nout   = %q", panel, out)
 	}
 }
+
+// truncate measures terminal cells, not runes. A CJK ideograph or an
+// emoji occupies two columns, so rune-counting let a 44-rune string
+// claim 88 cells and overflow the column it was sized for.
+func TestTruncateCountsCellsNotRunes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		n    int
+	}{
+		{"ascii long", strings.Repeat("a", 90), 20},
+		{"cjk", strings.Repeat("世界", 40), 20},
+		{"emoji", strings.Repeat("🔥", 30), 10},
+		{"mixed", "pod-" + strings.Repeat("日本語", 20) + "-suffix", 24},
+		{"cjk at 1 cell", strings.Repeat("世", 5), 1},
+		{"cjk at 2 cells", strings.Repeat("世", 5), 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncate(tc.in, tc.n)
+			if w := lipgloss.Width(got); w > tc.n {
+				t.Errorf("truncate(_, %d) = %d cells (%q)", tc.n, w, got)
+			}
+		})
+	}
+}
+
+// Content that already fits comes back untouched — no gratuitous
+// ellipsis, and the wide-character path must not trip on it.
+func TestTruncateLeavesFittingContentAlone(t *testing.T) {
+	for _, s := range []string{"", "abc", "世界", "🔥", strings.Repeat("世", 10)} {
+		n := lipgloss.Width(s)
+		if n == 0 {
+			n = 1
+		}
+		if got := truncate(s, n); got != s && lipgloss.Width(s) <= n {
+			t.Errorf("truncate(%q, %d) = %q, want it unchanged", s, n, got)
+		}
+	}
+	if got := truncate("anything", 0); got != "" {
+		t.Errorf("truncate(_, 0) = %q, want empty", got)
+	}
+}
+
+// padCol is the primitive every table cell goes through, so a
+// rune-counting truncate made whole tables overflow their pane — 39
+// cells when asked for 20.
+func TestPadColExactWidthWithWideRunes(t *testing.T) {
+	plain := lipgloss.NewStyle()
+	red := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	cases := []struct {
+		name  string
+		in    string
+		width int
+		style lipgloss.Style
+	}{
+		{"cjk plain", strings.Repeat("世界", 40), 20, plain},
+		{"cjk styled", strings.Repeat("世界", 40), 20, red},
+		{"emoji", strings.Repeat("🔥", 30), 10, plain},
+		{"cjk short", "世界", 12, plain},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if w := lipgloss.Width(padCol(tc.in, tc.width, tc.style)); w != tc.width {
+				t.Errorf("padCol = %d cells, want exactly %d", w, tc.width)
+			}
+			if w := lipgloss.Width(padColRight(tc.in, tc.width, tc.style)); w != tc.width {
+				t.Errorf("padColRight = %d cells, want exactly %d", w, tc.width)
+			}
+		})
+	}
+}

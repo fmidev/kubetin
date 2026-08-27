@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -2087,18 +2088,27 @@ func padPhase(p corev1.PodPhase, width int, th Theme) string {
 // bodies, and OS-image fields don't get sliced mid-rune. Plain text
 // only — for ANSI-styled content use lipgloss.MaxWidth via
 // padCellANSI / padCellANSIRight.
+// truncate fits s into n terminal cells, appending "…" when it had to
+// cut something.
+//
+// Cells, not runes. A CJK ideograph or an emoji occupies two columns,
+// so counting runes let a 44-rune string claim 88 cells and overflow
+// the column it was measured for — padCol handed back 39 cells when
+// asked for 20, and inside a lipgloss box that wraps rather than
+// clips, which breaks every fixed-height layout downstream.
+//
+// go-runewidth is what lipgloss itself measures with, so this agrees
+// with lipgloss.Width by construction. Grapheme clusters can still be
+// split mid-sequence; the result is never wider than n, which is the
+// property the layout depends on.
 func truncate(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	r := []rune(s)
-	if len(r) <= n {
+	if runewidth.StringWidth(s) <= n {
 		return s
 	}
-	if n == 1 {
-		return string(r[0])
-	}
-	return string(r[:n-1]) + "…"
+	return runewidth.Truncate(s, n, "…")
 }
 
 // styleForReach delegates the cluster reach colour to the theme.
