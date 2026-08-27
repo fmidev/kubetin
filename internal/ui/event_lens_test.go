@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -260,5 +261,124 @@ func TestEventsLensEmptyStates(t *testing.T) {
 	})
 	if out := ns.renderEventsLens(120, 20); !strings.Contains(out, "no events in namespace kube-system") {
 		t.Errorf("namespace empty state missing:\n%s", out)
+	}
+}
+
+// The box must occupy exactly the canvas it was given. At one row too
+// many, View's clampCanvas silently eats the bottom border — the
+// layout test still passes, because it asserts dimensions rather than
+// an intact frame.
+func TestEventsLensBoxFitsItsCanvas(t *testing.T) {
+	for _, dim := range [][2]int{{110, 12}, {80, 8}, {200, 40}, {50, 6}} {
+		w, h := dim[0], dim[1]
+		m := lensModel(w, h+4, nil)
+		out := m.renderEventsLens(w, h)
+
+		if got := lipgloss.Height(out); got != h {
+			t.Errorf("%dx%d: rendered %d rows, want %d", w, h, got, h)
+		}
+		rows := strings.Split(out, "\n")
+		if !strings.Contains(rows[len(rows)-1], "└") {
+			t.Errorf("%dx%d: bottom border missing — last row = %q",
+				w, h, strings.TrimSpace(rows[len(rows)-1]))
+		}
+		if !strings.Contains(rows[0], "┌") {
+			t.Errorf("%dx%d: top border missing", w, h)
+		}
+	}
+}
+
+// A reason from a custom controller can be arbitrarily long. Unbounded
+// it wraps inside the box, which breaks both the four-lines-per-group
+// scroll arithmetic and the box height.
+func TestEventsLensLongReasonDoesNotWrap(t *testing.T) {
+	m := lensModel(eventsLensMinWidth, 20, func(m *Model) {
+		m.events = map[types.UID]eventRow{"x": {
+			UID: "x", Namespace: "default", Type: "Warning",
+			Reason:  strings.Repeat("VeryLongCustomReason", 6),
+			Message: strings.Repeat("m", 300),
+			Count:   3, LastSeen: time.Now(),
+			InvolvedKind: "Pod", InvolvedName: strings.Repeat("p", 80), InvolvedNs: "default",
+		}}
+	})
+
+	const pane = eventsLensMinWidth - 2
+	lines := m.eventGroupLines(groupEvents(m.events), pane)
+	if len(lines) != 4 {
+		t.Fatalf("one group produced %d lines, want exactly 4", len(lines))
+	}
+	for i, l := range lines {
+		if got := lipgloss.Width(l); got > pane {
+			t.Errorf("line %d is %d cells wide in a %d-cell pane; it will wrap", i, got, pane)
+		}
+	}
+
+	// And end to end: the box still fits and keeps its border.
+	out := m.renderEventsLens(eventsLensMinWidth, 12)
+	if got := lipgloss.Height(out); got != 12 {
+		t.Errorf("box height = %d, want 12", got)
+	}
+	rows := strings.Split(out, "\n")
+	if !strings.Contains(rows[len(rows)-1], "└") {
+		t.Error("long reason pushed the bottom border off the canvas")
+	}
+}
+
+// The footer carries counts plus hints and overflows a narrow box just
+// as readily as the reason does.
+func TestEventsLensFooterDoesNotWrap(t *testing.T) {
+	m := lensModel(eventsLensMinWidth, 20, func(m *Model) {
+		now := time.Now()
+		for i := 0; i < 40; i++ {
+			uid := types.UID("f" + string(rune('a'+i%26)) + string(rune('A'+i/26)))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Normal",
+				Reason: "R" + string(rune('a'+i%26)), Message: "m", Count: 99,
+				LastSeen: now, InvolvedKind: "Pod", InvolvedName: "p", InvolvedNs: "default",
+			}
+		}
+		// Scoped, so the footer also carries the "E all events" hint.
+		m.eventsLens.scope = &eventScopeRef{Kind: "Pod", Namespace: "default", Name: "p"}
+	})
+
+	out := m.renderEventsLens(eventsLensMinWidth, 14)
+	if got := lipgloss.Height(out); got != 14 {
+		t.Errorf("box height = %d, want 14 — a wrapped footer adds a row", got)
+	}
+	for i, line := range strings.Split(out, "\n") {
+		if got := lipgloss.Width(line); got > eventsLensMinWidth {
+			t.Errorf("row %d is %d cells wide, want <= %d", i, got, eventsLensMinWidth)
+		}
+	}
+}
+
+// Scroll limits are computed from the same chrome budget the renderer
+// spends; if they drift, G either stops short or scrolls into blank.
+func TestEventsLensScrollLimitMatchesRender(t *testing.T) {
+	m := lensModel(120, 24, func(m *Model) {
+		now := time.Now()
+		for i := 0; i < 30; i++ {
+			uid := types.UID("s" + string(rune('a'+i%26)) + string(rune('A'+i/26)))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Normal",
+				Reason: "Reason" + string(rune('a'+i%26)), Message: "m", Count: 1,
+				LastSeen: now, InvolvedKind: "Pod", InvolvedName: "p", InvolvedNs: "default",
+			}
+		}
+	})
+
+	end, _ := m.handleEventsKey(key("G"))
+	e := end.(Model)
+
+	events, _ := e.scopedEvents()
+	total := len(e.eventGroupLines(groupEvents(events), 118))
+	canvas := e.height - lipgloss.Height(e.renderHeader()) - lipgloss.Height(e.renderFooter())
+	want := total - (canvas - eventsLensChrome)
+	if want < 0 {
+		want = 0
+	}
+	if e.eventsLens.scroll != want {
+		t.Errorf("G scrolled to %d, want %d (last full screen of %d lines)",
+			e.eventsLens.scroll, want, total)
 	}
 }

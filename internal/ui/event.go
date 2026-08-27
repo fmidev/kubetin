@@ -247,9 +247,18 @@ func (m Model) eventGroupLines(groups []eventGroup, width int) []string {
 			dotStyle = m.Theme.StatusWrn
 		}
 
-		reason := m.Theme.Header.Render(g.Reason)
+		// Reason is the one field that comes from the cluster rather
+		// than from us — a custom controller can emit an arbitrarily
+		// long one. Unbounded, it wraps inside the box, which both
+		// breaks the four-lines-per-group scroll arithmetic and pushes
+		// the bottom border off the canvas.
+		prefix := " " + dotStyle.Render("●") + " "
 		countBadge := m.Theme.Dim.Render(fmt.Sprintf("×%d", g.Count))
-		left := " " + dotStyle.Render("●") + " " + reason
+		avail := width - lipgloss.Width(prefix) - lipgloss.Width(countBadge) - 1
+		if avail < 1 {
+			avail = 1
+		}
+		left := prefix + m.Theme.Header.Render(truncate(g.Reason, avail))
 		// -1 keeps the badge off the right border.
 		pad := width - lipgloss.Width(left) - lipgloss.Width(countBadge) - 1
 		if pad < 1 {
@@ -297,7 +306,7 @@ func (m Model) renderEventsLens(canvasWidth, canvasHeight int) string {
 		m.Theme.Dim.Render(truncate(scopeLabel, innerW-9)) + "\n")
 	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
 
-	bodyHeight := h - 4 // title, separator, footer, border slack
+	bodyHeight := h - eventsLensChrome
 	if bodyHeight < 1 {
 		bodyHeight = 1
 	}
@@ -318,9 +327,10 @@ func (m Model) renderEventsLens(canvasWidth, canvasHeight int) string {
 		// Widening is only meaningful when something is narrowing it.
 		hint = " · j/k scroll · E all events · Esc close"
 	}
-	b.WriteString(m.Theme.Footer.Render(fmt.Sprintf(
+	b.WriteString(m.Theme.Footer.Render(truncate(fmt.Sprintf(
 		" %s · %s%s",
-		plural(len(groups), "group"), plural(int(totalEventCount(groups)), "event"), hint)))
+		plural(len(groups), "group"), plural(int(totalEventCount(groups)), "event"), hint),
+		innerW)))
 
 	box := lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
@@ -344,7 +354,12 @@ func (m Model) emptyEventsLine() string {
 	return m.emptyPlaceholder(m.syncedEvents, "events")
 }
 
-const eventsLensMinWidth = 50
+const (
+	eventsLensMinWidth = 50
+	// Rows the box spends on chrome: title, separator, footer and the
+	// two border rows.
+	eventsLensChrome = 5
+)
 
 func totalEventCount(groups []eventGroup) int32 {
 	var n int32
@@ -422,8 +437,9 @@ func (m Model) clampEventsScroll(want int) int {
 	}
 	events, _ := m.scopedEvents()
 	lines := len(m.eventGroupLines(groupEvents(events), 80))
-	// Mirrors renderEventsLens: title, separator, footer, border slack.
-	body := m.height - lipgloss.Height(m.renderHeader()) - lipgloss.Height(m.renderFooter()) - 4
+	// Mirrors renderEventsLens exactly, so the scroll limit and what
+	// is actually drawn can't drift apart.
+	body := m.height - lipgloss.Height(m.renderHeader()) - lipgloss.Height(m.renderFooter()) - eventsLensChrome
 	if body < 1 {
 		body = 1
 	}
