@@ -268,6 +268,11 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.dashboard.scroll[dashPaneLogs] = 2
 			m.dashboard.focus = dashPaneEvents
 		})},
+		// Narrow but tall: the stacked column has to fill the window,
+		// not leave a band of dead space under a fixed-height log pane.
+		{"dashboard/tall-narrow", 70, 50, ViewPods, dashSetup(nil)},
+		{"dashboard/very-tall-narrow", 60, 80, ViewPods, dashSetup(nil)},
+		{"dashboard/tall-narrow-deploy", 70, 50, ViewDeployments, dashDeploySetup(nil)},
 		{"dashboard/stacked-scrolled", 80, 24, ViewPods, dashSetup(func(m *Model) {
 			m.dashboard.canvas = 7
 		})},
