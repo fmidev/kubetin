@@ -824,9 +824,32 @@ func (m Model) openLogsForCursorKey() (tea.Model, tea.Cmd) {
 	}
 	switch ref.Kind {
 	case "Pod", "Deployment":
+		// Honour a cached denial the way the action menu (which hides
+		// the item) and the dashboard (which renders the pane as
+		// denied) already do. Without this, `l` is a way around the
+		// RBAC gate that opens a viewer only to fill it with a 403.
+		//
+		// Only a *cached* denial refuses. An unknown permission stays
+		// optimistic: that request is what populates the cache.
+		key := cluster.PermissionKey(m.WatchedContext, "get", "", "pods/log", ref.Namespace)
+		if st, ok := m.permissions[key]; ok && !st.Allowed {
+			return m.logsDeniedToast(st.Reason)
+		}
 		return m.openLogsForCursor(ref)
 	}
 	m.toast = "✕ No logs for " + ref.Kind + "/" + ref.Name
 	m.toastUntil = time.Now().Add(3 * time.Second)
 	return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
+}
+
+// logsDeniedToast reports an RBAC refusal in the footer rather than
+// opening a viewer that can only show the error.
+func (m Model) logsDeniedToast(reason string) (tea.Model, tea.Cmd) {
+	msg := "✕ Not allowed to read pod logs (get pods/log)"
+	if reason != "" {
+		msg += ": " + reason
+	}
+	m.toast = msg
+	m.toastUntil = time.Now().Add(4 * time.Second)
+	return m, tea.Tick(4*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
 }

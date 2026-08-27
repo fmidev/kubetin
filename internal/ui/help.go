@@ -11,12 +11,20 @@ import (
 // handleHelpKey traps input while the help overlay is on screen.
 // Without this, every keybinding (j/k/d/Enter/Tab/etc.) leaks through
 // to the underlying view and silently mutates state the user can't
-// see. Only ?, Esc, and Ctrl-C are honoured here; everything else is
-// a no-op.
+// see.
+//
+// Honoured: ? / Esc / q to close, j / k and the arrows to scroll,
+// ctrl-d / ctrl-u and PgUp / PgDn to page, g / G and Home / End to
+// jump, ctrl-c to quit. Everything else is a no-op.
 func (m Model) handleHelpKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// The sheet is taller than most terminals, so it has to scroll —
 	// without this the bottom half was simply unreachable.
 	w, h := m.helpCanvas()
+	// Normalize first: the renderer clamps a local copy, so a resize
+	// that shortens the content (one column becoming two) leaves the
+	// stored offset above the new maximum, and the next j or k is
+	// spent snapping back to a position already on screen.
+	m.helpScroll = m.clampHelpScroll(m.helpScroll, h, w)
 	switch k.String() {
 	case "?", "esc", "q":
 		m.helpOpen = false
@@ -248,7 +256,15 @@ func (m Model) helpBody(width int) []string {
 	}
 	cols := packHelpColumns(m.helpBlocks(), n)
 	if len(cols) == 1 {
-		return cols[0]
+		// Rows are built at the fixed helpColWidth; on a terminal
+		// narrower than that, Style.Width won't cap them, so the box
+		// grows past the canvas and View clips the descriptions and
+		// the right border.
+		out := make([]string, 0, len(cols[0]))
+		for _, l := range cols[0] {
+			out = append(out, padCellANSI(l, width))
+		}
+		return out
 	}
 
 	height := 0
@@ -277,12 +293,19 @@ func (m Model) helpBody(width int) []string {
 	return out
 }
 
-// helpViewport is how many body rows the box can show: the canvas
-// minus title, separator, footer and the two border rows.
+// helpChrome is the rows the box spends on furniture: title,
+// separator, footer and the two border rows.
+const helpChrome = 5
+
+// helpViewport is how many body rows the box can show.
 func helpViewport(canvasHeight int) int {
-	v := canvasHeight - 5
-	if v < 3 {
-		v = 3
+	v := canvasHeight - helpChrome
+	// Floor of 1, not 3: a larger floor makes the box taller than the
+	// canvas on a very short terminal, and View then clips the bottom
+	// border. One row of content is little use, but overflowing is
+	// worse than useless.
+	if v < 1 {
+		v = 1
 	}
 	return v
 }

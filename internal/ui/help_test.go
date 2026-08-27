@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/fmidev/kubetin/internal/model"
 )
@@ -197,5 +198,62 @@ func TestLogsKeyWithoutSelection(t *testing.T) {
 	out, _ := m.handleKey(key("l"))
 	if called || out.(Model).logs.open {
 		t.Error("l opened logs with no row selected")
+	}
+}
+
+// Rows are built at a fixed helpColWidth. On a terminal narrower than
+// that, Style.Width won't cap them, so the box grows past the canvas
+// and View clips the descriptions and the right border. The layout
+// test can't catch it: clampCanvas makes the canvas dimensions right
+// by construction, which is exactly what it asserts.
+func TestHelpFitsNarrowTerminals(t *testing.T) {
+	for _, dim := range [][2]int{{40, 12}, {50, 10}, {30, 8}, {24, 6}} {
+		w, h := dim[0], dim[1]
+		m := helpModel(w, h+4)
+		innerW, _ := m.helpCanvas()
+
+		for i, l := range m.helpBody(innerW) {
+			if got := lipgloss.Width(l); got > innerW {
+				t.Errorf("%dx%d: body line %d is %d cells, pane is %d", w, h, i, got, innerW)
+				break
+			}
+		}
+
+		out := m.renderHelp(w, h)
+		if got := lipgloss.Height(out); got != h {
+			t.Errorf("%dx%d: rendered %d rows, want %d", w, h, got, h)
+		}
+		for i, line := range strings.Split(out, "\n") {
+			if got := lipgloss.Width(line); got > w {
+				t.Errorf("%dx%d: row %d is %d cells wide", w, h, i, got)
+				break
+			}
+		}
+	}
+}
+
+// A resize that shortens the content leaves the stored offset above
+// the new maximum. The renderer clamps a local copy, so without
+// normalizing, the next keypress is spent snapping back to a position
+// already on screen instead of moving.
+func TestHelpScrollNormalizedAfterResize(t *testing.T) {
+	m := helpModel(90, 20) // one column, long
+	w, h := m.helpCanvas()
+	m.helpScroll = m.clampHelpScroll(1<<30, h, w)
+	stale := m.helpScroll
+
+	m.width = 150 // two columns: fewer lines, smaller maximum
+	nw, nh := m.helpCanvas()
+	newMax := m.clampHelpScroll(1<<30, nh, nw)
+	if newMax >= stale {
+		t.Fatalf("resize didn't shrink the content: was max %d, now %d", stale, newMax)
+	}
+
+	// One k must move one row up from what's displayed, not merely
+	// re-clamp to where it already was.
+	out, _ := m.handleHelpKey(key("k"))
+	if got := out.(Model).helpScroll; got != newMax-1 {
+		t.Errorf("after resize, k left scroll at %d; want %d (one above the new bottom)",
+			got, newMax-1)
 	}
 }

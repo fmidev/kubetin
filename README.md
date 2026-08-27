@@ -138,21 +138,22 @@ kubetin -trust
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
 | | `1` – `6` | pods / deployments / services / ingresses / nodes / namespaces |
-| Inspect | `i` | status dashboard for the selected row |
-| | `l` | logs for the selected row |
-| | `e` | events for the selected row |
-| | `d` | describe the selected row |
-| | `E` | events for the namespace (or cluster, with `ns: all`) |
+| Inspect the selected row | `i` | status dashboard |
+| | `l` | logs |
+| | `e` | events |
+| | `d` | describe |
+| | `Enter` | action menu |
 | Filter | `/` | filter by name / namespace |
 | | `n` | namespace picker |
 | | `0` | all namespaces |
 | | `Esc` | clear filter / namespace |
 | Sort | `s` / `S` | cycle column / reverse direction |
-| Inspect | `Enter` | action menu (Describe / Logs / Delete) |
-| | `d` | describe selected resource |
-| | `Shift-Y` | (inside Secret describe) reveal data |
-| Logs | `/`, `n` / `N`, `f`, `g` / `G` | search, next/prev match, follow toggle, top/bottom |
-| System | `?` | help overlay |
+| Events lens | `E` | open for the namespace (or cluster, with `ns: all`) |
+| | `E` | (inside) widen to everything |
+| | `e` / `Esc` | (inside) close |
+| Logs viewer | `/`, `n` / `N`, `f`, `g` / `G` | search, next/prev match, follow toggle, top/bottom |
+| System | `?` | help overlay (scrolls with `j` / `k`) |
+| | `Shift-Y` | reveal Secret data inside describe |
 | | `F2` | debug overlay |
 | | `q` / `Ctrl-C` | quit |
 

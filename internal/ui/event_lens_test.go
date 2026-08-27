@@ -428,3 +428,54 @@ func TestEventsLensWideRunesDoNotWrap(t *testing.T) {
 		t.Error("wide runes pushed the bottom border off the canvas")
 	}
 }
+
+// `l` must honour a cached pods/log denial the way the action menu
+// (which hides the item) and the dashboard (which renders the pane as
+// denied) already do — otherwise it's a way around the RBAC gate that
+// opens a viewer only to fill it with a 403.
+func TestLogsKeyHonoursCachedDenial(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.width, m.height = 120, 24
+	m.view = ViewPods
+	m.pods["p1"] = podRow{UID: "p1", Namespace: "default", Name: "api",
+		Containers: []string{"app"}}
+	m.cursor = "p1"
+	m.permissions[cluster.PermissionKey("alpha", "get", "", "pods/log", "default")] =
+		permState{Allowed: false, Reason: "forbidden by RBAC"}
+
+	started := false
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { started = true; return nil }
+
+	// Deliberately not invoking cmd: the denial path returns a 4s
+	// toast-clear Tick, and running it would just sleep the suite.
+	out, _ := m.handleKey(key("l"))
+	o := out.(Model)
+	if started || o.logs.open {
+		t.Error("l opened a stream despite a cached denial")
+	}
+	if !strings.Contains(o.toast, "Not allowed") || !strings.Contains(o.toast, "forbidden by RBAC") {
+		t.Errorf("toast = %q, want the denial and its reason", o.toast)
+	}
+}
+
+// An unknown permission stays optimistic: that request is what
+// populates the cache in the first place.
+func TestLogsKeyOptimisticWhenPermissionUnknown(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.width, m.height = 120, 24
+	m.view = ViewPods
+	m.pods["p1"] = podRow{UID: "p1", Namespace: "default", Name: "api",
+		Containers: []string{"app"}}
+	m.cursor = "p1"
+
+	started := false
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { started = true; return nil }
+
+	out, cmd := m.handleKey(key("l"))
+	if cmd != nil {
+		cmd()
+	}
+	if !started || !out.(Model).logs.open {
+		t.Error("l refused to stream with no cached permission result")
+	}
+}
