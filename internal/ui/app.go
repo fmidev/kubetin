@@ -117,6 +117,12 @@ type Model struct {
 	// this; left empty when not provided (the help renders without it).
 	Build string
 
+	// LogTail is how many historical lines the log viewer replays
+	// before following. Zero means logTailDefault; negative means the
+	// whole log. main wires -log-tail here, like Build and
+	// HideSidebar.
+	LogTail int
+
 	// HideSidebar suppresses the cluster rail. New defaults it to true
 	// for a single-cluster kubeconfig, where the rail would list the
 	// one cluster you're already looking at; `C` toggles it and

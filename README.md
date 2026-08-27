@@ -90,6 +90,14 @@ quarantined and none of this applies.
 kubetin
 ```
 
+The log viewer opens on the last 2000 lines and follows from there.
+Press `L` inside it to pull the whole log, or start with a different
+depth:
+
+```sh
+kubetin -log-tail 10000   # or a negative value for the whole log
+```
+
 First launch prompts you to bless the kubeconfig files it discovers — see
 [Trust list](#trust-list) below.
 
@@ -152,6 +160,7 @@ kubetin -trust
 | | `E` | (inside) widen to everything |
 | | `e` / `Esc` | (inside) close |
 | Logs viewer | `/`, `n` / `N`, `f`, `g` / `G` | search, next/prev match, follow toggle, top/bottom |
+| | `L` | load the whole log (the viewer opens on the last 2000 lines) |
 | System | `?` | help overlay (scrolls with `j` / `k`) |
 | | `Shift-Y` | reveal Secret data inside describe |
 | | `F2` | debug overlay |

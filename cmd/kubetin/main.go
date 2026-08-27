@@ -38,6 +38,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	trustAll := flag.Bool("trust", false, "add every discovered kubeconfig to the trust list and exit")
 	noSidebar := flag.Bool("no-sidebar", false, "start with the cluster rail hidden (toggle with C)")
+	logTail := flag.Int("log-tail", 0, "log lines to replay when opening the viewer (0 = default, negative = whole log; L loads all in-viewer)")
 	flag.Parse()
 
 	if *showVersion {
@@ -108,7 +109,7 @@ func main() {
 		runHeadless(rootCtx, store, sup, d.Contexts, *printInterval, *watchCtx, *noWatch)
 		return
 	}
-	runTUI(rootCtx, store, sup, d.Contexts, *watchCtx, *noWatch, *noSidebar, restoreStderr)
+	runTUI(rootCtx, store, sup, d.Contexts, *watchCtx, *noWatch, *noSidebar, *logTail, restoreStderr)
 }
 
 func openDebugLog() (*os.File, error) {
@@ -141,7 +142,7 @@ func openDebugLog() (*os.File, error) {
 // restore, then bridges the pod watcher into Program.Send. A single
 // coordinator goroutine owns the active watcher so focus switches can
 // cancel and replace it without race conditions.
-func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, contexts []string, want string, noWatch, hideSidebar bool, restoreStderr func()) {
+func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, contexts []string, want string, noWatch, hideSidebar bool, logTail int, restoreStderr func()) {
 	selected, err := pickWatchContext(ctx, store, want, contexts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kubetin: %v\n", err)
@@ -155,6 +156,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	if hideSidebar {
 		m.HideSidebar = true
 	}
+	m.LogTail = logTail
 
 	// prog is created later but referenced by callbacks defined now.
 	// Callbacks fire only after prog.Run starts, so the nil check is
@@ -231,7 +233,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 		logMu.Unlock()
 
 		ls, err := sup.StreamLogs(streamCtx, focusedCtx,
-			req.Ref.Namespace, req.Ref.Name, req.Container, 200)
+			req.Ref.Namespace, req.Ref.Name, req.Container, req.Tail)
 		if err != nil {
 			cancel()
 			return ui.LogErrorMsg{Session: req.Session, Err: err.Error()}

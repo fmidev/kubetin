@@ -71,8 +71,15 @@ func (s *Supervisor) StreamLogs(parent context.Context, ctxName, namespace, pod,
 	}
 
 	// First attempt synchronous to surface auth/not-found errors.
-	tail := int64(tailLines)
-	stream, err := openStream(parent, clientset, namespace, pod, container, &tail, time.Time{})
+	// A negative tailLines means no limit — the whole log, the way
+	// `kubectl logs` behaves. openStream reads a nil tail as "no
+	// TailLines option", which is exactly that.
+	var tailPtr *int64
+	if tailLines >= 0 {
+		tail := int64(tailLines)
+		tailPtr = &tail
+	}
+	stream, err := openStream(parent, clientset, namespace, pod, container, tailPtr, time.Time{})
 	if err != nil {
 		return nil, err
 	}

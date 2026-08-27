@@ -148,6 +148,7 @@ var helpGroups = []helpGroup{
 			{"n / N", "next / previous match"},
 			{"f", "toggle follow"},
 			{"g / G", "top / bottom"},
+			{"L", "load the whole log"},
 		},
 	},
 	{
