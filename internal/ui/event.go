@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -184,102 +185,181 @@ func groupEvents(m map[types.UID]eventRow) []eventGroup {
 //	● Reason                                          ×count
 //	  Message (one or two lines, truncated)
 //	  Pod/foo · namespace · 14:32:01
-func (m Model) renderEventsView(maxRows, maxWidth int) string {
-	// Pre-filter by scope before grouping so the per-group Count
-	// stays correct — aggregating-then-filtering would double-count
-	// (Reason+Message) pairs that span the scoped object plus
-	// unrelated objects.
-	events := m.events
-	if m.eventScope != nil {
-		events = make(map[types.UID]eventRow, len(m.events))
+//
+// eventsLensState is the events overlay.
+//
+// Events are never a place you navigate to — they are always *about*
+// something. So this works the way the log viewer does: pop it open
+// over whatever you were looking at, read, Esc straight back to the
+// same row. It used to be a view on the number row, which meant a
+// round trip and a cursor reset to read three lines.
+type eventsLensState struct {
+	open bool
+	// scope nil means "no single object" — the namespace picker then
+	// decides between one namespace and the whole cluster.
+	scope  *eventScopeRef
+	scroll int
+}
+
+// scopedEvents returns the events to show plus a label naming that
+// scope. Three levels, all derived from state that already exists:
+//
+//	object     `e` on a row
+//	namespace  no object scope, namespace picker set
+//	cluster    no object scope, ns: all
+func (m Model) scopedEvents() (map[types.UID]eventRow, string) {
+	if s := m.eventsLens.scope; s != nil {
+		out := make(map[types.UID]eventRow, 16)
 		for uid, r := range m.events {
-			if m.eventScope.matches(r) {
-				events[uid] = r
+			if s.matches(r) {
+				out[uid] = r
 			}
 		}
-	}
-	groups := groupEvents(events)
-
-	if maxWidth < 40 {
-		maxWidth = 40
-	}
-
-	var b strings.Builder
-	var header string
-	if m.eventScope != nil {
-		header = m.Theme.Header.Render(fmt.Sprintf(
-			" EVENTS — %s/%s · %s (%d groups, %d total events) · esc to clear",
-			m.eventScope.Kind, m.eventScope.Name, m.eventScope.Namespace,
-			len(groups), totalEventCount(groups),
-		))
-	} else {
-		header = m.Theme.Header.Render(fmt.Sprintf(
-			" EVENTS (%d groups, %d total events)",
-			len(groups), totalEventCount(groups),
-		))
-	}
-	b.WriteString(header)
-	b.WriteString("\n\n")
-	rendered := 2
-
-	if len(groups) == 0 {
-		if m.eventScope != nil {
-			b.WriteString(m.Theme.Dim.Render("  no events for this " + strings.ToLower(m.eventScope.Kind) + " yet"))
-			return b.String()
+		label := s.Kind + "/" + s.Name
+		if s.Namespace != "" {
+			label += " · " + s.Namespace
 		}
-		b.WriteString(m.emptyPlaceholder(m.syncedEvents, "events"))
-		return b.String()
+		return out, label
 	}
+	if m.namespace != "" {
+		// The namespace picker applies here like it does to every
+		// other namespaced view. It did not before: the events view
+		// ignored m.namespace outright, so `n: kube-system` showed the
+		// whole cluster's events while the header said otherwise.
+		out := make(map[types.UID]eventRow, 64)
+		for uid, r := range m.events {
+			if r.InvolvedNs == m.namespace {
+				out[uid] = r
+			}
+		}
+		return out, "namespace " + m.namespace
+	}
+	return m.events, "all namespaces"
+}
 
+// eventGroupLines renders each group as its three-line block plus a
+// blank separator, returned as lines so the caller can window them.
+func (m Model) eventGroupLines(groups []eventGroup, width int) []string {
+	lines := make([]string, 0, len(groups)*4)
 	for _, g := range groups {
-		if rendered >= maxRows {
-			break
-		}
 		dotStyle := m.Theme.StatusOK
 		if g.Type == "Warning" {
 			dotStyle = m.Theme.StatusWrn
 		}
-		dot := dotStyle.Render("●")
 
-		// Line 1: dot + reason (bold), count badge right-aligned.
-		reason := m.Theme.Header.Render(g.Reason)
+		// Reason is the one field that comes from the cluster rather
+		// than from us — a custom controller can emit an arbitrarily
+		// long one. Unbounded, it wraps inside the box, which both
+		// breaks the four-lines-per-group scroll arithmetic and pushes
+		// the bottom border off the canvas.
+		prefix := " " + dotStyle.Render("●") + " "
 		countBadge := m.Theme.Dim.Render(fmt.Sprintf("×%d", g.Count))
-		left := " " + dot + " " + reason
-		pad := maxWidth - lipgloss.Width(left) - lipgloss.Width(countBadge) - 1
+		avail := width - lipgloss.Width(prefix) - lipgloss.Width(countBadge) - 1
+		if avail < 1 {
+			avail = 1
+		}
+		left := prefix + m.Theme.Header.Render(truncate(g.Reason, avail))
+		// -1 keeps the badge off the right border.
+		pad := width - lipgloss.Width(left) - lipgloss.Width(countBadge) - 1
 		if pad < 1 {
 			pad = 1
 		}
-		b.WriteString(left + strings.Repeat(" ", pad) + countBadge)
-		b.WriteByte('\n')
-		rendered++
-		if rendered >= maxRows {
-			break
-		}
+		lines = append(lines, left+strings.Repeat(" ", pad)+countBadge)
 
-		// Line 2: message (truncated to width).
-		msg := strings.ReplaceAll(g.Message, "\n", " ")
-		msgLine := "   " + truncate(msg, maxWidth-4)
-		b.WriteString(m.Theme.Base.Render(msgLine))
-		b.WriteByte('\n')
-		rendered++
-		if rendered >= maxRows {
-			break
-		}
+		lines = append(lines, m.Theme.Base.Render("   "+truncate(oneLine(g.Message), width-4)))
 
-		// Line 3: involved object · namespace · last seen.
 		involved := ""
 		if g.InvolvedKind != "" {
 			involved = g.InvolvedKind + "/" + g.InvolvedName
 		}
-		ns := g.InvolvedNs
-		seen := formatAge(g.LastSeen)
-		meta := strings.TrimSpace(strings.Join([]string{involved, ns, seen + " ago"}, " · "))
-		b.WriteString(m.Theme.Dim.Render("   " + truncate(meta, maxWidth-4)))
-		b.WriteString("\n\n")
-		rendered += 2
+		meta := strings.TrimSpace(strings.Join(
+			[]string{involved, g.InvolvedNs, formatAge(g.LastSeen) + " ago"}, " · "))
+		lines = append(lines, m.Theme.Dim.Render("   "+truncate(meta, width-4)))
+		lines = append(lines, "")
 	}
-	return b.String()
+	return lines
 }
+
+// renderEventsLens draws the overlay, shaped like the log viewer: a
+// bordered box over the full body region, scrollable, Esc to close.
+func (m Model) renderEventsLens(canvasWidth, canvasHeight int) string {
+	w, h := canvasWidth, canvasHeight
+	if w < eventsLensMinWidth {
+		w = eventsLensMinWidth
+	}
+	if h < 6 {
+		h = 6
+	}
+	// Width(w-2) plus the two border columns renders at w, so the
+	// content area is exactly w-2 — the separator has to span that or
+	// it stops short of the right border.
+	innerW := w - 2
+	if innerW < 1 {
+		innerW = 1
+	}
+
+	events, scopeLabel := m.scopedEvents()
+	groups := groupEvents(events)
+
+	var b strings.Builder
+	b.WriteString(m.Theme.Title.Render(" events ") +
+		m.Theme.Dim.Render(truncate(scopeLabel, innerW-9)) + "\n")
+	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", innerW)) + "\n")
+
+	bodyHeight := h - eventsLensChrome
+	if bodyHeight < 1 {
+		bodyHeight = 1
+	}
+
+	lines := m.eventGroupLines(groups, innerW)
+	if len(lines) == 0 {
+		lines = []string{m.emptyEventsLine()}
+	}
+	body, _ := scrollWindow(strings.Join(lines, "\n"), m.eventsLens.scroll, bodyHeight)
+	b.WriteString(body)
+	for i := lipgloss.Height(body); i < bodyHeight; i++ {
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+
+	hint := " · j/k scroll · Esc close"
+	if m.eventsLens.scope != nil {
+		// Widening is only meaningful when something is narrowing it.
+		hint = " · j/k scroll · E all events · Esc close"
+	}
+	b.WriteString(m.Theme.Footer.Render(truncate(fmt.Sprintf(
+		" %s · %s%s",
+		plural(len(groups), "group"), plural(int(totalEventCount(groups)), "event"), hint),
+		innerW)))
+
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("244")).
+		Width(w - 2).
+		Render(b.String())
+
+	return lipgloss.Place(canvasWidth, canvasHeight, lipgloss.Center, lipgloss.Center, box)
+}
+
+// emptyEventsLine distinguishes "this object has none" from "the
+// cluster has none" — the difference matters when you pressed `e`
+// expecting an explanation and got nothing.
+func (m Model) emptyEventsLine() string {
+	if s := m.eventsLens.scope; s != nil {
+		return m.Theme.Dim.Render("  no events for this " + strings.ToLower(s.Kind) + " yet")
+	}
+	if m.namespace != "" {
+		return m.Theme.Dim.Render("  no events in namespace " + m.namespace)
+	}
+	return m.emptyPlaceholder(m.syncedEvents, "events")
+}
+
+const (
+	eventsLensMinWidth = 50
+	// Rows the box spends on chrome: title, separator, footer and the
+	// two border rows.
+	eventsLensChrome = 5
+)
 
 func totalEventCount(groups []eventGroup) int32 {
 	var n int32
@@ -287,4 +367,96 @@ func totalEventCount(groups []eventGroup) int32 {
 		n += g.Count
 	}
 	return n
+}
+
+// openEventsForCursor opens the lens scoped to the highlighted row.
+// Falls back to the unscoped lens when there's no selection, rather
+// than doing nothing and looking broken.
+func (m Model) openEventsForCursor() (tea.Model, tea.Cmd) {
+	ref, ok := m.refForCursor()
+	if !ok {
+		return m.openEventsAll()
+	}
+	return m.openEventsFor(ref)
+}
+
+// openEventsFor scopes the lens to one object.
+func (m Model) openEventsFor(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
+	m.eventsLens = eventsLensState{
+		open: true,
+		scope: &eventScopeRef{
+			Kind:      ref.Kind,
+			Namespace: ref.Namespace,
+			Name:      ref.Name,
+		},
+	}
+	return m, nil
+}
+
+// openEventsAll drops the object scope. What's left is the namespace
+// picker's doing: `n: foo` narrows to that namespace, `ns: all` shows
+// the cluster.
+func (m Model) openEventsAll() (tea.Model, tea.Cmd) {
+	m.eventsLens = eventsLensState{open: true}
+	return m, nil
+}
+
+func (m Model) handleEventsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "ctrl+c":
+		m.quitMsg = "bye"
+		return m, tea.Quit
+	case "esc", "q", "e":
+		// `e` closes as well as opens: pressing it twice is the
+		// fastest way to glance at events and get back.
+		m.eventsLens = eventsLensState{}
+	case "E":
+		// Widen to everything without leaving the lens.
+		m.eventsLens.scope = nil
+		m.eventsLens.scroll = 0
+	case "j", "down":
+		m.eventsLens.scroll = m.clampEventsScroll(m.eventsLens.scroll + 1)
+	case "k", "up":
+		if m.eventsLens.scroll > 0 {
+			m.eventsLens.scroll--
+		}
+	case "g", "home":
+		m.eventsLens.scroll = 0
+	case "G", "end":
+		m.eventsLens.scroll = m.clampEventsScroll(1 << 30)
+	}
+	return m, nil
+}
+
+// clampEventsScroll bounds the offset against the rendered line count,
+// so j past the end saturates instead of running away and needing as
+// many k presses to come back.
+func (m Model) clampEventsScroll(want int) int {
+	if want < 0 {
+		return 0
+	}
+	events, _ := m.scopedEvents()
+	lines := len(m.eventGroupLines(groupEvents(events), 80))
+	// Mirrors renderEventsLens exactly, so the scroll limit and what
+	// is actually drawn can't drift apart.
+	body := m.height - lipgloss.Height(m.renderHeader()) - lipgloss.Height(m.renderFooter()) - eventsLensChrome
+	if body < 1 {
+		body = 1
+	}
+	if max := lines - body; want > max {
+		if max < 0 {
+			return 0
+		}
+		return max
+	}
+	return want
+}
+
+// plural renders "1 group" / "2 groups" — the counts sit in a footer
+// the user reads, not a log line.
+func plural(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
