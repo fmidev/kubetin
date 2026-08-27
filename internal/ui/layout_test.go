@@ -92,6 +92,22 @@ func TestViewFitsCanvas(t *testing.T) {
 		}},
 
 		{"help-open", 120, 40, ViewPods, func(m *Model) { m.helpOpen = true }},
+		{"help/two-column", 150, 44, ViewPods, func(m *Model) { m.helpOpen = true }},
+		{"help/one-column", 90, 30, ViewPods, func(m *Model) { m.helpOpen = true }},
+		{"help/short", 120, 14, ViewPods, func(m *Model) { m.helpOpen = true }},
+		{"help/tiny", 40, 12, ViewPods, func(m *Model) { m.helpOpen = true }},
+		{"help/scrolled", 90, 24, ViewPods, func(m *Model) {
+			m.helpOpen = true
+			m.helpScroll = 20
+		}},
+		{"help/scrolled-past-end", 90, 24, ViewPods, func(m *Model) {
+			m.helpOpen = true
+			m.helpScroll = 9999
+		}},
+		{"help/with-build", 150, 44, ViewPods, func(m *Model) {
+			m.helpOpen = true
+			m.Build = "kubetin v1.7.0 · 028e88d · 2026-08-27T00:00:00Z"
+		}},
 		{"rbac-open-empty", 120, 40, ViewPods, func(m *Model) { m.rbacOpen = true }},
 		{"rbac-open-mixed", 120, 40, ViewPods, func(m *Model) {
 			m.rbacOpen = true

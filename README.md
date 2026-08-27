@@ -90,6 +90,14 @@ quarantined and none of this applies.
 kubetin
 ```
 
+The log viewer opens on the last 2000 lines and follows from there.
+Press `L` inside it to pull the whole log, or start with a different
+depth:
+
+```sh
+kubetin -log-tail 10000   # or a negative value for the whole log
+```
+
 First launch prompts you to bless the kubeconfig files it discovers — see
 [Trust list](#trust-list) below.
 
@@ -138,18 +146,23 @@ kubetin -trust
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
 | | `1` – `6` | pods / deployments / services / ingresses / nodes / namespaces |
-| Events | `e` | events for the selected resource |
-| | `E` | events for the namespace (or cluster, with `ns: all`) |
+| Inspect the selected row | `i` | status dashboard |
+| | `l` | logs |
+| | `e` | events |
+| | `d` | describe |
+| | `Enter` | action menu |
 | Filter | `/` | filter by name / namespace |
 | | `n` | namespace picker |
 | | `0` | all namespaces |
 | | `Esc` | clear filter / namespace |
 | Sort | `s` / `S` | cycle column / reverse direction |
-| Inspect | `Enter` | action menu (Describe / Logs / Delete) |
-| | `d` | describe selected resource |
-| | `Shift-Y` | (inside Secret describe) reveal data |
-| Logs | `/`, `n` / `N`, `f`, `g` / `G` | search, next/prev match, follow toggle, top/bottom |
-| System | `?` | help overlay |
+| Events lens | `E` | open for the namespace (or cluster, with `ns: all`) |
+| | `E` | (inside) widen to everything |
+| | `e` / `Esc` | (inside) close |
+| Logs viewer | `/`, `n` / `N`, `f`, `g` / `G` | search, next/prev match, follow toggle, top/bottom |
+| | `L` | load the whole log (the viewer opens on the last 2000 lines) |
+| System | `?` | help overlay (scrolls with `j` / `k`) |
+| | `Shift-Y` | reveal Secret data inside describe |
 | | `F2` | debug overlay |
 | | `q` / `Ctrl-C` | quit |
 

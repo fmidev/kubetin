@@ -25,8 +25,13 @@ type logsState struct {
 	pickerOpen bool
 	pickerCur  int
 
-	lines    []string // ring buffer; oldest evicted first
-	cap      int
+	lines []string // ring buffer; oldest evicted first
+	cap   int
+	// tail is what this stream requested; full is set once the user
+	// has pulled the whole log. Together they drive the "there is more
+	// behind this window" hint.
+	tail     int
+	full     bool
 	scroll   int  // 0 = bottom; positive = scrolled up by N rows
 	follow   bool // when true, scroll auto-clamps to the bottom
 	err      string
@@ -67,6 +72,9 @@ type LogStartMsg struct {
 	Session   uint64
 	Ref       cluster.DescribeRef
 	Container string
+	// Tail is the number of historical lines to replay before
+	// following. Negative means the whole log.
+	Tail int
 }
 
 // LogStopMsg asks main to cancel the active stream (if any).
@@ -109,10 +117,21 @@ type LogReconnectingMsg struct {
 }
 
 const (
-	defaultLogCap   = 5000
-	logScrollPage   = 10
-	logScrollHalf   = 5
-	logTailDefault  = 200
+	// Buffer for a normal tail. 20k lines at a few hundred bytes each
+	// is a handful of megabytes, and only one stream runs at a time.
+	defaultLogCap = 20000
+	// Buffer once the user has asked for the whole log with `L`. They
+	// asked, so hold considerably more before evicting.
+	fullLogCap    = 200000
+	logScrollPage = 10
+	logScrollHalf = 5
+	// Lines fetched when the viewer opens. 200 showed roughly one
+	// screen of history on a chatty pod, which is rarely the window
+	// you need when something broke a minute ago. Overridable with
+	// -log-tail, and `L` pulls the rest.
+	logTailDefault = 2000
+	// logTailAll is the sentinel for "no TailLines at all".
+	logTailAll      = -1
 	logViewMinWidth = 50
 )
 
@@ -137,15 +156,35 @@ func (m Model) startLogs(ref cluster.DescribeRef, container string) (tea.Model, 
 // Bumps logs.session so any messages still draining from a previously-
 // cancelled stream get filtered out by their stale session id.
 func (m *Model) beginLogStream(ref cluster.DescribeRef, container string) tea.Cmd {
+	return m.beginLogStreamTail(ref, container, m.logTail())
+}
+
+// logTail is the configured initial tail, falling back to the default
+// when main hasn't set one.
+func (m Model) logTail() int {
+	if m.LogTail != 0 {
+		return m.LogTail
+	}
+	return logTailDefault
+}
+
+// beginLogStreamTail is beginLogStream with an explicit history depth.
+// A negative tail asks for the whole log.
+func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, tail int) tea.Cmd {
 	if m.OnLogsStart == nil {
 		return nil
 	}
 	m.logs.session++
 	m.logs.streaming = true
+	m.logs.tail = tail
+	m.logs.full = tail < 0
 	m.logs.ref = ref
 	m.logs.container = container
 	m.logs.lines = make([]string, 0, 256)
 	m.logs.cap = defaultLogCap
+	if tail < 0 {
+		m.logs.cap = fullLogCap
+	}
 	m.logs.scroll = 0
 	m.logs.follow = true
 	m.logs.err = ""
@@ -157,8 +196,18 @@ func (m *Model) beginLogStream(ref cluster.DescribeRef, container string) tea.Cm
 	m.logs.searchFocused = false
 	cb := m.OnLogsStart
 	focused := m.WatchedContext
-	req := LogStartMsg{Session: m.logs.session, Ref: ref, Container: container}
+	req := LogStartMsg{Session: m.logs.session, Ref: ref, Container: container, Tail: tail}
 	return func() tea.Msg { return cb(focused, req) }
+}
+
+// tailOrDefault reports the tail this stream actually requested,
+// falling back for buffers seeded outside beginLogStreamTail (tests,
+// and any future caller that fills lines directly).
+func (l logsState) tailOrDefault() int {
+	if l.tail == 0 {
+		return logTailDefault
+	}
+	return l.tail
 }
 
 // logStatusIndicator renders the stream's state badge. Precedence:
@@ -317,6 +366,16 @@ func (m Model) handleLogsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.logs.follow {
 			m.logs.scroll = 0
 		}
+	case "L":
+		// Re-request the same pod and container with no tail limit.
+		// Costly on a large log, so it's on demand rather than the
+		// default — but it's the difference between "the last screen"
+		// and "what actually happened".
+		if m.logs.full {
+			return m, nil
+		}
+		cmd := m.beginLogStreamTail(m.logs.ref, m.logs.container, logTailAll)
+		return m, cmd
 	}
 	return m, nil
 }
@@ -765,9 +824,16 @@ func (m Model) renderLogs(canvasWidth, canvasHeight int) string {
 	if m.logs.searchTerm != "" {
 		hint = " · n/N:next/prev  /:edit"
 	}
+	// Say whether this is the whole log or a window onto the tail of
+	// one — otherwise "1200 lines" reads as the complete story when
+	// it's the last 2000 of a million.
+	scope := "full log"
+	if !m.logs.full {
+		scope = fmt.Sprintf("tail %d · L:all", m.logs.tailOrDefault())
+	}
 	rest := m.Theme.Footer.Render(fmt.Sprintf(
-		" · %d lines%s  ·  j/k scroll  G follow  f toggle  Esc close",
-		len(m.logs.lines), hint))
+		" · %d lines (%s)%s  ·  j/k scroll  G follow  f toggle  Esc close",
+		len(m.logs.lines), scope, hint))
 	b.WriteString(" " + status + searchInfo + rest)
 
 	box := lipgloss.NewStyle().
@@ -807,4 +873,49 @@ func (m Model) renderContainerPicker(canvasWidth, canvasHeight int) string {
 		Render(b.String())
 
 	return lipgloss.Place(canvasWidth, canvasHeight, lipgloss.Center, lipgloss.Center, box)
+}
+
+// openLogsForCursorKey is the `l` shortcut: logs for the highlighted
+// row, the same one-key shape `e` gives events and `i` gives the
+// dashboard. Previously logs were only reachable through the action
+// menu.
+//
+// Only pods and deployments have logs. Anything else says so rather
+// than falling through to openLogsForPod, which would stream the
+// cursor's containers against a ref of the wrong kind.
+func (m Model) openLogsForCursorKey() (tea.Model, tea.Cmd) {
+	ref, ok := m.refForCursor()
+	if !ok {
+		return m, nil
+	}
+	switch ref.Kind {
+	case "Pod", "Deployment":
+		// Honour a cached denial the way the action menu (which hides
+		// the item) and the dashboard (which renders the pane as
+		// denied) already do. Without this, `l` is a way around the
+		// RBAC gate that opens a viewer only to fill it with a 403.
+		//
+		// Only a *cached* denial refuses. An unknown permission stays
+		// optimistic: that request is what populates the cache.
+		key := cluster.PermissionKey(m.WatchedContext, "get", "", "pods/log", ref.Namespace)
+		if st, ok := m.permissions[key]; ok && !st.Allowed {
+			return m.logsDeniedToast(st.Reason)
+		}
+		return m.openLogsForCursor(ref)
+	}
+	m.toast = "✕ No logs for " + ref.Kind + "/" + ref.Name
+	m.toastUntil = time.Now().Add(3 * time.Second)
+	return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
+}
+
+// logsDeniedToast reports an RBAC refusal in the footer rather than
+// opening a viewer that can only show the error.
+func (m Model) logsDeniedToast(reason string) (tea.Model, tea.Cmd) {
+	msg := "✕ Not allowed to read pod logs (get pods/log)"
+	if reason != "" {
+		msg += ": " + reason
+	}
+	m.toast = msg
+	m.toastUntil = time.Now().Add(4 * time.Second)
+	return m, tea.Tick(4*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
 }

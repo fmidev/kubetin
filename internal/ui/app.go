@@ -117,6 +117,12 @@ type Model struct {
 	// this; left empty when not provided (the help renders without it).
 	Build string
 
+	// LogTail is how many historical lines the log viewer replays
+	// before following. Zero means logTailDefault; negative means the
+	// whole log. main wires -log-tail here, like Build and
+	// HideSidebar.
+	LogTail int
+
 	// HideSidebar suppresses the cluster rail. New defaults it to true
 	// for a single-cluster kubeconfig, where the rail would list the
 	// one cluster you're already looking at; `C` toggles it and
@@ -226,6 +232,7 @@ type Model struct {
 	nsSortDesc bool
 
 	helpOpen            bool
+	helpScroll          int
 	describe            describeState
 	actionMenu          actionMenuState
 	deleteConfirm       deleteConfirmState
@@ -823,6 +830,10 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// press rather than tracking the cursor, so the list doesn't
 		// churn underneath you while you read it.
 		return m.openEventsForCursor()
+	case "l":
+		// Logs for the highlighted row — the same one-key shape `e`
+		// gives events and `i` gives the dashboard.
+		return m.openLogsForCursorKey()
 	case "E":
 		return m.openEventsAll()
 	case "/":

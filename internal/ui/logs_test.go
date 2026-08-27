@@ -3,6 +3,11 @@ package ui
 import (
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/fmidev/kubetin/internal/cluster"
+	"github.com/fmidev/kubetin/internal/model"
 )
 
 // highlightMatches must wrap exactly the matched span and leave any
@@ -115,5 +120,150 @@ func TestSummariseStreamErr(t *testing.T) {
 				t.Errorf("summariseStreamErr(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// 200 lines was roughly one screen of history on a chatty pod, which
+// is rarely the window you need when something broke a minute ago.
+func TestLogTailDefaultIsRequested(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.width, m.height = 120, 24
+
+	var got LogStartMsg
+	m.OnLogsStart = func(_ string, req LogStartMsg) tea.Msg { got = req; return nil }
+
+	out, cmd := m.startLogs(cluster.DescribeRef{
+		Version: "v1", Resource: "pods", Kind: "Pod",
+		Namespace: "default", Name: "api",
+	}, "app")
+	if cmd != nil {
+		cmd()
+	}
+	if got.Tail != logTailDefault {
+		t.Errorf("requested tail %d, want %d", got.Tail, logTailDefault)
+	}
+	o := out.(Model)
+	if o.logs.cap != defaultLogCap {
+		t.Errorf("cap = %d, want %d — a tail bigger than the buffer is discarded", o.logs.cap, defaultLogCap)
+	}
+	if o.logs.cap < got.Tail {
+		t.Errorf("buffer (%d) smaller than the tail requested (%d)", o.logs.cap, got.Tail)
+	}
+}
+
+// -log-tail overrides the default, including asking for everything.
+func TestLogTailFlagOverridesDefault(t *testing.T) {
+	for _, want := range []int{50, 100000, logTailAll} {
+		m := New("alpha", model.NewStore(), []string{"alpha"})
+		m.width, m.height = 120, 24
+		m.LogTail = want
+
+		var got LogStartMsg
+		m.OnLogsStart = func(_ string, req LogStartMsg) tea.Msg { got = req; return nil }
+		_, cmd := m.startLogs(cluster.DescribeRef{Kind: "Pod", Namespace: "default", Name: "api"}, "app")
+		if cmd != nil {
+			cmd()
+		}
+		if got.Tail != want {
+			t.Errorf("LogTail=%d requested %d", want, got.Tail)
+		}
+	}
+}
+
+// L re-requests the same pod and container with no tail limit, and
+// raises the buffer to match — otherwise the extra history is fetched
+// only to be evicted.
+func TestLogsLoadAllKey(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.width, m.height = 120, 24
+
+	var got LogStartMsg
+	m.OnLogsStart = func(_ string, req LogStartMsg) tea.Msg { got = req; return nil }
+
+	opened, cmd := m.startLogs(cluster.DescribeRef{
+		Version: "v1", Resource: "pods", Kind: "Pod",
+		Namespace: "default", Name: "api",
+	}, "envoy")
+	if cmd != nil {
+		cmd()
+	}
+	o := opened.(Model)
+	firstSession := o.logs.session
+
+	full, cmd := o.handleLogsKey(key("L"))
+	if cmd != nil {
+		cmd()
+	}
+	f := full.(Model)
+
+	if got.Tail != logTailAll {
+		t.Errorf("L requested tail %d, want %d", got.Tail, logTailAll)
+	}
+	if got.Ref.Name != "api" || got.Container != "envoy" {
+		t.Errorf("L reloaded %s/%s, want the same pod and container", got.Ref.Name, got.Container)
+	}
+	if got.Session == firstSession {
+		t.Error("L reused the session id; late lines from the old stream would contaminate the new one")
+	}
+	if !f.logs.full {
+		t.Error("logs.full not set after L")
+	}
+	if f.logs.cap != fullLogCap {
+		t.Errorf("cap = %d after L, want %d", f.logs.cap, fullLogCap)
+	}
+}
+
+// Pressing L twice must not restart a stream that already has
+// everything.
+func TestLogsLoadAllIsIdempotent(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.width, m.height = 120, 24
+	calls := 0
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { calls++; return nil }
+
+	o, cmd := m.startLogs(cluster.DescribeRef{Kind: "Pod", Namespace: "default", Name: "api"}, "app")
+	if cmd != nil {
+		cmd()
+	}
+	full, cmd := o.(Model).handleLogsKey(key("L"))
+	if cmd != nil {
+		cmd()
+	}
+	again, cmd := full.(Model).handleLogsKey(key("L"))
+	if cmd != nil {
+		cmd()
+	}
+	if calls != 2 {
+		t.Errorf("OnLogsStart called %d times, want 2 (open + one L)", calls)
+	}
+	if !again.(Model).logs.full {
+		t.Error("second L cleared the full flag")
+	}
+}
+
+// The footer has to distinguish a window onto the tail from the whole
+// log — "1200 lines" reads as the complete story otherwise.
+func TestLogsFooterReportsScope(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.width, m.height = 120, 30
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { return nil }
+
+	o, _ := m.startLogs(cluster.DescribeRef{Kind: "Pod", Namespace: "default", Name: "api"}, "app")
+	tailed := o.(Model)
+	tailed.logs.lines = []string{"a", "b"}
+	out := tailed.renderLogs(120, 20)
+	if !strings.Contains(out, "L:all") {
+		t.Errorf("tailed viewer should offer L:all:\n%s", out)
+	}
+
+	full, _ := tailed.handleLogsKey(key("L"))
+	f := full.(Model)
+	f.logs.lines = []string{"a", "b"}
+	out = f.renderLogs(120, 20)
+	if !strings.Contains(out, "full log") {
+		t.Errorf("full viewer should say so:\n%s", out)
+	}
+	if strings.Contains(out, "L:all") {
+		t.Error("full viewer still advertises L:all")
 	}
 }
