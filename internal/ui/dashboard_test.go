@@ -130,7 +130,8 @@ func TestDashScrollClampsAtBothEnds(t *testing.T) {
 	if !ok || !lay.wide {
 		t.Fatalf("expected a wide layout for the fixture, got ok=%v wide=%v", ok, lay.wide)
 	}
-	max := m.dashScrollMax(dashPaneEvents, lay, r)
+	pw, ph := m.focusedPaneSize(lay, r)
+	max := m.dashScrollMax(dashPaneEvents, r, pw, ph)
 	if max <= 0 {
 		t.Fatalf("fixture should overflow the events pane; max = %d", max)
 	}
@@ -855,6 +856,407 @@ func TestRenderDashLogsSurvivesDegenerateHeight(t *testing.T) {
 			out := m.renderDashLogs(w, h) // must not panic
 			if got := lipgloss.Height(out); got < 1 {
 				t.Errorf("w=%d h=%d: rendered %d rows, want at least 1", w, h, got)
+			}
+		}
+	}
+}
+
+// openedDash goes through the real entry point, so focus and canvas
+// are whatever a user actually gets — dashSetup alone leaves focus at
+// the zero value, which is how the first version of these tests
+// managed to exercise the wrong pane.
+func openedDash(t *testing.T, w, h int, extra func(*Model)) Model {
+	t.Helper()
+	m := dashModel(w, h, extra)
+	m.dashboard = dashboardState{}
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { return nil }
+	out, _ := m.openDashboard(cluster.DescribeRef{
+		Version: "v1", Resource: "pods", Kind: "Pod",
+		Namespace: "default", Name: "dash-pod",
+	}, types.UID("dash-uid"))
+	o := out.(Model)
+	// After opening, not before: beginLogStreamTail resets the buffer,
+	// so lines seeded earlier are thrown away and the pane has nothing
+	// to scroll.
+	o.logs.lines = nil
+	for i := 0; i < 300; i++ {
+		o.logs.lines = append(o.logs.lines, fmt.Sprintf("logline-%03d", i))
+	}
+	return o
+}
+
+// j/k must scroll the log pane in *both* layouts. Stacked mode routed
+// them to the canvas offset instead, so once the column started
+// filling the canvas exactly there was nothing left to move and the
+// keys did nothing at all.
+func TestDashLogsScrollInBothLayouts(t *testing.T) {
+	for _, dim := range [][2]int{{160, 40}, {70, 40}, {70, 30}} {
+		w, h := dim[0], dim[1]
+		m := openedDash(t, w, h, nil)
+		if m.dashboard.focus != dashPaneLogs {
+			t.Fatalf("%dx%d: dashboard opened focused on pane %d, want logs", w, h, m.dashboard.focus)
+		}
+
+		var mm tea.Model = m
+		for i := 0; i < 5; i++ {
+			mm, _ = mm.(Model).handleDashboardKey(key("k"))
+		}
+		a := mm.(Model)
+		if a.logs.scroll != 5 {
+			t.Errorf("%dx%d: five k moved the log offset to %d, want 5", w, h, a.logs.scroll)
+		}
+		if a.logs.follow {
+			t.Errorf("%dx%d: scrolling back should pause follow", w, h)
+		}
+
+		// And it has to be visible, not just recorded in state.
+		_, canvas := a.dashCanvasSize()
+		before := m.renderDashboard(canvas, w)
+		after := a.renderDashboard(canvas, w)
+		if before == after {
+			t.Errorf("%dx%d: the rendered dashboard is unchanged after scrolling", w, h)
+		}
+	}
+}
+
+// The events pane never scrolled in the stacked layout either: it was
+// rendered at natural height and clipped from the top, so its own
+// offset was ignored.
+func TestDashEventsScrollWhenStacked(t *testing.T) {
+	// The pane caps at dashStackEventsMax rows, so it needs more
+	// groups than that before there is anything to scroll.
+	m := openedDash(t, 70, 40, func(m *Model) {
+		now := time.Now()
+		for i := 0; i < 30; i++ {
+			uid := types.UID("scroll-evt-" + string(rune('a'+i%26)) + string(rune('A'+i/26)))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Warning",
+				Reason: "Reason" + string(rune('a'+i%26)), Message: "m", Count: 1,
+				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
+				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+			}
+		}
+	})
+	m.dashboard.focus = dashPaneEvents
+
+	lay, sub, _ := m.dashLayoutNow()
+	if lay.wide {
+		t.Fatal("fixture should be the stacked layout")
+	}
+	pw, ph := m.focusedPaneSize(lay, sub)
+	if max := m.dashScrollMax(dashPaneEvents, sub, pw, ph); max <= 0 {
+		t.Fatalf("fixture should overflow the events pane; max = %d", max)
+	}
+
+	before := m.renderDashboard(30, 70)
+	var mm tea.Model = m
+	for i := 0; i < 3; i++ {
+		mm, _ = mm.(Model).handleDashboardKey(key("j"))
+	}
+	a := mm.(Model)
+	if a.dashboard.scroll[dashPaneEvents] != 3 {
+		t.Errorf("events offset = %d, want 3", a.dashboard.scroll[dashPaneEvents])
+	}
+	if a.renderDashboard(30, 70) == before {
+		t.Error("events pane looks identical after scrolling")
+	}
+}
+
+// On a window too short for the whole column, the focused pane has to
+// be brought into view — otherwise Tab moves a highlight below the
+// fold and j/k drives something invisible.
+func TestDashFocusedPaneRevealedWhenStackedOverflows(t *testing.T) {
+	m := openedDash(t, 70, 20, nil)
+	_, canvas := m.dashCanvasSize()
+
+	sub, _ := m.dashSubjectNow()
+	if lipgloss.Height(m.stackedBody(sub, 70, canvas)) <= canvas {
+		t.Fatal("fixture should overflow the canvas")
+	}
+	if !strings.Contains(m.renderDashboard(canvas, 70), "LOGS") {
+		t.Error("opened focused on logs, but the logs pane is off screen")
+	}
+
+	// Tab round the panes; each must be on screen once focused.
+	var mm tea.Model = m
+	for _, want := range []string{"CONTAINERS", "EVENTS", "LOGS"} {
+		mm, _ = mm.(Model).handleDashboardKey(key("tab"))
+		a := mm.(Model)
+		if !strings.Contains(a.renderDashboard(canvas, 70), want) {
+			t.Errorf("after Tab to %s, that pane is not visible", want)
+		}
+	}
+}
+
+// A window tall enough for everything shows every pane at once, and
+// tabbing round must not scroll anything away.
+func TestDashNoCanvasScrollWhenColumnFits(t *testing.T) {
+	m := openedDash(t, 70, 44, nil)
+	_, canvas := m.dashCanvasSize()
+
+	var mm tea.Model = m
+	for i := 0; i <= int(dashPaneCount); i++ {
+		out := mm.(Model).renderDashboard(canvas, 70)
+		for _, pane := range []string{"CONTAINERS", "EVENTS", "LOGS"} {
+			if !strings.Contains(out, pane) {
+				t.Fatalf("tab %d: %s scrolled off a window that fits the whole column", i, pane)
+			}
+		}
+		mm, _ = mm.(Model).handleDashboardKey(key("tab"))
+	}
+}
+
+// Resizing is its own path into the bug this PR fixes: the layout is
+// sized against the canvas, so dragging a terminal narrower can move
+// the focused pane below the fold. WindowSizeMsg only updated the
+// dimensions, so j/k went back to driving a pane the user can't see.
+func TestDashResizeRevealsFocusedPane(t *testing.T) {
+	cases := []struct {
+		name       string
+		from, to   [2]int
+		wantHidden bool // whether the pane would be off screen unrevealed
+	}{
+		{"wide to overflowing stacked", [2]int{160, 40}, [2]int{70, 20}, true},
+		{"tall stacked to short stacked", [2]int{70, 44}, [2]int{70, 20}, true},
+		{"short stacked to tall stacked", [2]int{70, 20}, [2]int{70, 44}, false},
+		{"stacked to wide", [2]int{70, 20}, [2]int{200, 50}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := openedDash(t, tc.from[0], tc.from[1], nil)
+			out, _ := m.Update(tea.WindowSizeMsg{Width: tc.to[0], Height: tc.to[1]})
+			r := out.(Model)
+
+			_, canvas := r.dashCanvasSize()
+			if !strings.Contains(r.renderDashboard(canvas, tc.to[0]), "LOGS") {
+				t.Error("focused pane off screen after resize")
+			}
+
+			// The whole render must still be exactly the canvas.
+			if got := lipgloss.Height(r.renderDashboard(canvas, tc.to[0])); got != canvas {
+				t.Errorf("rendered %d rows, want %d", got, canvas)
+			}
+		})
+	}
+}
+
+// Growing back into a window that fits must show the top of the column
+// again, not leave it scrolled where the smaller layout had it.
+func TestDashResizeShowsColumnTopWhenItFits(t *testing.T) {
+	m := openedDash(t, 70, 20, nil)
+	var mm tea.Model = m
+	for i := 0; i < 3; i++ {
+		mm, _ = mm.(Model).handleDashboardKey(key("tab"))
+	}
+	small := mm.(Model)
+	_, smallCanvas := small.dashCanvasSize()
+	if strings.Contains(small.renderDashboard(smallCanvas, 70), "CONTAINERS") {
+		t.Fatal("fixture should have scrolled the top pane away")
+	}
+
+	out, _ := small.Update(tea.WindowSizeMsg{Width: 70, Height: 60})
+	r := out.(Model)
+	_, canvas := r.dashCanvasSize()
+	if !strings.Contains(r.renderDashboard(canvas, 70), "CONTAINERS") {
+		t.Error("growing the window left the top of the column scrolled away")
+	}
+}
+
+// A resize while the dashboard is closed must not touch its state.
+func TestResizeIgnoresClosedDashboard(t *testing.T) {
+	m := dashModel(160, 40, nil)
+	m.dashboard = dashboardState{}
+	out, _ := m.Update(tea.WindowSizeMsg{Width: 70, Height: 20})
+	if r := out.(Model); r.dashboard.open {
+		t.Errorf("resize disturbed a closed dashboard: %+v", r.dashboard)
+	}
+}
+
+// Pane heights come from live cluster data, so the column reflows
+// while the dashboard is open: a burst of events grows that pane from
+// one row to eight and pushes a focused logs pane below the fold. With
+// the offset remembered rather than derived, nothing recomputed it —
+// no key was pressed and no resize happened — and j/k then scrolled a
+// pane the user could not see, with no way back except cycling focus.
+func TestDashFocusedPaneStaysVisibleAsPanesGrow(t *testing.T) {
+	m := openedDash(t, 70, 22, func(m *Model) {
+		// Start with a single event so the events pane is one row.
+		m.events = map[types.UID]eventRow{"seed": {
+			UID: "seed", Namespace: "default", Type: "Normal", Reason: "Started",
+			Message: "started", Count: 1, LastSeen: time.Now(),
+			InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+		}}
+	})
+	_, canvas := m.dashCanvasSize()
+	if !strings.Contains(m.renderDashboard(canvas, 70), "LOGS") {
+		t.Fatal("fixture should start with the logs pane visible")
+	}
+
+	// Events stream in, growing the pane above logs.
+	var mm tea.Model = m
+	for i := 1; i <= 12; i++ {
+		mm, _ = mm.(Model).Update(EvtEventMsg(cluster.EventEvent{
+			Kind: cluster.EvtAdded, Context: "alpha",
+			UID:       types.UID(fmt.Sprintf("grow-%02d", i)),
+			Namespace: "default", Type: "Warning",
+			Reason: fmt.Sprintf("Reason%02d", i), Message: "m", Count: 1,
+			LastSeen: time.Now(), InvolvedKind: "Pod",
+			InvolvedName: "dash-pod", InvolvedNs: "default",
+		}))
+	}
+	a := mm.(Model)
+
+	if !strings.Contains(a.renderDashboard(canvas, 70), "LOGS") {
+		t.Error("focused logs pane pushed off screen by incoming events")
+	}
+	// And it must still be the pane j/k drives.
+	if a.dashboard.focus != dashPaneLogs {
+		t.Errorf("focus drifted to pane %d", a.dashboard.focus)
+	}
+}
+
+// The same reflow through the pod informer rather than events.
+func TestDashFocusedPaneStaysVisibleAsContainersGrow(t *testing.T) {
+	m := openedDash(t, 70, 22, func(m *Model) {
+		r := m.pods["dash-uid"]
+		r.ContainerInfo = r.ContainerInfo[:1]
+		r.InitContainerInfo = nil
+		m.pods["dash-uid"] = r
+	})
+	_, canvas := m.dashCanvasSize()
+	if !strings.Contains(m.renderDashboard(canvas, 70), "LOGS") {
+		t.Fatal("fixture should start with the logs pane visible")
+	}
+
+	many := make([]cluster.ContainerInfo, 0, 8)
+	for i := 0; i < 8; i++ {
+		many = append(many, cluster.ContainerInfo{
+			Name: fmt.Sprintf("c%d", i), Image: "img:1", Ready: true,
+			State: cluster.ContainerReady,
+		})
+	}
+	out, _ := m.Update(PodEventMsg(cluster.PodEvent{
+		Kind: cluster.PodUpdated, Context: "alpha", UID: "dash-uid",
+		Namespace: "default", Name: "dash-pod", Phase: "Running",
+		ContainerInfo: many,
+	}))
+	if !strings.Contains(out.(Model).renderDashboard(canvas, 70), "LOGS") {
+		t.Error("focused logs pane pushed off screen by a pod update")
+	}
+}
+
+// The stacked render used to resolve its geometry three times — once
+// to measure the panes, once to draw them, once to place the canvas —
+// and each pass filters and sorts the cluster-wide event map. Informer
+// updates trigger redraws, so a busy cluster paid it per event.
+//
+// Kept as a benchmark rather than a threshold assertion: the number is
+// machine-dependent, but a regression to multiple passes shows up as a
+// stacked render several times the cost of the wide one, which does a
+// single pass.
+func benchDashModel(w, h, events int) Model {
+	m := dashModel(w, h, func(m *Model) {
+		now := time.Now()
+		m.events = map[types.UID]eventRow{}
+		for i := 0; i < events; i++ {
+			uid := types.UID(fmt.Sprintf("bench-e%05d", i))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Warning",
+				Reason: fmt.Sprintf("Reason%03d", i%200), Message: "message text",
+				Count: 1, LastSeen: now.Add(-time.Duration(i) * time.Second),
+				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+			}
+		}
+		for i := 0; i < 400; i++ {
+			uid := types.UID(fmt.Sprintf("bench-p%04d", i))
+			m.pods[uid] = podRow{
+				UID: uid, Namespace: "default",
+				Name:   fmt.Sprintf("payments-api-7f9c8-%04d", i),
+				Phase:  "Running",
+				Labels: map[string]string{"app": "payments"},
+			}
+		}
+	})
+	m.dashboard.focus = dashPaneLogs
+	return m
+}
+
+func BenchmarkDashboardRenderStacked(b *testing.B) {
+	m := benchDashModel(70, 30, 2000)
+	_, canvas := m.dashCanvasSize()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = m.renderDashboard(canvas, 70)
+	}
+}
+
+func BenchmarkDashboardRenderWide(b *testing.B) {
+	m := benchDashModel(200, 50, 2000)
+	_, canvas := m.dashCanvasSize()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = m.renderDashboard(canvas, 200)
+	}
+}
+
+// There are now two ways into the pane heights: the render path, which
+// measures content it has already produced, and the keypress path,
+// which renders to measure. They must agree, or the scroll bounds stop
+// matching what is drawn — the drift this whole area has been prone to.
+func TestStackedGeometryAgreesWithHeightResolver(t *testing.T) {
+	sizes := [][2]int{{70, 20}, {70, 30}, {70, 44}, {60, 26}, {80, 60}}
+	for _, view := range []View{ViewPods, ViewDeployments} {
+		for _, dim := range sizes {
+			w, h := dim[0], dim[1]
+			m := dashModel(w, h, nil)
+			m.view = view
+			if view == ViewDeployments {
+				m = dashModel(w, h, nil)
+				dashDeploySetup(nil)(&m)
+				m.view = ViewDeployments
+			}
+			sub, ok := m.dashSubjectNow()
+			if !ok {
+				t.Fatalf("view=%v %dx%d: no subject", view, w, h)
+			}
+			_, canvas := m.dashCanvasSize()
+
+			g := m.stackedLayout(sub, w, canvas)
+			sH, mH, eH, lH := m.stackedPaneHeights(sub, w, canvas)
+			if g.status != sH || g.main != mH || g.events != eH || g.logs != lH {
+				t.Errorf("view=%v %dx%d: render path got (%d,%d,%d,%d), keypress path (%d,%d,%d,%d)",
+					view, w, h, g.status, g.main, g.events, g.logs, sH, mH, eH, lH)
+			}
+		}
+	}
+}
+
+// Windowing pre-rendered content must produce exactly what asking the
+// pane renderer for that height produces — otherwise the single-pass
+// render silently draws something different from the old path.
+func TestSizeStackedPaneMatchesDirectRender(t *testing.T) {
+	m := dashModel(70, 30, func(m *Model) {
+		now := time.Now()
+		for i := 0; i < 30; i++ {
+			uid := types.UID(fmt.Sprintf("size-e%02d", i))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Warning",
+				Reason: fmt.Sprintf("R%02d", i), Message: "m", Count: 1,
+				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
+				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+			}
+		}
+	})
+	sub, _ := m.dashSubjectNow()
+	const inner = 68
+
+	for _, scroll := range []int{0, 3, 9} {
+		for _, h := range []int{1, 4, 8} {
+			natural := m.renderDashEventsFor(sub, inner, 0, 0)
+			got := sizeStackedPane(natural, inner, h, scroll)
+			want := m.renderDashEventsFor(sub, inner, h, scroll)
+			if got != want {
+				t.Errorf("scroll=%d h=%d: windowed content differs from a direct render", scroll, h)
 			}
 		}
 	}

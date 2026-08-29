@@ -39,10 +39,6 @@ type dashboardState struct {
 	// indicator behave exactly as they do in the full-screen viewer.
 	scroll [dashPaneCount]int
 
-	// canvas is the stacked layout's whole-body offset, used instead
-	// of the per-pane offsets when the panes are drawn in one column.
-	canvas int
-
 	// logRef is the pod actually being streamed. For a Pod target it
 	// equals the target; for a Deployment it's one chosen replica, so
 	// it has to be tracked separately.
@@ -104,7 +100,6 @@ func (m Model) openDashboard(ref cluster.DescribeRef, uid types.UID) (tea.Model,
 	m.dashboard.stack = append(m.dashboard.stack, t)
 	m.dashboard.focus = dashPaneLogs
 	m.dashboard.scroll = [dashPaneCount]int{}
-	m.dashboard.canvas = 0
 	m.dashboard.podCursor = 0
 	m.prepareLogTarget(t)
 	return m, m.startDashboardLogs()
@@ -208,7 +203,6 @@ func (m Model) popDashboard() (tea.Model, tea.Cmd) {
 	}
 	m.dashboard.stack = m.dashboard.stack[:len(m.dashboard.stack)-1]
 	m.dashboard.scroll = [dashPaneCount]int{}
-	m.dashboard.canvas = 0
 	t, _ := m.dashboard.target()
 	m.prepareLogTarget(t)
 	return m, m.startDashboardLogs()
@@ -310,10 +304,63 @@ func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// scrollDashboard moves the active scroll offset by delta, clamped to
-// the content. Which offset is "active" depends on the layout: the
-// stacked column scrolls as one canvas, the wide frame scrolls the
-// focused pane.
+// focusedPaneSize is the content width and height of the pane j/k is
+// driving, in whichever layout is active. Both layouts resolve their
+// geometry through here, so the scroll bounds and what is actually
+// drawn cannot disagree about how big a pane is.
+func (m Model) focusedPaneSize(lay dashLayout, sub dashSubject) (int, int) {
+	if lay.wide {
+		switch m.dashboard.focus {
+		case dashPaneMain:
+			return lay.left.w, lay.left.h
+		case dashPaneEvents:
+			return lay.right.w, lay.right.h
+		}
+		return lay.logs.w, lay.logs.h
+	}
+	cw, ch := m.dashCanvasSize()
+	inner := cw - 2
+	if inner < 1 {
+		inner = 1
+	}
+	_, mainH, eventsH, logsH := m.stackedPaneHeights(sub, cw, ch)
+	switch m.dashboard.focus {
+	case dashPaneMain:
+		return inner, mainH
+	case dashPaneEvents:
+		return inner, eventsH
+	}
+	return inner, logsH
+}
+
+// stackedCanvasOffset is the row the stacked column must start at for
+// the focused pane to be on screen.
+//
+// Derived per render rather than stored. The pane heights come from
+// live cluster data — a burst of events grows the events pane from one
+// row to eight — so any remembered offset goes stale the moment the
+// cluster changes, not just when the user presses something. It used
+// to be a field refreshed on open, Tab, pop and resize, and an event
+// arriving between those pushed the focused pane below the fold with
+// no way back except cycling focus.
+func (m Model) stackedCanvasOffset(g stackedGeom, h int) int {
+	body := g.body
+	if lipgloss.Height(body) <= h {
+		return 0
+	}
+	top := m.stackedPaneTop(m.dashboard.focus, g.status, g.main, g.events)
+
+	// Show the pane from its top edge. Aligning its bottom instead
+	// would jump the column further than the eye can follow when the
+	// pane is tall.
+	_, clamped := scrollWindow(body, top, h)
+	return clamped
+}
+
+// scrollDashboard moves the focused pane's scroll offset by delta,
+// clamped to that pane's content. Focus means the same thing in both
+// layouts: stacked mode used to route j/k at the whole canvas instead,
+// which left Tab moving a highlight that changed nothing.
 func (m *Model) scrollDashboard(delta int) {
 	lay, sub, ok := m.dashLayoutNow()
 	if !ok {
@@ -326,19 +373,15 @@ func (m *Model) scrollDashboard(delta int) {
 		m.movePodCursor(delta, len(sub.Pods))
 		return
 	}
-	if !lay.wide {
-		_, h := m.dashCanvasSize()
-		m.canvasScrollTo(m.dashboard.canvas+delta, sub, h)
-		return
-	}
+	pw, ph := m.focusedPaneSize(lay, sub)
 	// Logs share the viewer's offset: j/k move it and pause/resume
 	// follow, so a scrolled-back pane holds its position as new lines
 	// arrive instead of sliding with the tail.
 	if m.dashboard.focus == dashPaneLogs {
-		m.scrollLogsBy(-delta, lay.logs.h)
+		m.scrollLogsBy(-delta, ph)
 		return
 	}
-	max := m.dashScrollMax(m.dashboard.focus, lay, sub)
+	max := m.dashScrollMax(m.dashboard.focus, sub, pw, ph)
 	v := m.dashboard.scroll[m.dashboard.focus] + delta
 	if v < 0 {
 		v = 0
@@ -362,20 +405,12 @@ func (m *Model) jumpDashboard(top bool) {
 		}
 		return
 	}
-	if !lay.wide {
-		_, h := m.dashCanvasSize()
-		if top {
-			m.dashboard.canvas = 0
-		} else {
-			m.canvasScrollTo(1<<30, sub, h)
-		}
-		return
-	}
+	pw, ph := m.focusedPaneSize(lay, sub)
 	// For logs, offset counts from the tail: g is the oldest line we
 	// still hold (paused), G is back to following.
 	if m.dashboard.focus == dashPaneLogs {
 		if top {
-			m.logs.scroll = clampLogsScrollTo(len(m.logs.lines), len(m.logs.lines), lay.logs.h)
+			m.logs.scroll = clampLogsScrollTo(len(m.logs.lines), len(m.logs.lines), ph)
 			m.logs.follow = false
 		} else {
 			m.logs.scroll = 0
@@ -383,18 +418,13 @@ func (m *Model) jumpDashboard(top bool) {
 		}
 		return
 	}
-	max := m.dashScrollMax(m.dashboard.focus, lay, sub)
+	max := m.dashScrollMax(m.dashboard.focus, sub, pw, ph)
 	switch {
 	case top:
 		m.dashboard.scroll[m.dashboard.focus] = 0
 	default:
 		m.dashboard.scroll[m.dashboard.focus] = max
 	}
-}
-
-func (m *Model) canvasScrollTo(want int, sub dashSubject, h int) {
-	_, clamped := scrollWindow(m.stackedBody(sub, m.width, h), want, h)
-	m.dashboard.canvas = clamped
 }
 
 // movePodCursor steps the owned-pod selection, clamped to the list.
@@ -415,18 +445,15 @@ func (m *Model) movePodCursor(delta, n int) {
 
 // dashScrollMax is the largest useful offset for a pane: render its
 // content and count, so the bound can't drift from what's drawn.
-func (m Model) dashScrollMax(p dashboardPane, lay dashLayout, sub dashSubject) int {
+func (m Model) dashScrollMax(p dashboardPane, sub dashSubject, w, h int) int {
 	var content string
-	var h int
 	switch p {
 	case dashPaneMain:
 		// Natural height (h=0): asking for a huge height would make
 		// clampCanvas pad the content out to that many rows.
-		content = m.renderDashMain(sub, lay.left.w, 0)
-		h = lay.left.h
+		content = m.renderDashMain(sub, w, 0)
 	case dashPaneEvents:
-		content = m.renderDashEventsFor(sub, lay.right.w, 0, 0)
-		h = lay.right.h
+		content = m.renderDashEventsFor(sub, w, 0, 0)
 	case dashPaneLogs:
 		// Logs are bounded by clampLogsScrollTo against logsState, not
 		// by this pane's offset array.
@@ -471,7 +498,8 @@ func (m Model) renderDashboard(height, width int) string {
 	if lay.wide {
 		return m.renderDashboardWide(sub, t, lay, width, height)
 	}
-	body, _ := scrollWindow(m.stackedBody(sub, width, height), m.dashboard.canvas, height)
+	g := m.stackedLayout(sub, width, height)
+	body, _ := scrollWindow(g.body, m.stackedCanvasOffset(g, height), height)
 	return clampCanvas(body, width, height)
 }
 
@@ -520,59 +548,118 @@ func (m Model) renderDashboardWide(sub dashSubject, t dashboardTarget, lay dashL
 	return clampCanvas(canvas, w, h)
 }
 
-// stackedBody builds the single-column form at full natural height.
-// The caller windows it — scrolling one tall string keeps every pane
-// reachable on a terminal that can't show them all at once.
-func (m Model) stackedBody(sub dashSubject, w, h int) string {
-	th := m.Theme
-	t, _ := m.dashboard.target()
-	// lipgloss Width(w-2) plus the two border columns renders at w, so
-	// the usable content width is w-2.
+// stackedPaneHeights resolves each stacked pane's interior height.
+// Status and the two middle panes size to their content (bounded);
+// logs take whatever is left. Shared by the renderer and the scroll
+// logic so they can't disagree about how tall a pane is.
+func (m Model) stackedPaneHeights(sub dashSubject, w, h int) (status, main, events, logs int) {
+	inner := stackedInnerWidth(w)
+	return resolveStackedHeights(sub.statusHeight(),
+		lineCount(m.renderDashMain(sub, inner, 0)),
+		lineCount(m.renderDashEventsFor(sub, inner, 0, 0)), h)
+}
+
+// resolveStackedHeights is the one place pane heights are decided,
+// taking line counts rather than rendering anything. Keeping it pure
+// lets the render path measure content it has already produced instead
+// of producing it a second time.
+func resolveStackedHeights(statusH, mainLines, eventLines, h int) (status, main, events, logs int) {
+	status = statusH
+	main = dashStackPaneHeight(mainLines, dashStackContainersMax)
+	events = dashStackPaneHeight(eventLines, dashStackEventsMax)
+	// Each box spends two rows on its borders.
+	logs = h - (status + 2) - (main + 2) - (events + 2) - 2
+	if logs < dashStackLogMin {
+		logs = dashStackLogMin
+	}
+	return status, main, events, logs
+}
+
+func stackedInnerWidth(w int) int {
 	inner := w - 2
 	if inner < 1 {
 		inner = 1
 	}
+	return inner
+}
 
-	// Each pane is rendered at natural height first, then clamped to
-	// what it actually needs (bounded), so a container's continuation
-	// row or a short event list sizes its own box instead of being
-	// clipped by a guessed row count.
-	sized := func(content string, cap int) string {
-		h := dashStackPaneHeight(lineCount(content), cap)
-		return clampCanvas(content, inner, h)
+// sizeStackedPane windows already-rendered natural content down to a
+// pane's height. Equivalent to asking the pane renderer for that
+// height directly, without paying to build the content again.
+func sizeStackedPane(natural string, w, h, scroll int) string {
+	body, _ := scrollWindow(natural, scroll, h)
+	return clampCanvas(body, w, h)
+}
+
+// stackedPaneTop is the body row each stacked pane's box starts on,
+// used to scroll the canvas far enough to reveal it.
+func (m Model) stackedPaneTop(p dashboardPane, statusH, mainH, eventsH int) int {
+	switch p {
+	case dashPaneMain:
+		return statusH + 2
+	case dashPaneEvents:
+		return statusH + 2 + mainH + 2
+	case dashPaneLogs:
+		return statusH + 2 + mainH + 2 + eventsH + 2
+	}
+	return 0
+}
+
+// stackedGeom is one render's resolved stacked layout: the assembled
+// column plus each pane's interior height.
+type stackedGeom struct {
+	body                       string
+	status, main, events, logs int
+}
+
+// stackedLayout builds the single-column form and reports the geometry
+// it used.
+//
+// One pass on purpose. The variable panes are rendered once at natural
+// height, measured, then windowed down — previously they were rendered
+// to measure and rendered again to display, and the canvas offset
+// derived the whole thing a third time. Each of those passes filters
+// and sorts the cluster-wide event map, and informer updates trigger a
+// redraw, so a busy cluster paid it on every event.
+func (m Model) stackedLayout(sub dashSubject, w, h int) stackedGeom {
+	th := m.Theme
+	t, _ := m.dashboard.target()
+	inner := stackedInnerWidth(w)
+
+	naturalMain := m.renderDashMain(sub, inner, 0)
+	naturalEvents := m.renderDashEventsFor(sub, inner, 0, 0)
+
+	g := stackedGeom{}
+	g.status, g.main, g.events, g.logs = resolveStackedHeights(
+		sub.statusHeight(), lineCount(naturalMain), lineCount(naturalEvents), h)
+
+	// The owned-pod list windows around its cursor rather than a
+	// scroll offset, so that one can't be reproduced by trimming the
+	// natural render — but its expensive part (resolving and sorting
+	// the pods) already happened in dashSubjectNow.
+	sizedMain := sizeStackedPane(naturalMain, inner, g.main, m.dashboard.scroll[dashPaneMain])
+	if sub.isDeploy() {
+		sizedMain = m.renderDashMain(sub, inner, g.main)
 	}
 
-	// Status, main and events size to their content; logs then takes
-	// whatever is left. Fixing logs at a constant instead left a tall
-	// window with a short log pane and a band of dead space under it,
-	// which is the opposite of what a tall window is for.
-	parts := []string{
+	g.body = strings.Join([]string{
 		dashStackedBox(m.dashTitle(t),
-			m.renderDashStatus(sub, inner, sub.statusHeight()), w, false, th),
+			m.renderDashStatus(sub, inner, g.status), w, false, th),
 		dashStackedBox(m.paneLabel(sub.mainLabel(), dashPaneMain),
-			sized(m.renderDashMain(sub, inner, 0), dashStackContainersMax),
-			w, m.dashboard.focus == dashPaneMain, th),
+			sizedMain, w, m.dashboard.focus == dashPaneMain, th),
 		dashStackedBox(m.paneLabel("EVENTS", dashPaneEvents),
-			sized(m.renderDashEventsFor(sub, inner, 0, 0), dashStackEventsMax),
+			sizeStackedPane(naturalEvents, inner, g.events, m.dashboard.scroll[dashPaneEvents]),
 			w, m.dashboard.focus == dashPaneEvents, th),
-	}
+		dashStackedBox(m.logsPaneLabel(),
+			m.renderDashLogs(inner, g.logs),
+			w, m.dashboard.focus == dashPaneLogs, th),
+	}, "\n")
+	return g
+}
 
-	used := 0
-	for _, p := range parts {
-		used += lipgloss.Height(p)
-	}
-	// -2 for the log box's own border rows.
-	logsH := h - used - 2
-	if logsH < dashStackLogMin {
-		// Not enough room to fill: fall back to the minimum and let
-		// the canvas scroll, which is what short terminals already did.
-		logsH = dashStackLogMin
-	}
-
-	parts = append(parts, dashStackedBox(m.logsPaneLabel(),
-		m.renderDashLogs(inner, logsH),
-		w, m.dashboard.focus == dashPaneLogs, th))
-	return strings.Join(parts, "\n")
+// stackedBody is stackedLayout for callers that only want the column.
+func (m Model) stackedBody(sub dashSubject, w, h int) string {
+	return m.stackedLayout(sub, w, h).body
 }
 
 // dashStackLogMin is the floor for the stacked log pane. Above it the
