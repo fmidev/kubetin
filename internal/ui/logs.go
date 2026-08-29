@@ -781,12 +781,17 @@ func copySGR(b *strings.Builder, s string, i int) int {
 		}
 		return j + 1
 	case ']', 'P', 'X', '^', '_':
-		// OSC/DCS/SOS/PM/APC carry a payload up to BEL or ST.
+		// OSC/DCS/SOS/PM/APC carry a payload up to BEL or ST. ST has
+		// three spellings and a terminal honours all of them, so we
+		// have to as well — stopping only at `ESC \` would swallow
+		// the ordinary log text after a C1-terminated one.
 		for j := i + 2; j < len(s); j++ {
-			if s[j] == 0x07 {
+			switch {
+			case s[j] == 0x07 || s[j] == 0x9c:
 				return j + 1
-			}
-			if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+			case s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\':
+				return j + 2
+			case s[j] == 0xc2 && j+1 < len(s) && s[j+1] == 0x9c:
 				return j + 2
 			}
 		}

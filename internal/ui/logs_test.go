@@ -287,6 +287,11 @@ func TestSanitizeLogLine(t *testing.T) {
 		{"scroll region dropped", "a\x1b[1;10rb", "ab"},
 		{"osc title dropped", "a\x1b]0;pwn\x07b", "ab"},
 		{"osc st-terminated dropped", "a\x1b]0;pwn\x1b\\b", "ab"},
+		// ST has three spellings; a terminal honours all of them, so
+		// the text after one must survive rather than being eaten as
+		// part of the control string.
+		{"osc c1-st-terminated dropped", "a\x1b]0;pwn\x9crest", "arest"},
+		{"osc utf8-st-terminated dropped", "a\x1b]0;pwn\u009crest", "arest"},
 		{"charset switch dropped", "a\x1b(0b", "ab"},
 		{"carriage return dropped", "50%\r100%", "50%100%"},
 		{"backspace dropped", "ab\x08c", "abc"},
