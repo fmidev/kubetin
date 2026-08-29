@@ -1,12 +1,14 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
@@ -717,4 +719,143 @@ func sortedByName(pods []podRow) bool {
 		}
 	}
 	return true
+}
+
+// The stacked column used to be a fixed height regardless of the
+// terminal: at 60 rows it drew 32 and left 24 blank under a log pane
+// frozen at 10 lines. Logs now absorb the slack.
+func TestStackedLogsFillTallWindow(t *testing.T) {
+	for _, h := range []int{32, 40, 50, 60, 100} {
+		m := dashModel(70, h, func(m *Model) {
+			m.logs.lines = nil
+			for i := 0; i < 300; i++ {
+				m.logs.lines = append(m.logs.lines, "line")
+			}
+		})
+		_, canvas := m.dashCanvasSize()
+		sub, ok := m.dashSubjectNow()
+		if !ok {
+			t.Fatal("no subject")
+		}
+		if got := lipgloss.Height(m.stackedBody(sub, 70, canvas)); got != canvas {
+			t.Errorf("h=%d: stacked body is %d rows for a %d-row canvas (%+d)",
+				h, got, canvas, got-canvas)
+		}
+	}
+}
+
+// A taller window has to mean more log lines, not more blank space.
+func TestStackedLogsGrowWithHeight(t *testing.T) {
+	count := func(h int) int {
+		m := dashModel(70, h, func(m *Model) {
+			m.logs.lines = nil
+			for i := 0; i < 300; i++ {
+				m.logs.lines = append(m.logs.lines, fmt.Sprintf("logline-%03d", i))
+			}
+		})
+		return strings.Count(m.View(), "logline-")
+	}
+	short, tall := count(34), count(60)
+	if tall <= short {
+		t.Errorf("60-row window shows %d log lines, 34-row shows %d — taller must show more",
+			tall, short)
+	}
+}
+
+// Below the point where the column can fit, the canvas scrolls — the
+// behaviour short terminals always had. It must not panic or clip the
+// panes above logs.
+func TestStackedShortWindowStillScrolls(t *testing.T) {
+	for _, h := range []int{12, 16, 20, 26} {
+		m := dashModel(70, h, nil)
+		_, canvas := m.dashCanvasSize()
+		sub, ok := m.dashSubjectNow()
+		if !ok {
+			t.Fatal("no subject")
+		}
+		body := m.stackedBody(sub, 70, canvas)
+		if lipgloss.Height(body) < canvas {
+			t.Errorf("h=%d: body %d rows is under the %d-row canvas; it should fill or overflow",
+				h, lipgloss.Height(body), canvas)
+		}
+		if got := lipgloss.Height(m.renderDashboard(canvas, 70)); got != canvas {
+			t.Errorf("h=%d: rendered %d rows, want %d", h, got, canvas)
+		}
+	}
+}
+
+// The log pane never drops below its floor, however cramped the rest.
+// stackedLogRows returns how many *content* rows the logs box shows —
+// its interior, excluding the two border rows. Counting the borders as
+// content is how the first version of this test passed with the floor
+// regressed from 5 to 3.
+func stackedLogRows(t *testing.T, body string) int {
+	t.Helper()
+	idx := strings.Index(body, "LOGS")
+	if idx < 0 {
+		t.Fatal("no logs pane in the stacked body")
+	}
+	// Logs is the last box, so the slice runs: the top border row
+	// carrying the LOGS label, the interior, then the bottom border.
+	rows := strings.Split(body[idx:], "\n")
+	if len(rows) < 2 {
+		t.Fatalf("logs box is only %d rows; it has no interior", len(rows))
+	}
+	if last := rows[len(rows)-1]; !strings.Contains(last, "└") {
+		t.Fatalf("logs box has no bottom border; last row = %q", truncForErr(last))
+	}
+	return len(rows) - 2
+}
+
+// The pane never drops below its floor however cramped the panes above
+// it. The floor is what stops a busy events list squeezing logs down to
+// nothing on a short terminal.
+func TestStackedLogsRespectFloor(t *testing.T) {
+	m := dashModel(70, 14, func(m *Model) {
+		// Force the panes above logs to be as tall as they can be.
+		now := time.Now()
+		for i := 0; i < 40; i++ {
+			uid := types.UID("evt" + string(rune('a'+i%26)) + string(rune('A'+i/26)))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Warning",
+				Reason: "R" + string(rune('a'+i%26)), Message: "m", Count: 1,
+				LastSeen: now, InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+			}
+		}
+		// Unique lines so the structural count can be cross-checked
+		// against what is actually on screen.
+		m.logs.lines = nil
+		for i := 0; i < 200; i++ {
+			m.logs.lines = append(m.logs.lines, fmt.Sprintf("floorline-%03d", i))
+		}
+	})
+	_, canvas := m.dashCanvasSize()
+	sub, _ := m.dashSubjectNow()
+	body := m.stackedBody(sub, 70, canvas)
+
+	if got := stackedLogRows(t, body); got < dashStackLogMin {
+		t.Errorf("logs pane interior is %d rows, below the %d floor", got, dashStackLogMin)
+	}
+
+	// And independently: that many log lines are genuinely rendered,
+	// not just that many rows of padding.
+	if got := strings.Count(body, "floorline-"); got < dashStackLogMin {
+		t.Errorf("only %d log lines visible, want at least %d", got, dashStackLogMin)
+	}
+}
+
+// A pane renderer must not panic on a degenerate height. The stacked
+// layout's floor keeps this from arising today, but the renderer
+// shouldn't depend on its caller for that: `make([]string, 0, h)` with
+// a negative h takes down the whole TUI.
+func TestRenderDashLogsSurvivesDegenerateHeight(t *testing.T) {
+	m := dashModel(70, 30, nil)
+	for _, h := range []int{-10, -1, 0, 1} {
+		for _, w := range []int{-5, 0, 1, 40} {
+			out := m.renderDashLogs(w, h) // must not panic
+			if got := lipgloss.Height(out); got < 1 {
+				t.Errorf("w=%d h=%d: rendered %d rows, want at least 1", w, h, got)
+			}
+		}
+	}
 }

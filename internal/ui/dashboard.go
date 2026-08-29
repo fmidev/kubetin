@@ -393,7 +393,7 @@ func (m *Model) jumpDashboard(top bool) {
 }
 
 func (m *Model) canvasScrollTo(want int, sub dashSubject, h int) {
-	_, clamped := scrollWindow(m.stackedBody(sub, m.width), want, h)
+	_, clamped := scrollWindow(m.stackedBody(sub, m.width, h), want, h)
 	m.dashboard.canvas = clamped
 }
 
@@ -471,7 +471,7 @@ func (m Model) renderDashboard(height, width int) string {
 	if lay.wide {
 		return m.renderDashboardWide(sub, t, lay, width, height)
 	}
-	body, _ := scrollWindow(m.stackedBody(sub, width), m.dashboard.canvas, height)
+	body, _ := scrollWindow(m.stackedBody(sub, width, height), m.dashboard.canvas, height)
 	return clampCanvas(body, width, height)
 }
 
@@ -523,7 +523,7 @@ func (m Model) renderDashboardWide(sub dashSubject, t dashboardTarget, lay dashL
 // stackedBody builds the single-column form at full natural height.
 // The caller windows it — scrolling one tall string keeps every pane
 // reachable on a terminal that can't show them all at once.
-func (m Model) stackedBody(sub dashSubject, w int) string {
+func (m Model) stackedBody(sub dashSubject, w, h int) string {
 	th := m.Theme
 	t, _ := m.dashboard.target()
 	// lipgloss Width(w-2) plus the two border columns renders at w, so
@@ -542,6 +542,10 @@ func (m Model) stackedBody(sub dashSubject, w int) string {
 		return clampCanvas(content, inner, h)
 	}
 
+	// Status, main and events size to their content; logs then takes
+	// whatever is left. Fixing logs at a constant instead left a tall
+	// window with a short log pane and a band of dead space under it,
+	// which is the opposite of what a tall window is for.
 	parts := []string{
 		dashStackedBox(m.dashTitle(t),
 			m.renderDashStatus(sub, inner, sub.statusHeight()), w, false, th),
@@ -551,19 +555,37 @@ func (m Model) stackedBody(sub dashSubject, w int) string {
 		dashStackedBox(m.paneLabel("EVENTS", dashPaneEvents),
 			sized(m.renderDashEventsFor(sub, inner, 0, 0), dashStackEventsMax),
 			w, m.dashboard.focus == dashPaneEvents, th),
-		dashStackedBox(m.logsPaneLabel(),
-			m.renderDashLogs(inner, dashStackLogHeight),
-			w, m.dashboard.focus == dashPaneLogs, th),
 	}
+
+	used := 0
+	for _, p := range parts {
+		used += lipgloss.Height(p)
+	}
+	// -2 for the log box's own border rows.
+	logsH := h - used - 2
+	if logsH < dashStackLogMin {
+		// Not enough room to fill: fall back to the minimum and let
+		// the canvas scroll, which is what short terminals already did.
+		logsH = dashStackLogMin
+	}
+
+	parts = append(parts, dashStackedBox(m.logsPaneLabel(),
+		m.renderDashLogs(inner, logsH),
+		w, m.dashboard.focus == dashPaneLogs, th))
 	return strings.Join(parts, "\n")
 }
 
-// dashStackLogHeight is how many log rows the stacked layout shows.
-// Fixed rather than proportional: the column is scrolled anyway, and a
-// log pane that grows with the buffer would push everything else out
-// of reach.
+// dashStackLogMin is the floor for the stacked log pane. Above it the
+// pane grows to fill the window exactly; below it the body overflows
+// and the canvas scrolls.
+//
+// Deliberately small. A larger floor overshoots whenever the leftover
+// space is between the floor and zero — the pane then pushes its own
+// bottom border off the canvas and forces a scroll on a window that
+// was nearly tall enough. Five rows is thin but readable, and it means
+// the column fits exactly far more often than it scrolls.
 const (
-	dashStackLogHeight     = 10
+	dashStackLogMin        = 5
 	dashStackContainersMax = 8
 	dashStackEventsMax     = 8
 )
