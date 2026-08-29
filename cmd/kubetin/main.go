@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -80,6 +81,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "kubetin: %v\n", err)
 		os.Exit(1)
 	}
+	// DiscoverTrusted returns an empty Discovered rather than an error
+	// when the trusted files parse but define no contexts. Catch that
+	// here, while stderr is still real — every path downstream assumes
+	// at least one context exists.
+	if len(d.Contexts) == 0 {
+		fmt.Fprintf(os.Stderr, "kubetin: no contexts defined in %d trusted kubeconfig file(s)\n", len(d.Files))
+		os.Exit(1)
+	}
 
 	// In TUI mode, replace fd 2 with /dev/null so exec credential
 	// plugins (gke-gcloud-auth-plugin, aws-iam-auth, kubelogin) — which
@@ -143,8 +152,20 @@ func openDebugLog() (*os.File, error) {
 // coordinator goroutine owns the active watcher so focus switches can
 // cancel and replace it without race conditions.
 func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, contexts []string, want string, noWatch, hideSidebar bool, logTail int, restoreStderr func()) {
-	selected, err := pickWatchContext(ctx, store, want, contexts)
-	if err != nil {
+	selected, err := pickWatchContext(ctx, store, want, contexts, watchPickTimeout)
+	switch {
+	case errors.Is(err, errNoHealthyCluster):
+		// A fleet that is entirely unreachable is exactly when the user
+		// wants the monitor open, so this opens on the first context and
+		// lets the sidebar report why each cluster is red.
+		klog.Warningf("startup: %v; opening on %q", err, contexts[0])
+		selected = contexts[0]
+	case err != nil:
+		// A bad -watch name or a cancelled startup stays fatal, and must
+		// restore fd 2 before printing — otherwise the message goes to
+		// the /dev/null we swapped in for the credential plugins and
+		// kubetin looks like it exited for no reason.
+		restoreStderr()
 		fmt.Fprintf(os.Stderr, "kubetin: %v\n", err)
 		os.Exit(1)
 	}
@@ -897,7 +918,7 @@ func runHeadless(ctx context.Context, store *model.Store, sup *cluster.Superviso
 	if !noWatch {
 		go func() {
 			defer close(watchDone)
-			selected, err := pickWatchContext(ctx, store, want, contexts)
+			selected, err := pickWatchContext(ctx, store, want, contexts, watchPickTimeout)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "kubetin: -watch: %v\n", err)
 				return
@@ -937,7 +958,35 @@ func runHeadless(ctx context.Context, store *model.Store, sup *cluster.Superviso
 	}
 }
 
-func pickWatchContext(ctx context.Context, store *model.Store, want string, contexts []string) (string, error) {
+// errNoHealthyCluster reports that the probe window closed without any
+// cluster coming up healthy, and is the one failure runTUI recovers
+// from. Callers test it with errors.Is rather than re-deriving the
+// cause from `want` and ctx.Err(), which cannot distinguish a probe
+// timeout from a cancelled startup.
+var errNoHealthyCluster = errors.New("no healthy cluster appeared")
+
+// watchPickTimeout is how long we wait for a probe to report a healthy
+// cluster before opening on the first context regardless.
+//
+// Sized to one probe round plus slack, because a second round can never
+// land inside it: runOne starts its interval ticker only after the
+// initial probe returns, so on a failing fleet the next attempt is at
+// (first probe + probe interval) — well past any sane deadline. And one
+// round is bounded: probeOnce runs all four of its API calls under a
+// single ProbeTimeout budget and commits Reach only after the last one.
+//
+// So waiting longer than this cannot turn up a healthy cluster, it just
+// holds a blank terminal. This was 30s, which meant ~25s of dead wait
+// whenever the fleet was down — the symptom that made kubetin look
+// hung before the fallback below existed.
+var watchPickTimeout = cluster.ProbeTimeout + 3*time.Second
+
+// pickWatchContext chooses the context to open on. An explicit -watch
+// wins outright; otherwise we give the probes `timeout` to report a
+// healthy cluster so we land on one that works. Running out of time is
+// only fatal for the headless caller — runTUI falls back to the first
+// context and starts anyway.
+func pickWatchContext(ctx context.Context, store *model.Store, want string, contexts []string, timeout time.Duration) (string, error) {
 	if want != "" {
 		for _, c := range contexts {
 			if c == want {
@@ -946,21 +995,42 @@ func pickWatchContext(ctx context.Context, store *model.Store, want string, cont
 		}
 		return "", fmt.Errorf("context %q not found in kubeconfig", want)
 	}
-	deadline := time.NewTimer(30 * time.Second)
+	firstHealthy := func() (string, bool) {
+		for _, c := range contexts {
+			if st, ok := store.Get(c); ok && st.Reach == model.ReachHealthy {
+				return c, true
+			}
+		}
+		return "", false
+	}
+
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		for _, c := range contexts {
-			if st, ok := store.Get(c); ok && st.Reach == model.ReachHealthy {
-				return c, nil
-			}
+		if c, ok := firstHealthy(); ok {
+			return c, nil
 		}
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-deadline.C:
-			return "", fmt.Errorf("no healthy cluster appeared within 30s; pass -watch <ctx>")
+			// Ctrl-C and the deadline can be ready in the same instant,
+			// and select picks a ready case at random. Cancellation wins:
+			// classifying it as a recoverable timeout would open a UI the
+			// user just asked to abort.
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			// A probe can also land in the gap between the last scan and
+			// this timer firing — the scan only runs every 500ms. Look
+			// once more before writing the fleet off, or we open on
+			// contexts[0] with a healthy cluster sitting in the store.
+			if c, ok := firstHealthy(); ok {
+				return c, nil
+			}
+			return "", fmt.Errorf("%w within %s; pass -watch <ctx>", errNoHealthyCluster, timeout)
 		case <-tick.C:
 		}
 	}
