@@ -1004,3 +1004,70 @@ func TestDashNoCanvasScrollWhenColumnFits(t *testing.T) {
 		t.Errorf("canvas = %d after tabbing round, want 0", got)
 	}
 }
+
+// Resizing is its own path into the bug this PR fixes: the layout is
+// sized against the canvas, so dragging a terminal narrower can move
+// the focused pane below the fold. WindowSizeMsg only updated the
+// dimensions, so j/k went back to driving a pane the user can't see.
+func TestDashResizeRevealsFocusedPane(t *testing.T) {
+	cases := []struct {
+		name       string
+		from, to   [2]int
+		wantHidden bool // whether the pane would be off screen unrevealed
+	}{
+		{"wide to overflowing stacked", [2]int{160, 40}, [2]int{70, 20}, true},
+		{"tall stacked to short stacked", [2]int{70, 44}, [2]int{70, 20}, true},
+		{"short stacked to tall stacked", [2]int{70, 20}, [2]int{70, 44}, false},
+		{"stacked to wide", [2]int{70, 20}, [2]int{200, 50}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := openedDash(t, tc.from[0], tc.from[1], nil)
+			out, _ := m.Update(tea.WindowSizeMsg{Width: tc.to[0], Height: tc.to[1]})
+			r := out.(Model)
+
+			_, canvas := r.dashCanvasSize()
+			if !strings.Contains(r.renderDashboard(canvas, tc.to[0]), "LOGS") {
+				t.Errorf("focused pane off screen after resize (canvas=%d)", r.dashboard.canvas)
+			}
+
+			// The whole render must still be exactly the canvas.
+			if got := lipgloss.Height(r.renderDashboard(canvas, tc.to[0])); got != canvas {
+				t.Errorf("rendered %d rows, want %d", got, canvas)
+			}
+		})
+	}
+}
+
+// Growing back to a window that fits the column must clear the offset
+// rather than leave the view scrolled past the top.
+func TestDashResizeClearsStaleCanvasOffset(t *testing.T) {
+	m := openedDash(t, 70, 20, nil)
+	var mm tea.Model = m
+	for i := 0; i < 3; i++ {
+		mm, _ = mm.(Model).handleDashboardKey(key("tab"))
+	}
+	if mm.(Model).dashboard.canvas == 0 {
+		t.Fatal("fixture should have scrolled the canvas")
+	}
+
+	out, _ := mm.(Model).Update(tea.WindowSizeMsg{Width: 70, Height: 60})
+	r := out.(Model)
+	if r.dashboard.canvas != 0 {
+		t.Errorf("canvas = %d after growing to a window that fits; want 0", r.dashboard.canvas)
+	}
+	_, canvas := r.dashCanvasSize()
+	if !strings.Contains(r.renderDashboard(canvas, 70), "CONTAINERS") {
+		t.Error("stale offset left the top of the column scrolled away")
+	}
+}
+
+// A resize while the dashboard is closed must not touch its state.
+func TestResizeIgnoresClosedDashboard(t *testing.T) {
+	m := dashModel(160, 40, nil)
+	m.dashboard = dashboardState{}
+	out, _ := m.Update(tea.WindowSizeMsg{Width: 70, Height: 20})
+	if r := out.(Model); r.dashboard.open || r.dashboard.canvas != 0 {
+		t.Errorf("resize disturbed a closed dashboard: %+v", r.dashboard)
+	}
+}

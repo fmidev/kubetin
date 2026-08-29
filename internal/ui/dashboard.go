@@ -317,16 +317,10 @@ func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// scrollDashboard moves the active scroll offset by delta, clamped to
-// the content. Which offset is "active" depends on the layout: the
-// stacked column scrolls as one canvas, the wide frame scrolls the
-// focused pane.
 // focusedPaneSize is the content width and height of the pane j/k is
-// driving, in whichever layout is active. Stacked mode used to route
-// j/k to the canvas offset instead, which meant Tab moved a highlight
-// that changed nothing — and once the column started filling the
-// canvas exactly there was no canvas scroll left either, so the panes
-// simply stopped scrolling.
+// driving, in whichever layout is active. Both layouts resolve their
+// geometry through here, so the scroll bounds and what is actually
+// drawn cannot disagree about how big a pane is.
 func (m Model) focusedPaneSize(lay dashLayout, sub dashSubject) (int, int) {
 	if lay.wide {
 		switch m.dashboard.focus {
@@ -380,6 +374,10 @@ func (m *Model) revealFocusedPane(sub dashSubject) {
 	m.dashboard.canvas = clamped
 }
 
+// scrollDashboard moves the focused pane's scroll offset by delta,
+// clamped to that pane's content. Focus means the same thing in both
+// layouts: stacked mode used to route j/k at the whole canvas instead,
+// which left Tab moving a highlight that changed nothing.
 func (m *Model) scrollDashboard(delta int) {
 	lay, sub, ok := m.dashLayoutNow()
 	if !ok {

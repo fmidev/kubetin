@@ -297,6 +297,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		// The dashboard's stacked column is sized against the canvas,
+		// so a resize can move the focused pane below the fold or
+		// leave a canvas offset that pointed at a different layout.
+		// Re-run the reveal, which also zeroes the offset once the
+		// column fits again.
+		if m.dashboard.open {
+			m.revealFocused()
+		}
 		return m, nil
 
 	case tea.KeyMsg:
