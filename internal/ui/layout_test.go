@@ -274,7 +274,7 @@ func TestViewFitsCanvas(t *testing.T) {
 		{"dashboard/very-tall-narrow", 60, 80, ViewPods, dashSetup(nil)},
 		{"dashboard/tall-narrow-deploy", 70, 50, ViewDeployments, dashDeploySetup(nil)},
 		{"dashboard/stacked-scrolled", 80, 24, ViewPods, dashSetup(func(m *Model) {
-			m.dashboard.canvas = 7
+			m.dashboard.focus = dashPaneLogs
 		})},
 		{"dashboard/target-gone", 200, 50, ViewPods, dashSetup(func(m *Model) {
 			m.pods = map[types.UID]podRow{}

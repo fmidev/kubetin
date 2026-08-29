@@ -983,25 +983,26 @@ func TestDashFocusedPaneRevealedWhenStackedOverflows(t *testing.T) {
 		mm, _ = mm.(Model).handleDashboardKey(key("tab"))
 		a := mm.(Model)
 		if !strings.Contains(a.renderDashboard(canvas, 70), want) {
-			t.Errorf("after Tab to %s, that pane is not visible (canvas=%d)",
-				want, a.dashboard.canvas)
+			t.Errorf("after Tab to %s, that pane is not visible", want)
 		}
 	}
 }
 
-// A window tall enough for everything must not scroll the canvas at
-// all — there is nothing below the fold to reveal.
+// A window tall enough for everything shows every pane at once, and
+// tabbing round must not scroll anything away.
 func TestDashNoCanvasScrollWhenColumnFits(t *testing.T) {
 	m := openedDash(t, 70, 44, nil)
-	if m.dashboard.canvas != 0 {
-		t.Errorf("canvas scrolled to %d on a window that fits the whole column", m.dashboard.canvas)
-	}
+	_, canvas := m.dashCanvasSize()
+
 	var mm tea.Model = m
-	for i := 0; i < 4; i++ {
+	for i := 0; i <= int(dashPaneCount); i++ {
+		out := mm.(Model).renderDashboard(canvas, 70)
+		for _, pane := range []string{"CONTAINERS", "EVENTS", "LOGS"} {
+			if !strings.Contains(out, pane) {
+				t.Fatalf("tab %d: %s scrolled off a window that fits the whole column", i, pane)
+			}
+		}
 		mm, _ = mm.(Model).handleDashboardKey(key("tab"))
-	}
-	if got := mm.(Model).dashboard.canvas; got != 0 {
-		t.Errorf("canvas = %d after tabbing round, want 0", got)
 	}
 }
 
@@ -1028,7 +1029,7 @@ func TestDashResizeRevealsFocusedPane(t *testing.T) {
 
 			_, canvas := r.dashCanvasSize()
 			if !strings.Contains(r.renderDashboard(canvas, tc.to[0]), "LOGS") {
-				t.Errorf("focused pane off screen after resize (canvas=%d)", r.dashboard.canvas)
+				t.Error("focused pane off screen after resize")
 			}
 
 			// The whole render must still be exactly the canvas.
@@ -1039,26 +1040,25 @@ func TestDashResizeRevealsFocusedPane(t *testing.T) {
 	}
 }
 
-// Growing back to a window that fits the column must clear the offset
-// rather than leave the view scrolled past the top.
-func TestDashResizeClearsStaleCanvasOffset(t *testing.T) {
+// Growing back into a window that fits must show the top of the column
+// again, not leave it scrolled where the smaller layout had it.
+func TestDashResizeShowsColumnTopWhenItFits(t *testing.T) {
 	m := openedDash(t, 70, 20, nil)
 	var mm tea.Model = m
 	for i := 0; i < 3; i++ {
 		mm, _ = mm.(Model).handleDashboardKey(key("tab"))
 	}
-	if mm.(Model).dashboard.canvas == 0 {
-		t.Fatal("fixture should have scrolled the canvas")
+	small := mm.(Model)
+	_, smallCanvas := small.dashCanvasSize()
+	if strings.Contains(small.renderDashboard(smallCanvas, 70), "CONTAINERS") {
+		t.Fatal("fixture should have scrolled the top pane away")
 	}
 
-	out, _ := mm.(Model).Update(tea.WindowSizeMsg{Width: 70, Height: 60})
+	out, _ := small.Update(tea.WindowSizeMsg{Width: 70, Height: 60})
 	r := out.(Model)
-	if r.dashboard.canvas != 0 {
-		t.Errorf("canvas = %d after growing to a window that fits; want 0", r.dashboard.canvas)
-	}
 	_, canvas := r.dashCanvasSize()
 	if !strings.Contains(r.renderDashboard(canvas, 70), "CONTAINERS") {
-		t.Error("stale offset left the top of the column scrolled away")
+		t.Error("growing the window left the top of the column scrolled away")
 	}
 }
 
@@ -1067,7 +1067,80 @@ func TestResizeIgnoresClosedDashboard(t *testing.T) {
 	m := dashModel(160, 40, nil)
 	m.dashboard = dashboardState{}
 	out, _ := m.Update(tea.WindowSizeMsg{Width: 70, Height: 20})
-	if r := out.(Model); r.dashboard.open || r.dashboard.canvas != 0 {
+	if r := out.(Model); r.dashboard.open {
 		t.Errorf("resize disturbed a closed dashboard: %+v", r.dashboard)
+	}
+}
+
+// Pane heights come from live cluster data, so the column reflows
+// while the dashboard is open: a burst of events grows that pane from
+// one row to eight and pushes a focused logs pane below the fold. With
+// the offset remembered rather than derived, nothing recomputed it —
+// no key was pressed and no resize happened — and j/k then scrolled a
+// pane the user could not see, with no way back except cycling focus.
+func TestDashFocusedPaneStaysVisibleAsPanesGrow(t *testing.T) {
+	m := openedDash(t, 70, 22, func(m *Model) {
+		// Start with a single event so the events pane is one row.
+		m.events = map[types.UID]eventRow{"seed": {
+			UID: "seed", Namespace: "default", Type: "Normal", Reason: "Started",
+			Message: "started", Count: 1, LastSeen: time.Now(),
+			InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+		}}
+	})
+	_, canvas := m.dashCanvasSize()
+	if !strings.Contains(m.renderDashboard(canvas, 70), "LOGS") {
+		t.Fatal("fixture should start with the logs pane visible")
+	}
+
+	// Events stream in, growing the pane above logs.
+	var mm tea.Model = m
+	for i := 1; i <= 12; i++ {
+		mm, _ = mm.(Model).Update(EvtEventMsg(cluster.EventEvent{
+			Kind: cluster.EvtAdded, Context: "alpha",
+			UID:       types.UID(fmt.Sprintf("grow-%02d", i)),
+			Namespace: "default", Type: "Warning",
+			Reason: fmt.Sprintf("Reason%02d", i), Message: "m", Count: 1,
+			LastSeen: time.Now(), InvolvedKind: "Pod",
+			InvolvedName: "dash-pod", InvolvedNs: "default",
+		}))
+	}
+	a := mm.(Model)
+
+	if !strings.Contains(a.renderDashboard(canvas, 70), "LOGS") {
+		t.Error("focused logs pane pushed off screen by incoming events")
+	}
+	// And it must still be the pane j/k drives.
+	if a.dashboard.focus != dashPaneLogs {
+		t.Errorf("focus drifted to pane %d", a.dashboard.focus)
+	}
+}
+
+// The same reflow through the pod informer rather than events.
+func TestDashFocusedPaneStaysVisibleAsContainersGrow(t *testing.T) {
+	m := openedDash(t, 70, 22, func(m *Model) {
+		r := m.pods["dash-uid"]
+		r.ContainerInfo = r.ContainerInfo[:1]
+		r.InitContainerInfo = nil
+		m.pods["dash-uid"] = r
+	})
+	_, canvas := m.dashCanvasSize()
+	if !strings.Contains(m.renderDashboard(canvas, 70), "LOGS") {
+		t.Fatal("fixture should start with the logs pane visible")
+	}
+
+	many := make([]cluster.ContainerInfo, 0, 8)
+	for i := 0; i < 8; i++ {
+		many = append(many, cluster.ContainerInfo{
+			Name: fmt.Sprintf("c%d", i), Image: "img:1", Ready: true,
+			State: cluster.ContainerReady,
+		})
+	}
+	out, _ := m.Update(PodEventMsg(cluster.PodEvent{
+		Kind: cluster.PodUpdated, Context: "alpha", UID: "dash-uid",
+		Namespace: "default", Name: "dash-pod", Phase: "Running",
+		ContainerInfo: many,
+	}))
+	if !strings.Contains(out.(Model).renderDashboard(canvas, 70), "LOGS") {
+		t.Error("focused logs pane pushed off screen by a pod update")
 	}
 }

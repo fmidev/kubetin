@@ -39,10 +39,6 @@ type dashboardState struct {
 	// indicator behave exactly as they do in the full-screen viewer.
 	scroll [dashPaneCount]int
 
-	// canvas is the stacked layout's whole-body offset, used instead
-	// of the per-pane offsets when the panes are drawn in one column.
-	canvas int
-
 	// logRef is the pod actually being streamed. For a Pod target it
 	// equals the target; for a Deployment it's one chosen replica, so
 	// it has to be tracked separately.
@@ -104,13 +100,8 @@ func (m Model) openDashboard(ref cluster.DescribeRef, uid types.UID) (tea.Model,
 	m.dashboard.stack = append(m.dashboard.stack, t)
 	m.dashboard.focus = dashPaneLogs
 	m.dashboard.scroll = [dashPaneCount]int{}
-	m.dashboard.canvas = 0
 	m.dashboard.podCursor = 0
 	m.prepareLogTarget(t)
-	// Focus opens on logs; on a short window that pane sits below the
-	// fold, so scroll to it rather than starting on a view where j/k
-	// drives something off screen.
-	m.revealFocused()
 	return m, m.startDashboardLogs()
 }
 
@@ -212,10 +203,8 @@ func (m Model) popDashboard() (tea.Model, tea.Cmd) {
 	}
 	m.dashboard.stack = m.dashboard.stack[:len(m.dashboard.stack)-1]
 	m.dashboard.scroll = [dashPaneCount]int{}
-	m.dashboard.canvas = 0
 	t, _ := m.dashboard.target()
 	m.prepareLogTarget(t)
-	m.revealFocused()
 	return m, m.startDashboardLogs()
 }
 
@@ -280,10 +269,8 @@ func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.popDashboard()
 	case "tab":
 		m.dashboard.focus = (m.dashboard.focus + 1) % dashPaneCount
-		m.revealFocused()
 	case "shift+tab":
 		m.dashboard.focus = (m.dashboard.focus + dashPaneCount - 1) % dashPaneCount
-		m.revealFocused()
 	case "j", "down":
 		m.scrollDashboard(+1)
 	case "k", "up":
@@ -346,32 +333,33 @@ func (m Model) focusedPaneSize(lay dashLayout, sub dashSubject) (int, int) {
 	return inner, logsH
 }
 
-// revealFocusedPane scrolls the stacked canvas far enough to show the
-// focused pane. Only bites when the column overflows — a short window
-// where Tab would otherwise move focus to a pane below the fold.
-func (m *Model) revealFocusedPane(sub dashSubject) {
-	cw, ch := m.dashCanvasSize()
-	body := m.stackedBody(sub, cw, ch)
-	total := lipgloss.Height(body)
-	if total <= ch {
-		m.dashboard.canvas = 0
-		return
+// stackedCanvasOffset is the row the stacked column must start at for
+// the focused pane to be on screen.
+//
+// Derived per render rather than stored. The pane heights come from
+// live cluster data — a burst of events grows the events pane from one
+// row to eight — so any remembered offset goes stale the moment the
+// cluster changes, not just when the user presses something. It used
+// to be a field refreshed on open, Tab, pop and resize, and an event
+// arriving between those pushed the focused pane below the fold with
+// no way back except cycling focus.
+func (m Model) stackedCanvasOffset(body string, h int) int {
+	if lipgloss.Height(body) <= h {
+		return 0
 	}
+	sub, ok := m.dashSubjectNow()
+	if !ok {
+		return 0
+	}
+	cw, ch := m.dashCanvasSize()
 	statusH, mainH, eventsH, _ := m.stackedPaneHeights(sub, cw, ch)
 	top := m.stackedPaneTop(m.dashboard.focus, statusH, mainH, eventsH)
 
-	want := m.dashboard.canvas
-	if top < want {
-		want = top
-	}
-	// Bring at least the pane's first few rows into view rather than
-	// aligning its bottom edge, which would jump the column further
-	// than the eye can follow.
-	if bottom := top + dashStackLogMin; bottom > want+ch {
-		want = bottom - ch
-	}
-	_, clamped := scrollWindow(body, want, ch)
-	m.dashboard.canvas = clamped
+	// Show the pane from its top edge. Aligning its bottom instead
+	// would jump the column further than the eye can follow when the
+	// pane is tall.
+	_, clamped := scrollWindow(body, top, h)
+	return clamped
 }
 
 // scrollDashboard moves the focused pane's scroll offset by delta,
@@ -442,16 +430,6 @@ func (m *Model) jumpDashboard(top bool) {
 	default:
 		m.dashboard.scroll[m.dashboard.focus] = max
 	}
-}
-
-// revealFocused scrolls the stacked canvas to show the focused pane.
-// A no-op in the wide layout, where every pane is on screen already.
-func (m *Model) revealFocused() {
-	lay, sub, ok := m.dashLayoutNow()
-	if !ok || lay.wide {
-		return
-	}
-	m.revealFocusedPane(sub)
 }
 
 // movePodCursor steps the owned-pod selection, clamped to the list.
@@ -525,7 +503,8 @@ func (m Model) renderDashboard(height, width int) string {
 	if lay.wide {
 		return m.renderDashboardWide(sub, t, lay, width, height)
 	}
-	body, _ := scrollWindow(m.stackedBody(sub, width, height), m.dashboard.canvas, height)
+	full := m.stackedBody(sub, width, height)
+	body, _ := scrollWindow(full, m.stackedCanvasOffset(full, height), height)
 	return clampCanvas(body, width, height)
 }
 
