@@ -738,13 +738,22 @@ func copySGR(b *strings.Builder, s string, i int) int {
 		// CSI: parameter and intermediate bytes (0x20–0x3f) followed
 		// by one final byte (0x40–0x7e).
 		j := i + 2
+		sgr := true
 		for j < len(s) && s[j] >= 0x20 && s[j] <= 0x3f {
+			// A final 'm' alone doesn't make it a colour: SGR takes
+			// digits, ';' and ':' (true-colour subparameters) and
+			// nothing else. `CSI > 4;2 m` sets xterm's modifyOtherKeys
+			// — a terminal mode that changes what keys the app sees,
+			// which no reset undoes and which outlives the viewer.
+			if (s[j] < '0' || s[j] > '9') && s[j] != ';' && s[j] != ':' {
+				sgr = false
+			}
 			j++
 		}
 		if j >= len(s) || s[j] < 0x40 || s[j] > 0x7e {
 			return j // line ended mid-sequence
 		}
-		if s[j] == 'm' {
+		if sgr && s[j] == 'm' {
 			b.WriteString(s[i : j+1])
 		}
 		return j + 1

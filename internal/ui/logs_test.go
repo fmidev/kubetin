@@ -293,6 +293,9 @@ func TestSanitizeLogLine(t *testing.T) {
 		{"del dropped", "a\x7fb", "ab"},
 		{"tab expanded", "a\tb", "a    b"},
 		{"c1 csi dropped", "a\u009b31mb", "a31mb"},
+		{"private csi dropped", "a\x1b[>4;2mb", "ab"},
+		{"intermediate csi dropped", "a\x1b[ qb", "ab"},
+		{"true-colour subparams kept", "a\x1b[38:2::255:0:0mred\x1b[0m", "a\x1b[38:2::255:0:0mred\x1b[0m"},
 		{"trailing esc dropped", "abc\x1b", "abc"},
 		{"unterminated csi dropped", "abc\x1b[31", "abc"},
 	}
