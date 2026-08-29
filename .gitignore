@@ -4,6 +4,11 @@
 # Local Claude Code settings (do not commit)
 /.claude/
 
+# Local agent instructions. Ignored rather than committed for now —
+# untracked, it made every local build stamp itself "+dirty". Delete
+# this line if it should become part of the repo.
+/AGENTS.md
+
 # Editor / OS clutter
 .DS_Store
 *.swp
