@@ -80,6 +80,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "kubetin: %v\n", err)
 		os.Exit(1)
 	}
+	// DiscoverTrusted returns an empty Discovered rather than an error
+	// when the trusted files parse but define no contexts. Catch that
+	// here, while stderr is still real — every path downstream assumes
+	// at least one context exists.
+	if len(d.Contexts) == 0 {
+		fmt.Fprintf(os.Stderr, "kubetin: no contexts defined in %d trusted kubeconfig file(s)\n", len(d.Files))
+		os.Exit(1)
+	}
 
 	// In TUI mode, replace fd 2 with /dev/null so exec credential
 	// plugins (gke-gcloud-auth-plugin, aws-iam-auth, kubelogin) — which
@@ -145,8 +153,20 @@ func openDebugLog() (*os.File, error) {
 func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, contexts []string, want string, noWatch, hideSidebar bool, logTail int, restoreStderr func()) {
 	selected, err := pickWatchContext(ctx, store, want, contexts)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "kubetin: %v\n", err)
-		os.Exit(1)
+		// A fleet that is entirely unreachable is exactly when the user
+		// wants the monitor open, so a probe timeout opens on the first
+		// context and lets the sidebar report why each cluster is red.
+		// A bad -watch name or a cancelled startup stays fatal — and
+		// both must restore fd 2 before printing, or the message goes
+		// to the /dev/null we swapped in for the credential plugins and
+		// kubetin looks like it exited for no reason.
+		if want != "" || ctx.Err() != nil {
+			restoreStderr()
+			fmt.Fprintf(os.Stderr, "kubetin: %v\n", err)
+			os.Exit(1)
+		}
+		klog.Warningf("startup: %v; opening on %q", err, contexts[0])
+		selected = contexts[0]
 	}
 
 	m := ui.New(selected, store, contexts)
@@ -937,6 +957,11 @@ func runHeadless(ctx context.Context, store *model.Store, sup *cluster.Superviso
 	}
 }
 
+// pickWatchContext chooses the context to open on. An explicit -watch
+// wins outright; otherwise we give the probes a window to report a
+// healthy cluster so we land on one that works. Timing out is only
+// fatal for the headless caller — runTUI falls back to the first
+// context and starts anyway.
 func pickWatchContext(ctx context.Context, store *model.Store, want string, contexts []string) (string, error) {
 	if want != "" {
 		for _, c := range contexts {
