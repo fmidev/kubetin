@@ -191,6 +191,29 @@ func TestPickWatchContextTimeoutIsRecoverable(t *testing.T) {
 	}
 }
 
+// The store is only scanned every 500ms, so a probe can land in the gap
+// between the last scan and the deadline firing. Giving up there would
+// open contexts[0] with a healthy cluster already in the store.
+//
+// Deterministic by construction: the 200ms deadline is the only case
+// that can fire before the 500ms tick, and beta turns healthy well
+// before it.
+func TestPickWatchContextHealthyOnTheDeadline(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachUnreachable})
+	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachUnreachable})
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachHealthy})
+	}()
+
+	got, err := pickWatchContext(context.Background(), store, "", []string{"alpha", "beta"}, 200*time.Millisecond)
+	if err != nil || got != "beta" {
+		t.Fatalf("want beta/nil, got %q/%v", got, err)
+	}
+}
+
 // Cancellation and the deadline can be ready at the same time, and
 // select picks a ready case at random — so the classification has to
 // hold whichever branch wins the toss, not just the tidy one.

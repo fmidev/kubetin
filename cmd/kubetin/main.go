@@ -989,15 +989,22 @@ func pickWatchContext(ctx context.Context, store *model.Store, want string, cont
 		}
 		return "", fmt.Errorf("context %q not found in kubeconfig", want)
 	}
+	firstHealthy := func() (string, bool) {
+		for _, c := range contexts {
+			if st, ok := store.Get(c); ok && st.Reach == model.ReachHealthy {
+				return c, true
+			}
+		}
+		return "", false
+	}
+
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		for _, c := range contexts {
-			if st, ok := store.Get(c); ok && st.Reach == model.ReachHealthy {
-				return c, nil
-			}
+		if c, ok := firstHealthy(); ok {
+			return c, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -1009,6 +1016,13 @@ func pickWatchContext(ctx context.Context, store *model.Store, want string, cont
 			// user just asked to abort.
 			if err := ctx.Err(); err != nil {
 				return "", err
+			}
+			// A probe can also land in the gap between the last scan and
+			// this timer firing — the scan only runs every 500ms. Look
+			// once more before writing the fleet off, or we open on
+			// contexts[0] with a healthy cluster sitting in the store.
+			if c, ok := firstHealthy(); ok {
+				return c, nil
 			}
 			return "", fmt.Errorf("%w within %s; pass -watch <ctx>", errNoHealthyCluster, timeout)
 		case <-tick.C:
