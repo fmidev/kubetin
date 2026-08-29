@@ -373,6 +373,14 @@ func oneLine(s string) string {
 func (m Model) renderDashLogs(w, h int) string {
 	scroll := m.logs.scroll
 	th := m.Theme
+	// A non-positive height reaches the slice arithmetic below as a
+	// negative capacity and panics the whole TUI (makeslice: cap out
+	// of range). The stacked layout's floor keeps that from happening
+	// today, but a pane renderer shouldn't depend on its caller for
+	// that — clampCanvas already treats h<1 as 1, so match it.
+	if h < 1 {
+		h = 1
+	}
 	if m.logs.err != "" && len(m.logs.lines) == 0 {
 		return clampCanvas(" "+th.StatusBad.Render("✕ "+summariseStreamErr(m.logs.err)), w, h)
 	}
