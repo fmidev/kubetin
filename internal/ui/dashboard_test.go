@@ -1261,3 +1261,73 @@ func TestSizeStackedPaneMatchesDirectRender(t *testing.T) {
 		}
 	}
 }
+
+// The events pane formats only the rows it will display. That is worth
+// ~100x on a large event cache, but it means the windowing arithmetic
+// now lives in two places — this pins the new path against the old one
+// (format everything, then trim) across offsets and heights, including
+// the edges where they are most likely to diverge.
+func TestDashEventsWindowedRenderMatchesFullRender(t *testing.T) {
+	for _, n := range []int{0, 1, 5, 50} {
+		m := dashModel(120, 30, func(m *Model) {
+			now := time.Now()
+			m.events = map[types.UID]eventRow{}
+			for i := 0; i < n; i++ {
+				uid := types.UID(fmt.Sprintf("win-%03d", i))
+				m.events[uid] = eventRow{
+					UID: uid, Namespace: "default", Type: "Warning",
+					Reason: fmt.Sprintf("Reason%03d", i), Message: fmt.Sprintf("message %d", i),
+					Count: int32(i + 1), LastSeen: now.Add(-time.Duration(i) * time.Minute),
+					InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+				}
+			}
+		})
+		sub, _ := m.dashSubjectNow()
+		rows := m.dashEventRows(sub)
+
+		for _, h := range []int{1, 3, 8, 60} {
+			for _, scroll := range []int{0, 1, 4, 40, 1000} {
+				got := m.renderDashEvents(rows, 100, h, scroll, false)
+
+				// The old shape: format every row, then window.
+				full := m.renderDashEvents(rows, 100, 0, 0, false)
+				want, _ := scrollWindow(full, scroll, h)
+				want = clampCanvas(want, 100, h)
+
+				if got != want {
+					t.Errorf("n=%d h=%d scroll=%d: windowed render differs from full-then-trim\ngot:\n%s\nwant:\n%s",
+						n, h, scroll, got, want)
+				}
+			}
+		}
+	}
+}
+
+// The natural line count has to match what a natural render produces,
+// or the layout resolves heights against a number the renderer
+// disagrees with.
+func TestDashEventLineCountMatchesNaturalRender(t *testing.T) {
+	for _, n := range []int{0, 1, 7, 40} {
+		m := dashModel(120, 30, func(m *Model) {
+			now := time.Now()
+			m.events = map[types.UID]eventRow{}
+			for i := 0; i < n; i++ {
+				uid := types.UID(fmt.Sprintf("cnt-%03d", i))
+				m.events[uid] = eventRow{
+					UID: uid, Namespace: "default", Type: "Normal",
+					Reason: fmt.Sprintf("R%03d", i), Message: "m", Count: 1,
+					LastSeen: now, InvolvedKind: "Pod",
+					InvolvedName: "dash-pod", InvolvedNs: "default",
+				}
+			}
+		})
+		sub, _ := m.dashSubjectNow()
+		rows := m.dashEventRows(sub)
+
+		got := dashEventLineCount(rows)
+		want := lineCount(m.renderDashEvents(rows, 100, 0, 0, false))
+		if got != want {
+			t.Errorf("n=%d: counted %d lines, natural render has %d", n, got, want)
+		}
+	}
+}

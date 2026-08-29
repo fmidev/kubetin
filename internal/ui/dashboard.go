@@ -453,7 +453,12 @@ func (m Model) dashScrollMax(p dashboardPane, sub dashSubject, w, h int) int {
 		// clampCanvas pad the content out to that many rows.
 		content = m.renderDashMain(sub, w, 0)
 	case dashPaneEvents:
-		content = m.renderDashEventsFor(sub, w, 0, 0)
+		// Counted, not rendered: formatting every row to measure it
+		// is what this pane's windowing exists to avoid.
+		if max := dashEventLineCount(m.dashEventRows(sub)) - h; max > 0 {
+			return max
+		}
+		return 0
 	case dashPaneLogs:
 		// Logs are bounded by clampLogsScrollTo against logsState, not
 		// by this pane's offset array.
@@ -520,12 +525,19 @@ func (m Model) renderDashMain(sub dashSubject, w, h int) string {
 	return m.renderDashContainers(sub.Pod, w, h, m.dashboard.scroll[dashPaneMain])
 }
 
-func (m Model) renderDashEventsFor(sub dashSubject, w, h, scroll int) string {
+// dashEventRows is the scoped, sorted event set for the current
+// subject. Split out so the layout can count rows without formatting
+// them, and so a render that follows reuses the same scope pass.
+func (m Model) dashEventRows(sub dashSubject) []eventRow {
 	if sub.isDeploy() {
-		return m.renderDashEvents(m.dashDeployEvents(sub.Deploy, sub.Pods), w, h, scroll, true)
+		return m.dashDeployEvents(sub.Deploy, sub.Pods)
 	}
 	t, _ := m.dashboard.target()
-	return m.renderDashEvents(m.dashEventsFor(t.Ref), w, h, scroll, false)
+	return m.dashEventsFor(t.Ref)
+}
+
+func (m Model) renderDashEventsFor(sub dashSubject, w, h, scroll int) string {
+	return m.renderDashEvents(m.dashEventRows(sub), w, h, scroll, sub.isDeploy())
 }
 
 func (m Model) renderDashboardWide(sub dashSubject, t dashboardTarget, lay dashLayout, w, h int) string {
@@ -556,7 +568,7 @@ func (m Model) stackedPaneHeights(sub dashSubject, w, h int) (status, main, even
 	inner := stackedInnerWidth(w)
 	return resolveStackedHeights(sub.statusHeight(),
 		lineCount(m.renderDashMain(sub, inner, 0)),
-		lineCount(m.renderDashEventsFor(sub, inner, 0, 0)), h)
+		dashEventLineCount(m.dashEventRows(sub)), h)
 }
 
 // resolveStackedHeights is the one place pane heights are decided,
@@ -627,11 +639,14 @@ func (m Model) stackedLayout(sub dashSubject, w, h int) stackedGeom {
 	inner := stackedInnerWidth(w)
 
 	naturalMain := m.renderDashMain(sub, inner, 0)
-	naturalEvents := m.renderDashEventsFor(sub, inner, 0, 0)
+	// Scoped once, then counted and formatted from the same slice: the
+	// events pane formats only its visible rows, so measuring it by
+	// rendering it at natural height would cost more than the render.
+	eventRows := m.dashEventRows(sub)
 
 	g := stackedGeom{}
 	g.status, g.main, g.events, g.logs = resolveStackedHeights(
-		sub.statusHeight(), lineCount(naturalMain), lineCount(naturalEvents), h)
+		sub.statusHeight(), lineCount(naturalMain), dashEventLineCount(eventRows), h)
 
 	// The owned-pod list windows around its cursor rather than a
 	// scroll offset, so that one can't be reproduced by trimming the
@@ -648,7 +663,8 @@ func (m Model) stackedLayout(sub dashSubject, w, h int) stackedGeom {
 		dashStackedBox(m.paneLabel(sub.mainLabel(), dashPaneMain),
 			sizedMain, w, m.dashboard.focus == dashPaneMain, th),
 		dashStackedBox(m.paneLabel("EVENTS", dashPaneEvents),
-			sizeStackedPane(naturalEvents, inner, g.events, m.dashboard.scroll[dashPaneEvents]),
+			m.renderDashEvents(eventRows, inner, g.events,
+				m.dashboard.scroll[dashPaneEvents], sub.isDeploy()),
 			w, m.dashboard.focus == dashPaneEvents, th),
 		dashStackedBox(m.logsPaneLabel(),
 			m.renderDashLogs(inner, g.logs),
