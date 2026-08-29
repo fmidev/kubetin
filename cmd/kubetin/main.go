@@ -959,17 +959,20 @@ func runHeadless(ctx context.Context, store *model.Store, sup *cluster.Superviso
 }
 
 // errNoHealthyCluster reports that the probe window closed without any
-// cluster coming up healthy. Callers distinguish it from the other
-// failures by errors.Is rather than by re-deriving the cause from
-// `want` and ctx.Err(): when Ctrl-C lands in the same instant as the
-// deadline, select picks a ready case at random, so the call site
-// cannot tell the two apart on its own.
+// cluster coming up healthy, and is the one failure runTUI recovers
+// from. Callers test it with errors.Is rather than re-deriving the
+// cause from `want` and ctx.Err(), which cannot distinguish a probe
+// timeout from a cancelled startup.
 var errNoHealthyCluster = errors.New("no healthy cluster appeared")
 
-// watchPickTimeout is how long we let the probes run before giving up
-// on finding a healthy cluster to open on. One probe interval by
-// default, so a fleet whose first round all timed out still gets a
-// second round in under the wire.
+// watchPickTimeout is how long we wait for a probe to report a healthy
+// cluster before opening on the first context regardless.
+//
+// It buys exactly one probe round, not two: runOne only starts its
+// interval ticker once the initial probe returns, so on a fleet that is
+// failing the next attempt lands at (first probe + probe interval),
+// past this deadline. Only the first round can land inside the window,
+// and ProbeTimeout caps that at 5s.
 var watchPickTimeout = 30 * time.Second
 
 // pickWatchContext chooses the context to open on. An explicit -watch
@@ -1000,6 +1003,13 @@ func pickWatchContext(ctx context.Context, store *model.Store, want string, cont
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-deadline.C:
+			// Ctrl-C and the deadline can be ready in the same instant,
+			// and select picks a ready case at random. Cancellation wins:
+			// classifying it as a recoverable timeout would open a UI the
+			// user just asked to abort.
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			return "", fmt.Errorf("%w within %s; pass -watch <ctx>", errNoHealthyCluster, timeout)
 		case <-tick.C:
 		}

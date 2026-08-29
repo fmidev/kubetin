@@ -191,6 +191,24 @@ func TestPickWatchContextTimeoutIsRecoverable(t *testing.T) {
 	}
 }
 
+// Cancellation and the deadline can be ready at the same time, and
+// select picks a ready case at random — so the classification has to
+// hold whichever branch wins the toss, not just the tidy one.
+func TestPickWatchContextCancelledBeatsDeadline(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachUnreachable})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for i := 0; i < 200; i++ {
+		_, err := pickWatchContext(ctx, store, "", []string{"alpha"}, time.Nanosecond)
+		if errors.Is(err, errNoHealthyCluster) {
+			t.Fatalf("run %d: aborted startup classified as a recoverable timeout", i)
+		}
+	}
+}
+
 func TestPickWatchContextCancelledIsFatal(t *testing.T) {
 	store := model.NewStore()
 	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachUnreachable})
