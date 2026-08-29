@@ -293,6 +293,13 @@ func TestSanitizeLogLine(t *testing.T) {
 		{"del dropped", "a\x7fb", "ab"},
 		{"tab expanded", "a\tb", "a    b"},
 		{"c1 csi dropped", "a\u009b31mb", "a31mb"},
+		// A raw 0x9b is CSI to a terminal that is not in UTF-8 mode,
+		// and it reaches us intact — Scanner.Text() validates nothing.
+		// Dropping the introducer is what defuses it; its parameters
+		// are only text once it is gone.
+		{"raw c1 introducer dropped", "a\x9b2Jb", "a2Jb"},
+		{"invalid utf8 dropped", "a\xffb", "ab"},
+		{"valid multibyte kept", "käännös 日本語 ✓", "käännös 日本語 ✓"},
 		{"private csi dropped", "a\x1b[>4;2mb", "ab"},
 		{"intermediate csi dropped", "a\x1b[ qb", "ab"},
 		{"true-colour subparams kept", "a\x1b[38:2::255:0:0mred\x1b[0m", "a\x1b[38:2::255:0:0mred\x1b[0m"},
@@ -311,9 +318,13 @@ func TestSanitizeLogLine(t *testing.T) {
 // Chatty pods push thousands of lines a second through here, so a
 // line with nothing to strip must not cost a copy.
 func TestSanitizeLogLinePlainPathDoesNotAllocate(t *testing.T) {
-	in := "2026-08-29T21:29:59Z nothing interesting here"
-	if n := testing.AllocsPerRun(100, func() { sanitizeLogLine(in) }); n != 0 {
-		t.Errorf("plain line allocated %.0f times", n)
+	for _, in := range []string{
+		"2026-08-29T21:29:59Z nothing interesting here",
+		"2026-08-29T21:29:59Z käännös epäonnistui 日本語",
+	} {
+		if n := testing.AllocsPerRun(100, func() { sanitizeLogLine(in) }); n != 0 {
+			t.Errorf("%q allocated %.0f times", in, n)
+		}
 	}
 }
 

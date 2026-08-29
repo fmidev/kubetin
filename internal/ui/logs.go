@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -683,44 +684,66 @@ func highlightMatches(s, needle string, bold bool) string {
 // buffer is also what search reads and what the dashboard's splice
 // helpers walk, and those assume every escape in a line is `CSI … m`.
 func sanitizeLogLine(s string) string {
-	if !hasControlBytes(s) {
+	if !needsSanitizing(s) {
 		return s
 	}
 	var b strings.Builder
 	b.Grow(len(s))
 	for i := 0; i < len(s); {
-		switch c := s[i]; {
+		c := s[i]
+		switch {
 		case c == 0x1b:
 			i = copySGR(&b, s, i)
+			continue
 		case c == '\t':
 			// A raw tab jumps to the terminal's own tab stops, which
 			// the box we render into doesn't share, and measures as
 			// zero cells so the padding maths under-counts it too.
 			b.WriteString("    ")
 			i++
+			continue
 		case c < 0x20 || c == 0x7f:
 			i++
-		case c == 0xc2 && i+1 < len(s) && s[i+1] >= 0x80 && s[i+1] <= 0x9f:
-			i += 2 // C1 control in UTF-8 form — U+009B is a second CSI
-		default:
+			continue
+		case c < utf8.RuneSelf:
 			b.WriteByte(c)
 			i++
+			continue
 		}
+		// Non-ASCII. Decode rather than copy bytes: a lone 0x9b is
+		// CSI to a terminal that hasn't been switched into UTF-8
+		// mode, and it reaches us intact because Scanner.Text() does
+		// no validation. Drop the C1 range in both its raw and its
+		// UTF-8 form, and drop bytes that decode to nothing at all.
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if (r == utf8.RuneError && size == 1) || r <= 0x9f {
+			i += size
+			continue
+		}
+		b.WriteString(s[i : i+size])
+		i += size
 	}
 	return b.String()
 }
 
-// hasControlBytes is sanitizeLogLine's fast path. Most lines are
-// plain text and keep their backing string with no copy.
-func hasControlBytes(s string) bool {
-	for i := 0; i < len(s); i++ {
+// needsSanitizing is sanitizeLogLine's fast path. A line of printable
+// text — ASCII or well-formed multibyte — keeps its backing string
+// with no copy.
+func needsSanitizing(s string) bool {
+	for i := 0; i < len(s); {
 		c := s[i]
 		if c < 0x20 || c == 0x7f {
 			return true
 		}
-		if c == 0xc2 && i+1 < len(s) && s[i+1] >= 0x80 && s[i+1] <= 0x9f {
+		if c < utf8.RuneSelf {
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if (r == utf8.RuneError && size == 1) || r <= 0x9f {
 			return true
 		}
+		i += size
 	}
 	return false
 }
