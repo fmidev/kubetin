@@ -477,10 +477,14 @@ func dashSetup(extra func(*Model)) func(*Model) {
 			uid := types.UID("evt-" + string(rune('a'+i)))
 			m.events[uid] = eventRow{
 				UID: uid, Namespace: "default", Type: "Warning",
-				Reason:       "BackOff",
-				Message:      "Back-off restarting failed container envoy in pod dash-pod_default",
-				Count:        int32(i + 1),
-				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
+				Reason:  "BackOff",
+				Message: "Back-off restarting failed container envoy in pod dash-pod_default",
+				Count:   int32(i + 1),
+				// Hours, not minutes-from-now: the first row would
+				// otherwise be stamped at `now` and render "0s", which
+				// flips to "1s" the moment a second ticks over. Any
+				// test comparing two renders then depends on the clock.
+				LastSeen:     now.Add(-time.Duration(i+1) * time.Hour),
 				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
 			}
 		}
@@ -683,9 +687,13 @@ func eventsLens(extra func(*Model)) func(*Model) {
 			}
 			m.events[uid] = eventRow{
 				UID: uid, Namespace: ns, Type: "Warning", Reason: "BackOff",
-				Message:      "Back-off restarting failed container envoy in pod payments-api",
-				Count:        int32(i + 1),
-				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
+				Message: "Back-off restarting failed container envoy in pod payments-api",
+				Count:   int32(i + 1),
+				// Hours, not minutes-from-now: the first row would
+				// otherwise be stamped at `now` and render "0s", which
+				// flips to "1s" the moment a second ticks over. Any
+				// test comparing two renders then depends on the clock.
+				LastSeen:     now.Add(-time.Duration(i+1) * time.Hour),
 				InvolvedKind: "Pod", InvolvedName: "payments-api-7f9c8-x2k4l", InvolvedNs: ns,
 			}
 		}

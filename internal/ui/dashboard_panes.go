@@ -299,8 +299,19 @@ func (m Model) renderDashEvents(events []eventRow, w, h, scroll int, withObject 
 	}
 	cw := fitColumns(cols, w-1)
 
-	lines := make([]string, 0, len(events))
-	for _, e := range events {
+	// Format only the rows that will be shown. Every cell costs a
+	// lipgloss Style.Render, which dominates this pane's cost, and the
+	// event cache is cluster-wide: formatting 2000 rows to display 20
+	// was ~100x the work needed. h<=0 means "natural height", where
+	// the caller does want them all.
+	visible := events
+	if h > 0 {
+		start := clampEventScroll(len(events), scroll, h)
+		visible = events[start : start+min(h, len(events)-start)]
+	}
+
+	lines := make([]string, 0, len(visible))
+	for _, e := range visible {
 		typeStyle, msgStyle := th.Dim, th.Base
 		if e.Type == "Warning" {
 			typeStyle, msgStyle = th.StatusWrn, th.StatusWrn
@@ -323,7 +334,37 @@ func (m Model) renderDashEvents(events []eventRow, w, h, scroll int, withObject 
 		lines = append(lines, " "+joinCells(cells...))
 	}
 
-	return dashPaneBody(lines, w, h, scroll)
+	// Already windowed above, so the offset here is zero.
+	return dashPaneBody(lines, w, h, 0)
+}
+
+// clampEventScroll bounds a scroll offset to the rows available,
+// picking the same first row scrollWindow would have selected from the
+// fully-formatted set. clampCanvas pads the short tail, so nothing
+// needs adding above.
+func clampEventScroll(total, scroll, h int) int {
+	maxStart := total - h
+	if maxStart < 0 {
+		maxStart = 0
+	}
+	if scroll > maxStart {
+		scroll = maxStart
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	return scroll
+}
+
+// dashEventLineCount is the natural height of the events pane without
+// formatting a single row — one line per event, or one for the empty
+// placeholder. Lets the layout resolve heights without paying for a
+// render it is only going to measure.
+func dashEventLineCount(events []eventRow) int {
+	if len(events) == 0 {
+		return 1
+	}
+	return len(events)
 }
 
 // dashPaneBody windows pane rows to h and pads to the pane rect. A

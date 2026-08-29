@@ -925,6 +925,9 @@ func TestDashLogsScrollInBothLayouts(t *testing.T) {
 func TestDashEventsScrollWhenStacked(t *testing.T) {
 	// The pane caps at dashStackEventsMax rows, so it needs more
 	// groups than that before there is anything to scroll.
+	// Hour-scale ages so nothing renders a sub-minute age: this asserts
+	// two renders *differ*, and a clock tick changing "0s" to "1s"
+	// would satisfy that without the scroll doing anything.
 	m := openedDash(t, 70, 40, func(m *Model) {
 		now := time.Now()
 		for i := 0; i < 30; i++ {
@@ -932,7 +935,7 @@ func TestDashEventsScrollWhenStacked(t *testing.T) {
 			m.events[uid] = eventRow{
 				UID: uid, Namespace: "default", Type: "Warning",
 				Reason: "Reason" + string(rune('a'+i%26)), Message: "m", Count: 1,
-				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
+				LastSeen:     now.Add(-time.Duration(i+1) * time.Hour),
 				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
 			}
 		}
@@ -1235,14 +1238,17 @@ func TestStackedGeometryAgreesWithHeightResolver(t *testing.T) {
 // pane renderer for that height produces — otherwise the single-pass
 // render silently draws something different from the old path.
 func TestSizeStackedPaneMatchesDirectRender(t *testing.T) {
+	// Zero timestamps: this compares two renders of the same rows and
+	// formatAge reads the clock, so a row stamped "now" would flip
+	// 0s -> 1s between them. Ages render "—" and ordering falls to the
+	// Reason tie-breaker, which is all this test needs.
 	m := dashModel(70, 30, func(m *Model) {
-		now := time.Now()
+		m.events = map[types.UID]eventRow{}
 		for i := 0; i < 30; i++ {
 			uid := types.UID(fmt.Sprintf("size-e%02d", i))
 			m.events[uid] = eventRow{
 				UID: uid, Namespace: "default", Type: "Warning",
 				Reason: fmt.Sprintf("R%02d", i), Message: "m", Count: 1,
-				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
 				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
 			}
 		}
@@ -1258,6 +1264,81 @@ func TestSizeStackedPaneMatchesDirectRender(t *testing.T) {
 			if got != want {
 				t.Errorf("scroll=%d h=%d: windowed content differs from a direct render", scroll, h)
 			}
+		}
+	}
+}
+
+// The events pane formats only the rows it will display. That is worth
+// ~100x on a large event cache, but it means the windowing arithmetic
+// now lives in two places — this pins the new path against the old one
+// (format everything, then trim) across offsets and heights, including
+// the edges where they are most likely to diverge.
+func TestDashEventsWindowedRenderMatchesFullRender(t *testing.T) {
+	for _, n := range []int{0, 1, 5, 50} {
+		// Zero timestamps: the two renders below happen microseconds
+		// apart, but formatAge reads the clock, so a row stamped "now"
+		// flips 0s -> 1s across a second boundary and fails the
+		// comparison for reasons that have nothing to do with
+		// windowing. Ordering stays deterministic via the Reason
+		// tie-breaker.
+		m := dashModel(120, 30, func(m *Model) {
+			m.events = map[types.UID]eventRow{}
+			for i := 0; i < n; i++ {
+				uid := types.UID(fmt.Sprintf("win-%03d", i))
+				m.events[uid] = eventRow{
+					UID: uid, Namespace: "default", Type: "Warning",
+					Reason: fmt.Sprintf("Reason%03d", i), Message: fmt.Sprintf("message %d", i),
+					Count:        int32(i + 1),
+					InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+				}
+			}
+		})
+		sub, _ := m.dashSubjectNow()
+		rows := m.dashEventRows(sub)
+
+		for _, h := range []int{1, 3, 8, 60} {
+			for _, scroll := range []int{0, 1, 4, 40, 1000} {
+				got := m.renderDashEvents(rows, 100, h, scroll, false)
+
+				// The old shape: format every row, then window.
+				full := m.renderDashEvents(rows, 100, 0, 0, false)
+				want, _ := scrollWindow(full, scroll, h)
+				want = clampCanvas(want, 100, h)
+
+				if got != want {
+					t.Errorf("n=%d h=%d scroll=%d: windowed render differs from full-then-trim\ngot:\n%s\nwant:\n%s",
+						n, h, scroll, got, want)
+				}
+			}
+		}
+	}
+}
+
+// The natural line count has to match what a natural render produces,
+// or the layout resolves heights against a number the renderer
+// disagrees with.
+func TestDashEventLineCountMatchesNaturalRender(t *testing.T) {
+	for _, n := range []int{0, 1, 7, 40} {
+		m := dashModel(120, 30, func(m *Model) {
+			now := time.Now()
+			m.events = map[types.UID]eventRow{}
+			for i := 0; i < n; i++ {
+				uid := types.UID(fmt.Sprintf("cnt-%03d", i))
+				m.events[uid] = eventRow{
+					UID: uid, Namespace: "default", Type: "Normal",
+					Reason: fmt.Sprintf("R%03d", i), Message: "m", Count: 1,
+					LastSeen: now, InvolvedKind: "Pod",
+					InvolvedName: "dash-pod", InvolvedNs: "default",
+				}
+			}
+		})
+		sub, _ := m.dashSubjectNow()
+		rows := m.dashEventRows(sub)
+
+		got := dashEventLineCount(rows)
+		want := lineCount(m.renderDashEvents(rows, 100, 0, 0, false))
+		if got != want {
+			t.Errorf("n=%d: counted %d lines, natural render has %d", n, got, want)
 		}
 	}
 }
