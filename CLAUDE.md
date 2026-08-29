@@ -104,12 +104,20 @@ Process startup runs `silenceStderr()` (cmd/kubetin/stderr_unix.go): `dup(2)` sa
 - **Sidebar separator** — `strings.Repeat("│\n", h)` produces `h+1` rows; the trailing `\n` becomes a phantom blank row that JoinVertical treats as content. The `clampCanvas` body wrap covers this now but be aware.
 - **Sort arrow color** — `Theme.Title.Render("▲")` then concat onto a `Theme.Header.Render(label)` is the pattern for mixed-style headers. Pass through `padCellANSI`, never `padCol`.
 - **`return m, m.cycleFocus(+1)`** — Go spec doesn't guarantee left-to-right evaluation of non-call operands. Assign `cmd := m.cycleFocus(+1); return m, cmd` for any pattern where the method mutates `m`.
+- **Raw log bytes** — pods colour their output (smartmetserver does), and
+  nothing stops one emitting a cursor move or an OSC title set. `applyLogLines`
+  runs every line through `sanitizeLogLine` (text + `CSI … m` only); both
+  renderers cut with `fitLogLine`, which never slices an escape and closes any
+  colour the line left open. Feeding a coloured line to `truncate` counted the
+  escape bytes as visible cells, dropped the closing `ESC[39m`, and the colour
+  bled over the whole UI — surviving Esc out of the viewer.
 - **Footer height varies** — `lipgloss.Height(footer)` returns 2 when filter is focused or has content, 1 otherwise. `bodyHeight` math depends on this.
 
 ## What NOT to do
 
 - Don't add `Set`-style replace-whole-state writers to `model.Store`. Use Apply methods.
 - Don't pass ANSI-styled strings into byte-level helpers (`padCol`, `truncate`).
+- Don't render log lines with `truncate`; they carry producer ANSI. Use `fitLogLine`.
 - Don't merge kubeconfigs through `clientcmd.Precedence`. Per-file load only.
 - Don't add async receivers without a Context guard at the top.
 - Don't log to `os.Stderr` from goroutines — fd 2 is `/dev/null` in TUI mode. Use `klog`.

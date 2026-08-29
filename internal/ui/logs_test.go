@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
@@ -265,5 +266,126 @@ func TestLogsFooterReportsScope(t *testing.T) {
 	}
 	if strings.Contains(out, "L:all") {
 		t.Error("full viewer still advertises L:all")
+	}
+}
+
+// sanitizeLogLine must keep colours and drop everything else a
+// container can write to its stdout. The failure it guards against is
+// a pod whose output moves the cursor, clears the screen, or sets the
+// terminal title — all of which land outside the box we drew and
+// outlive the viewer.
+func TestSanitizeLogLine(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "2026-08-29T21:29:59Z started", "2026-08-29T21:29:59Z started"},
+		{"sgr kept", "a \x1b[31mred\x1b[0m b", "a \x1b[31mred\x1b[0m b"},
+		{"cursor move dropped", "a\x1b[5Ab", "ab"},
+		{"erase display dropped", "a\x1b[2Jb", "ab"},
+		{"scroll region dropped", "a\x1b[1;10rb", "ab"},
+		{"osc title dropped", "a\x1b]0;pwn\x07b", "ab"},
+		{"osc st-terminated dropped", "a\x1b]0;pwn\x1b\\b", "ab"},
+		{"charset switch dropped", "a\x1b(0b", "ab"},
+		{"carriage return dropped", "50%\r100%", "50%100%"},
+		{"backspace dropped", "ab\x08c", "abc"},
+		{"del dropped", "a\x7fb", "ab"},
+		{"tab expanded", "a\tb", "a    b"},
+		{"c1 csi dropped", "a\u009b31mb", "a31mb"},
+		{"trailing esc dropped", "abc\x1b", "abc"},
+		{"unterminated csi dropped", "abc\x1b[31", "abc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeLogLine(tc.in); got != tc.want {
+				t.Errorf("sanitizeLogLine(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// Chatty pods push thousands of lines a second through here, so a
+// line with nothing to strip must not cost a copy.
+func TestSanitizeLogLinePlainPathDoesNotAllocate(t *testing.T) {
+	in := "2026-08-29T21:29:59Z nothing interesting here"
+	if n := testing.AllocsPerRun(100, func() { sanitizeLogLine(in) }); n != 0 {
+		t.Errorf("plain line allocated %.0f times", n)
+	}
+}
+
+// The bug this fixes: `truncate` counted escape bytes as visible cells
+// and cut at a byte offset, so a coloured line lost its closing
+// `\x1b[39m` — the colour then bled over the rest of the UI and
+// survived closing the viewer — and could be cut mid-sequence
+// (`\x1b[3` + "…", which the terminal keeps consuming). fitLogLine
+// cuts on cell boundaries and always closes what the line opened.
+func TestFitLogLineNeverLeaksColour(t *testing.T) {
+	// Shape taken from a real smartmetserver line: bg, bold, fg, then
+	// the matching unsets at the end.
+	line := "2026-08-29T21:29:59Z \x1b[42m\x1b[1m\x1b[37mLaunched Synapse server\x1b[39m\x1b[22m\x1b[49m"
+
+	for w := 1; w <= 80; w++ {
+		out := fitLogLine(line, w)
+		if got := lipgloss.Width(out); got > w {
+			t.Fatalf("w=%d: rendered %d cells: %q", w, got, out)
+		}
+		// Strip every complete SGR sequence; an ESC left in what
+		// remains is a sequence the cut sliced through.
+		var stripped strings.Builder
+		for i := 0; i < len(out); {
+			if end, ok := sgrEnd(out, i); ok {
+				i = end
+				continue
+			}
+			stripped.WriteByte(out[i])
+			i++
+		}
+		if strings.ContainsRune(stripped.String(), 0x1b) {
+			t.Fatalf("w=%d: partial escape survived: %q", w, out)
+		}
+		if strings.ContainsRune(out, 0x1b) && !strings.HasSuffix(out, "\x1b[0m") {
+			t.Fatalf("w=%d: colour left open: %q", w, out)
+		}
+	}
+}
+
+// sgrEnd reports the index just past a complete `CSI … m` at s[i].
+func sgrEnd(s string, i int) (int, bool) {
+	if i+1 >= len(s) || s[i] != 0x1b || s[i+1] != '[' {
+		return i, false
+	}
+	j := i + 2
+	for j < len(s) && s[j] >= '0' && s[j] <= ';' {
+		j++
+	}
+	if j < len(s) && s[j] == 'm' {
+		return j + 1, true
+	}
+	return i, false
+}
+
+// An uncoloured line must not pick up a reset it doesn't need.
+func TestFitLogLineLeavesPlainLinesAlone(t *testing.T) {
+	if got := fitLogLine("plain line", 40); got != "plain line" {
+		t.Errorf("got %q", got)
+	}
+	if got := fitLogLine("plain line", 6); got != "plain…" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// Sanitizing happens on ingest so search, the dashboard pane's splice
+// helpers, and both renderers all see one clean representation.
+func TestApplyLogLinesSanitizes(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.logs.cap = 100
+	m.applyLogLines([]string{"boom\x1b[2J\x1b[H", "\x1b[31mred\x1b[0m"})
+
+	if got := m.logs.lines[0]; got != "boom" {
+		t.Errorf("erase/home not stripped: %q", got)
+	}
+	if got := m.logs.lines[1]; got != "\x1b[31mred\x1b[0m" {
+		t.Errorf("colour not preserved: %q", got)
 	}
 }
