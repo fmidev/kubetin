@@ -1144,3 +1144,120 @@ func TestDashFocusedPaneStaysVisibleAsContainersGrow(t *testing.T) {
 		t.Error("focused logs pane pushed off screen by a pod update")
 	}
 }
+
+// The stacked render used to resolve its geometry three times — once
+// to measure the panes, once to draw them, once to place the canvas —
+// and each pass filters and sorts the cluster-wide event map. Informer
+// updates trigger redraws, so a busy cluster paid it per event.
+//
+// Kept as a benchmark rather than a threshold assertion: the number is
+// machine-dependent, but a regression to multiple passes shows up as a
+// stacked render several times the cost of the wide one, which does a
+// single pass.
+func benchDashModel(w, h, events int) Model {
+	m := dashModel(w, h, func(m *Model) {
+		now := time.Now()
+		m.events = map[types.UID]eventRow{}
+		for i := 0; i < events; i++ {
+			uid := types.UID(fmt.Sprintf("bench-e%05d", i))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Warning",
+				Reason: fmt.Sprintf("Reason%03d", i%200), Message: "message text",
+				Count: 1, LastSeen: now.Add(-time.Duration(i) * time.Second),
+				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+			}
+		}
+		for i := 0; i < 400; i++ {
+			uid := types.UID(fmt.Sprintf("bench-p%04d", i))
+			m.pods[uid] = podRow{
+				UID: uid, Namespace: "default",
+				Name:   fmt.Sprintf("payments-api-7f9c8-%04d", i),
+				Phase:  "Running",
+				Labels: map[string]string{"app": "payments"},
+			}
+		}
+	})
+	m.dashboard.focus = dashPaneLogs
+	return m
+}
+
+func BenchmarkDashboardRenderStacked(b *testing.B) {
+	m := benchDashModel(70, 30, 2000)
+	_, canvas := m.dashCanvasSize()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = m.renderDashboard(canvas, 70)
+	}
+}
+
+func BenchmarkDashboardRenderWide(b *testing.B) {
+	m := benchDashModel(200, 50, 2000)
+	_, canvas := m.dashCanvasSize()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = m.renderDashboard(canvas, 200)
+	}
+}
+
+// There are now two ways into the pane heights: the render path, which
+// measures content it has already produced, and the keypress path,
+// which renders to measure. They must agree, or the scroll bounds stop
+// matching what is drawn — the drift this whole area has been prone to.
+func TestStackedGeometryAgreesWithHeightResolver(t *testing.T) {
+	sizes := [][2]int{{70, 20}, {70, 30}, {70, 44}, {60, 26}, {80, 60}}
+	for _, view := range []View{ViewPods, ViewDeployments} {
+		for _, dim := range sizes {
+			w, h := dim[0], dim[1]
+			m := dashModel(w, h, nil)
+			m.view = view
+			if view == ViewDeployments {
+				m = dashModel(w, h, nil)
+				dashDeploySetup(nil)(&m)
+				m.view = ViewDeployments
+			}
+			sub, ok := m.dashSubjectNow()
+			if !ok {
+				t.Fatalf("view=%v %dx%d: no subject", view, w, h)
+			}
+			_, canvas := m.dashCanvasSize()
+
+			g := m.stackedLayout(sub, w, canvas)
+			sH, mH, eH, lH := m.stackedPaneHeights(sub, w, canvas)
+			if g.status != sH || g.main != mH || g.events != eH || g.logs != lH {
+				t.Errorf("view=%v %dx%d: render path got (%d,%d,%d,%d), keypress path (%d,%d,%d,%d)",
+					view, w, h, g.status, g.main, g.events, g.logs, sH, mH, eH, lH)
+			}
+		}
+	}
+}
+
+// Windowing pre-rendered content must produce exactly what asking the
+// pane renderer for that height produces — otherwise the single-pass
+// render silently draws something different from the old path.
+func TestSizeStackedPaneMatchesDirectRender(t *testing.T) {
+	m := dashModel(70, 30, func(m *Model) {
+		now := time.Now()
+		for i := 0; i < 30; i++ {
+			uid := types.UID(fmt.Sprintf("size-e%02d", i))
+			m.events[uid] = eventRow{
+				UID: uid, Namespace: "default", Type: "Warning",
+				Reason: fmt.Sprintf("R%02d", i), Message: "m", Count: 1,
+				LastSeen:     now.Add(-time.Duration(i) * time.Minute),
+				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
+			}
+		}
+	})
+	sub, _ := m.dashSubjectNow()
+	const inner = 68
+
+	for _, scroll := range []int{0, 3, 9} {
+		for _, h := range []int{1, 4, 8} {
+			natural := m.renderDashEventsFor(sub, inner, 0, 0)
+			got := sizeStackedPane(natural, inner, h, scroll)
+			want := m.renderDashEventsFor(sub, inner, h, scroll)
+			if got != want {
+				t.Errorf("scroll=%d h=%d: windowed content differs from a direct render", scroll, h)
+			}
+		}
+	}
+}
