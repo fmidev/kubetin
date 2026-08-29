@@ -11,8 +11,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
 )
+
+// The window is deliberately short — waiting longer cannot turn up a
+// healthy cluster — but it still has to outlast one probe attempt.
+// probeOnce commits Reach only after the last of its four API calls,
+// all sharing a single ProbeTimeout budget, so a window at or under
+// ProbeTimeout would report a healthy fleet as down.
+func TestWatchPickTimeoutOutlastsOneProbe(t *testing.T) {
+	if watchPickTimeout <= cluster.ProbeTimeout {
+		t.Fatalf("watchPickTimeout %s must exceed ProbeTimeout %s", watchPickTimeout, cluster.ProbeTimeout)
+	}
+}
 
 // TestMain doubles as the entry point for the subprocess cases below.
 // With KUBETIN_TEST_MAIN set it runs the real main() — fd-2 silencing,

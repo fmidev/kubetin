@@ -968,12 +968,18 @@ var errNoHealthyCluster = errors.New("no healthy cluster appeared")
 // watchPickTimeout is how long we wait for a probe to report a healthy
 // cluster before opening on the first context regardless.
 //
-// It buys exactly one probe round, not two: runOne only starts its
-// interval ticker once the initial probe returns, so on a fleet that is
-// failing the next attempt lands at (first probe + probe interval),
-// past this deadline. Only the first round can land inside the window,
-// and ProbeTimeout caps that at 5s.
-var watchPickTimeout = 30 * time.Second
+// Sized to one probe round plus slack, because a second round can never
+// land inside it: runOne starts its interval ticker only after the
+// initial probe returns, so on a failing fleet the next attempt is at
+// (first probe + probe interval) — well past any sane deadline. And one
+// round is bounded: probeOnce runs all four of its API calls under a
+// single ProbeTimeout budget and commits Reach only after the last one.
+//
+// So waiting longer than this cannot turn up a healthy cluster, it just
+// holds a blank terminal. This was 30s, which meant ~25s of dead wait
+// whenever the fleet was down — the symptom that made kubetin look
+// hung before the fallback below existed.
+var watchPickTimeout = cluster.ProbeTimeout + 3*time.Second
 
 // pickWatchContext chooses the context to open on. An explicit -watch
 // wins outright; otherwise we give the probes `timeout` to report a
