@@ -1409,10 +1409,14 @@ func (m *Model) cycleFocus(delta int) tea.Cmd {
 	if len(m.Contexts) <= 1 || m.OnFocusChange == nil {
 		return nil
 	}
+	// The states come from focusOrder's snapshot, not a fresh Store.Get
+	// per candidate: reachability has to be judged from the same read
+	// that produced the order, or a probe landing mid-scan could make us
+	// pick a context that is next in neither the old rail nor the new.
 	order := m.focusOrder()
 	idx := -1
-	for i, c := range order {
-		if c == m.WatchedContext {
+	for i, st := range order {
+		if st.Context == m.WatchedContext {
 			idx = i
 			break
 		}
@@ -1421,20 +1425,19 @@ func (m *Model) cycleFocus(delta int) tea.Cmd {
 	fallback := ""
 	for step := 1; step <= n; step++ {
 		j := ((idx+delta*step)%n + n) % n
-		c := order[j]
+		st := order[j]
 		// The last step lands back on the focused context; re-selecting
 		// it is the same no-navigation resync the guard above avoids.
 		// (With idx == -1 — focus not in the list at all — nothing
 		// matches and every context stays a candidate.)
-		if c == m.WatchedContext {
+		if st.Context == m.WatchedContext {
 			continue
 		}
-		st, ok := m.Store.Get(c)
-		if ok && (st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded) {
-			return m.focusContext(c)
+		if st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded {
+			return m.focusContext(st.Context)
 		}
 		if fallback == "" {
-			fallback = c
+			fallback = st.Context
 		}
 	}
 	// Nothing reachable to move to, but the user still asked to move:

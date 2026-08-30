@@ -62,22 +62,27 @@ func (m Model) renderSidebar(height int) string {
 	)
 }
 
-// focusOrder returns the switchable contexts in the order the rail
-// draws them. Tab used to walk m.Contexts — kubeconfig discovery order
-// — while the rail (and the overview, and the debug view) all sort by
-// sortKey, so every press jumped to a seemingly random row and the
-// order changed again whenever a probe moved a cluster between tiers.
-func (m Model) focusOrder() []string {
-	// One Snapshot, exactly as renderSidebar takes: probes move clusters
-	// between reach tiers from their own goroutines, and per-cluster
-	// Store.Get calls would each take the lock at a different instant —
-	// an order assembled from states that never coexisted. Keys are then
-	// fixed before the sort, so Less can't go inconsistent underneath it.
+// focusOrder returns the switchable contexts, with the state each was
+// ordered by, in the order the rail draws them. Tab used to walk
+// m.Contexts — kubeconfig discovery order — while the rail (and the
+// overview, and the debug view) all sort by sortKey, so every press
+// jumped to a seemingly random row and the order changed again whenever
+// a probe moved a cluster between tiers.
+//
+// The state travels with the context so callers judge reachability from
+// the same read that produced the order: one Snapshot, as renderSidebar
+// takes, rather than per-cluster Store.Get calls that each land at a
+// different instant and can assemble an order from states that never
+// coexisted.
+func (m Model) focusOrder() []model.ClusterState {
 	states := make(map[string]model.ClusterState)
 	for _, st := range m.Store.Snapshot() {
 		states[st.Context] = st
 	}
-	type entry struct{ ctx, key string }
+	type entry struct {
+		st  model.ClusterState
+		key string
+	}
 	entries := make([]entry, 0, len(m.Contexts))
 	for _, c := range m.Contexts {
 		st, ok := states[c]
@@ -85,13 +90,13 @@ func (m Model) focusOrder() []string {
 			// Not probed yet: same tier the rail gives ReachUnknown.
 			st = model.ClusterState{Context: c}
 		}
-		entries = append(entries, entry{ctx: c, key: sortKey(st)})
+		entries = append(entries, entry{st: st, key: sortKey(st)})
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].key < entries[j].key })
 
-	out := make([]string, len(entries))
+	out := make([]model.ClusterState, len(entries))
 	for i, e := range entries {
-		out[i] = e.ctx
+		out[i] = e.st
 	}
 	return out
 }
