@@ -19,11 +19,19 @@ const FocusedInterval = 15 * time.Second
 
 // PodMetric is the per-pod resource snapshot the UI renders.
 type PodMetric struct {
-	UID       types.UID
-	Namespace string
-	Name      string
-	CPUMilli  int64 // sum of container usage.cpu (millicores)
-	MemBytes  int64 // sum of container usage.memory (bytes)
+	UID        types.UID
+	Namespace  string
+	Name       string
+	CPUMilli   int64 // sum of container usage.cpu (millicores)
+	MemBytes   int64 // sum of container usage.memory (bytes)
+	Containers []ContainerMetric
+}
+
+// ContainerMetric is one container's share of a PodMetric. Memory
+// only — the dashboard's per-container column is the sole consumer.
+type ContainerMetric struct {
+	Name     string
+	MemBytes int64
 }
 
 // NodeMetric is the per-node resource snapshot.
@@ -111,20 +119,25 @@ func (p *FocusedMetricsPoller) tick(parent context.Context, mc *metricsclientset
 	}
 	for _, pm := range pmList.Items {
 		var cpu, mem int64
+		containers := make([]ContainerMetric, 0, len(pm.Containers))
 		for _, c := range pm.Containers {
 			if v, ok := c.Usage["cpu"]; ok {
 				cpu += v.MilliValue()
 			}
+			var cmem int64
 			if v, ok := c.Usage["memory"]; ok {
-				mem += v.Value()
+				cmem = v.Value()
+				mem += cmem
 			}
+			containers = append(containers, ContainerMetric{Name: c.Name, MemBytes: cmem})
 		}
 		snap.Pods = append(snap.Pods, PodMetric{
-			UID:       pm.UID,
-			Namespace: pm.Namespace,
-			Name:      pm.Name,
-			CPUMilli:  cpu,
-			MemBytes:  mem,
+			UID:        pm.UID,
+			Namespace:  pm.Namespace,
+			Name:       pm.Name,
+			CPUMilli:   cpu,
+			MemBytes:   mem,
+			Containers: containers,
 		})
 	}
 

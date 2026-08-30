@@ -682,9 +682,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if pm, ok := pmByKey[row.Namespace+"/"+row.Name]; ok {
 				row.CPUMilli = pm.CPUMilli
 				row.MemBytes = pm.MemBytes
+				row.ContainerMemBytes = containerMemByName(pm.Containers)
 				row.HasMetrics = true
 			} else {
 				row.HasMetrics = false
+				row.ContainerMemBytes = nil
 			}
 			m.pods[uid] = row
 		}
@@ -2001,14 +2003,15 @@ var podColumns = []column{
 	{min: 12, max: 18, prio: 2}, // NAMESPACE
 	{min: 20, max: 48, prio: 0}, // POD
 	{min: 10, max: 12, prio: 1}, // STATUS
-	{min: 10, max: 10, prio: 7}, // CONTAINERS
-	{min: 9, max: 9, prio: 6},   // RESTARTS
+	{min: 10, max: 10, prio: 8}, // CONTAINERS
+	{min: 9, max: 9, prio: 7},   // RESTARTS
 	{min: 5, max: 5, prio: 5},   // AGE
 	{min: 7, max: 7, prio: 3},   // CPU
 	{min: 9, max: 9, prio: 4},   // MEM
-	{min: 9, max: 9, prio: 9},   // ↓ NET
-	{min: 9, max: 9, prio: 10},  // ↑ NET
-	{min: 12, max: 24, prio: 8}, // NODE
+	{min: 5, max: 5, prio: 6},   // MEM%
+	{min: 9, max: 9, prio: 10},  // ↓ NET
+	{min: 9, max: 9, prio: 11},  // ↑ NET
+	{min: 12, max: 24, prio: 9}, // NODE
 }
 
 func (m Model) renderTable(maxRows int, maxWidth int) string {
@@ -2045,9 +2048,10 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 		padCellANSIRight(mark(SortAge, "AGE"), w[5]),
 		padCellANSIRight(mark(SortCPU, "CPU"), w[6]),
 		padCellANSIRight(mark(SortMem, "MEM"), w[7]),
-		padCellANSIRight(mark(SortNetRX, "↓ NET"), w[8]),
-		padCellANSIRight(mark(SortNetTX, "↑ NET"), w[9]),
-		padCellANSI(mark(SortNode, "NODE"), w[10]),
+		padCellANSIRight(mark(SortMemPct, "MEM%"), w[8]),
+		padCellANSIRight(mark(SortNetRX, "↓ NET"), w[9]),
+		padCellANSIRight(mark(SortNetTX, "↑ NET"), w[10]),
+		padCellANSI(mark(SortNode, "NODE"), w[11]),
 	)
 
 	var b strings.Builder
@@ -2089,6 +2093,10 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 			cpuStr = formatCPU(r.CPUMilli)
 			memStr = formatMem(r.MemBytes)
 		}
+		memPctCell := m.Theme.Base.Render("—")
+		if p, ok := podMemPct(r); ok {
+			memPctCell = m.Theme.loadStyle(p).Render(fmt.Sprintf("%d%%", p))
+		}
 		rxStr, txStr := "—", "—"
 		if r.HasNetwork {
 			rxStr = formatRate(r.NetRXBps)
@@ -2103,9 +2111,10 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 			padColRight(formatAge(r.CreatedAt), w[5], m.Theme.Base),
 			padColRight(cpuStr, w[6], m.Theme.Base),
 			padColRight(memStr, w[7], m.Theme.Base),
-			padColRight(rxStr, w[8], m.Theme.Base),
-			padColRight(txStr, w[9], m.Theme.Base),
-			padCol(shortHost(r.Node), w[10], m.Theme.Base),
+			padCellANSIRight(memPctCell, w[8]),
+			padColRight(rxStr, w[9], m.Theme.Base),
+			padColRight(txStr, w[10], m.Theme.Base),
+			padCol(shortHost(r.Node), w[11], m.Theme.Base),
 		)
 		if r.UID == m.cursor {
 			line = renderSelected(line)

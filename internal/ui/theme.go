@@ -38,6 +38,18 @@ func DefaultTheme() Theme {
 	}
 }
 
+// loadStyle maps a utilisation percent onto the shared 60/80
+// thresholds; >100 falls into the ≥80 red bucket.
+func (t Theme) loadStyle(p int) lipgloss.Style {
+	switch {
+	case p >= 80:
+		return t.StatusBad
+	case p >= 60:
+		return t.StatusWrn
+	}
+	return t.StatusOK
+}
+
 // styleForPhase returns the right colour style for a Pod phase.
 func (t Theme) styleForPhase(p corev1.PodPhase) lipgloss.Style {
 	switch p {

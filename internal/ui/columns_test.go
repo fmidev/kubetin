@@ -62,7 +62,7 @@ func podHeaderAt(t *testing.T, width int) string {
 // narrow panes and keep the full set on wide ones.
 func TestPodTableResponsiveColumns(t *testing.T) {
 	wide := podHeaderAt(t, 170)
-	for _, label := range []string{"NAMESPACE", "POD", "STATUS", "CONTAINERS", "RESTARTS", "AGE", "CPU", "MEM", "NET", "NODE"} {
+	for _, label := range []string{"NAMESPACE", "POD", "STATUS", "CONTAINERS", "RESTARTS", "AGE", "CPU", "MEM", "MEM%", "NET", "NODE"} {
 		if !strings.Contains(wide, label) {
 			t.Errorf("wide header missing %q: %q", label, wide)
 		}
@@ -74,7 +74,9 @@ func TestPodTableResponsiveColumns(t *testing.T) {
 			t.Errorf("80-cell header missing %q: %q", label, narrow)
 		}
 	}
-	for _, label := range []string{"NET", "NODE"} {
+	// "MEM%" must be checked explicitly — Contains(x, "MEM") matches
+	// either label.
+	for _, label := range []string{"MEM%", "NET", "NODE"} {
 		if strings.Contains(narrow, label) {
 			t.Errorf("80-cell header should have dropped %q: %q", label, narrow)
 		}
