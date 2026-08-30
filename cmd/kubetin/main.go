@@ -973,17 +973,24 @@ var errNoHealthyCluster = errors.New("no healthy cluster appeared")
 // watchPickTimeout is how long we wait for a probe to report a healthy
 // cluster before opening on the first context regardless.
 //
-// Sized to one probe round plus slack, because a second round can never
-// land inside it: runOne starts its interval ticker only after the
-// initial probe returns, so on a failing fleet the next attempt is at
-// (first probe + probe interval) — well past any sane deadline. And one
-// round is bounded: probeOnce runs all four of its API calls under a
-// single ProbeTimeout budget and commits Reach only after the last one.
+// A second round can never land inside it: runOne starts its interval
+// ticker only after the initial probe returns, so on a failing fleet
+// the next attempt is at (first probe + probe interval) — well past any
+// sane deadline.
 //
-// So waiting longer than this cannot turn up a healthy cluster, it just
-// holds a blank terminal. This was 30s, which meant ~25s of dead wait
-// whenever the fleet was down — the symptom that made kubetin look
-// hung before the fallback below existed.
+// The window is sized against a *down* fleet, not a slow one. probeOnce
+// now gives each of its four calls its own ProbeTimeout, so a healthy
+// round is bounded by 4×ProbeTimeout rather than one — but an
+// unreachable cluster still commits on the first call, which is the
+// case this deadline exists to cut short. Waiting 4× would hold a blank
+// terminal for 20s every time the fleet is down, and this was 30s once:
+// ~25s of dead wait was the symptom that made kubetin look hung before
+// the fallback below existed.
+//
+// The trade: a healthy cluster whose round runs past this window is not
+// yet Healthy when we pick, so startup opens elsewhere and its rail row
+// turns green a moment later. Cheap and self-correcting, where a longer
+// wait is neither.
 var watchPickTimeout = cluster.ProbeTimeout + 3*time.Second
 
 // pickWatchContext chooses the context to open on. An explicit -watch

@@ -25,9 +25,21 @@ import (
 	"github.com/fmidev/kubetin/internal/model"
 )
 
-// ProbeTimeout is the per-attempt deadline for a single /version probe.
-// Aggressive on purpose: a hung exec-auth plugin must not stall the loop.
-const ProbeTimeout = 5 * time.Second
+// ProbeTimeout is the deadline for a single API call in a probe round,
+// applied per call rather than to the round as a whole. Aggressive on
+// purpose: a hung exec-auth plugin must not stall the loop.
+//
+// It was once the budget for the whole round, back when the round was
+// one /version call. It has since grown to four, and four round trips
+// over a high-latency link overrun 5s while every individual call
+// succeeds: 1.1s + 1.1s + 2.2s + 1.0s measured against a cluster whose
+// nodes were all Ready, which the probe then committed as Degraded,
+// "context deadline exceeded". Distance should cost latency, not
+// correctness.
+//
+// A var rather than a const only so tests can shrink it; nothing
+// mutates it at runtime.
+var ProbeTimeout = 5 * time.Second
 
 // listAllOpts is the no-cache, no-pagination ListOptions we use for
 // the cheap node-count probe.
@@ -253,10 +265,9 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 		s.commit(ctxName, pf, model.ReachAuthFailed)
 		return
 	}
+	// Bounds each individual request the same way the per-call contexts
+	// below do, including the ones client-go retries internally.
 	restCfg.Timeout = ProbeTimeout
-
-	probeCtx, cancel := context.WithTimeout(parent, ProbeTimeout)
-	defer cancel()
 
 	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
@@ -266,7 +277,9 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	}
 
 	start := time.Now()
-	v, err := serverVersion(probeCtx, clientset.Discovery())
+	versionCtx, cancelVersion := context.WithTimeout(parent, ProbeTimeout)
+	v, err := serverVersion(versionCtx, clientset.Discovery())
+	cancelVersion()
 	if err != nil {
 		pf.LastError = trimError(err)
 		s.commit(ctxName, pf, classify(err))
@@ -281,23 +294,54 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	// this before deciding to skip the node probe — the kubeconfig's
 	// namespace hint alone is unreliable (microk8s pins "default"
 	// even for cluster-admins).
-	scopedNS := s.ResolveScope(probeCtx, ctxName, clientset)
+	// No wrapper deadline: resolveScopeNow applies its own ProbeTimeout,
+	// which is what every watcher already relies on.
+	scopedNS := s.ResolveScope(parent, ctxName, clientset)
 	var res nodeProbeResult
 	if scopedNS == "" {
 		// Cluster-scoped flow: list nodes for count + allocatable.
 		// RBAC failures here don't kill the cluster — they demote it
 		// to Degraded.
 		var nodeErr error
-		res, nodeErr = s.probeNodes(probeCtx, clientset)
-		if nodeErr != nil {
-			pf.LastError = trimError(nodeErr)
-		}
-		pf.NodeCount = res.Count
-		pf.NodeReady = res.ReadyCount
-		pf.AllocCPUMilli = res.AllocCPUMilli
-		pf.AllocMemBytes = res.AllocMemBytes
-		if res.Reach == model.ReachDegraded && nodeErr == nil {
-			pf.LastError = fmt.Sprintf("nodes %d/%d ready", res.ReadyCount, res.Count)
+		nodeCtx, cancelNodes := context.WithTimeout(parent, ProbeTimeout)
+		res, nodeErr = s.probeNodes(nodeCtx, clientset)
+		cancelNodes()
+		if isTimeout(nodeErr) {
+			// /version already answered, so the API is up and this is a
+			// slow path, not a sick cluster. Committing res here would
+			// blank the counts to "unknown", drop the allocatable totals
+			// the sidebar bars are drawn from, and paint Degraded — the
+			// false alarm a relayed link raises every time it stalls.
+			// Carry the last known detail forward and leave reach be.
+			prev, _ := s.store.Get(ctxName)
+			pf.NodeCount = prev.NodeCount
+			pf.NodeReady = prev.NodeReady
+			pf.AllocCPUMilli = prev.AllocCPUMilli
+			pf.AllocMemBytes = prev.AllocMemBytes
+			if prev.ServerVersion == "" {
+				// No round has ever completed, so there is no detail to
+				// carry: -1 is the model's "unknown", which the UI
+				// already renders as "—". Keyed on the version rather
+				// than on a zero count, because a cluster that really
+				// does list zero nodes has a zero count worth keeping.
+				pf.NodeCount = -1
+			}
+			res.Reach = prev.Reach
+			if res.Reach != model.ReachHealthy && res.Reach != model.ReachDegraded {
+				res.Reach = model.ReachHealthy
+			}
+			pf.LastError = "node list timed out; showing last known"
+		} else {
+			if nodeErr != nil {
+				pf.LastError = trimError(nodeErr)
+			}
+			pf.NodeCount = res.Count
+			pf.NodeReady = res.ReadyCount
+			pf.AllocCPUMilli = res.AllocCPUMilli
+			pf.AllocMemBytes = res.AllocMemBytes
+			if res.Reach == model.ReachDegraded && nodeErr == nil {
+				pf.LastError = fmt.Sprintf("nodes %d/%d ready", res.ReadyCount, res.Count)
+			}
 		}
 	} else {
 		// Scoped flow: assume Healthy until pod-access proves otherwise.
@@ -312,7 +356,17 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	// 403'd). For namespace-scoped: this IS the liveness check.
 	finalReach := res.Reach
 	if finalReach == model.ReachHealthy {
-		if perr := s.probePodAccess(probeCtx, ctxName, clientset); perr != nil {
+		podCtx, cancelPods := context.WithTimeout(parent, ProbeTimeout)
+		perr := s.probePodAccess(podCtx, ctxName, clientset)
+		cancelPods()
+		switch {
+		case isTimeout(perr):
+			// Abandoning the call is not a finding. A 403 here is; a
+			// stalled relay is not.
+			if pf.LastError == "" {
+				pf.LastError = "pod access check timed out"
+			}
+		case perr != nil:
 			finalReach = model.ReachDegraded
 			if pf.LastError == "" {
 				pf.LastError = trimError(perr)
@@ -356,6 +410,22 @@ func (s *Supervisor) probePodAccess(ctx context.Context, ctxName string, clients
 // nodeProbeResult bundles what probeNodes derived from a single
 // nodes.list call. Reach + err describe the call's success; count and
 // AllocCPU/Mem are the aggregated allocatable resources.
+// isTimeout reports whether err is us giving up on a call rather than
+// the cluster answering. The distinction matters: a deadline we chose
+// is not a finding about the cluster's health. Over a relayed link a
+// single list can stall for 10s while the API server answers the same
+// query in 50ms when asked locally.
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 type nodeProbeResult struct {
 	Reach         model.Reach
 	Count         int
