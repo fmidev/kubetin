@@ -68,15 +68,19 @@ func (m Model) renderSidebar(height int) string {
 // sortKey, so every press jumped to a seemingly random row and the
 // order changed again whenever a probe moved a cluster between tiers.
 func (m Model) focusOrder() []string {
-	// Keys are read once, up front. Probes move clusters between reach
-	// tiers from their own goroutines, so a comparator that called
-	// Store.Get would be sorting against a store that changes underneath
-	// it — an inconsistent Less, and an order matching no rail the user
-	// ever saw. renderSidebar takes one Snapshot for the same reason.
+	// One Snapshot, exactly as renderSidebar takes: probes move clusters
+	// between reach tiers from their own goroutines, and per-cluster
+	// Store.Get calls would each take the lock at a different instant —
+	// an order assembled from states that never coexisted. Keys are then
+	// fixed before the sort, so Less can't go inconsistent underneath it.
+	states := make(map[string]model.ClusterState)
+	for _, st := range m.Store.Snapshot() {
+		states[st.Context] = st
+	}
 	type entry struct{ ctx, key string }
 	entries := make([]entry, 0, len(m.Contexts))
 	for _, c := range m.Contexts {
-		st, ok := m.Store.Get(c)
+		st, ok := states[c]
 		if !ok {
 			// Not probed yet: same tier the rail gives ReachUnknown.
 			st = model.ClusterState{Context: c}

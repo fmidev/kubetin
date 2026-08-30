@@ -121,7 +121,7 @@ kubetin -trust
 | Move | `j` / `↓` | next row |
 | | `k` / `↑` | previous row |
 | | `g` / `G` | first / last row |
-| Cluster | `Tab` / `Shift-Tab` | next / previous cluster, in rail order |
+| Cluster | `Tab` / `Shift-Tab` | next / previous cluster in rail order (prefers reachable) |
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
 | | `1` – `6` | pods / deployments / services / ingresses / nodes / namespaces |
