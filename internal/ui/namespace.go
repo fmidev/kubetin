@@ -181,27 +181,34 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
+// nsColumns is the Namespace table in display order. The three count
+// columns are one cell wider than their header labels so the sort
+// arrow has room — without it padCellANSIRight truncates the arrow off
+// the right edge (same trick colRst uses in the pod table).
+//
+// LABELS is dropped first: it is the widest column and the least load-
+// bearing, and this table used to hardcode 60 cells for it on a row
+// that always came to 141 regardless of the pane.
+var nsColumns = []column{
+	{min: 20, max: 36, prio: 0}, // NAME
+	{min: 7, max: 14, prio: 1},  // STATUS
+	{min: 5, max: 5, prio: 3},   // AGE
+	{min: 5, max: 5, prio: 4},   // PODS
+	{min: 4, max: 4, prio: 5},   // DEP
+	{min: 4, max: 4, prio: 2},   // WRN — the column this view exists for
+	{min: 16, max: 60, prio: 6}, // LABELS
+}
+
 // renderNamespacesView is the Namespace table — mirrors the
 // deployment table layout, with STATUS color-coded:
 //
 //	Active       → green
 //	Terminating  → yellow (red when stuck for > ~10 min would be a
 //	                       v2 polish; v1 keeps it simple)
-func (m Model) renderNamespacesView(maxRows, _ int) string {
-	const (
-		colName   = 36
-		colStatus = 14
-		colAge    = 5
-		// Three resource-count sub-columns, headed PODS / DEP / WRN.
-		// Each column is one cell wider than the header label so the
-		// sort arrow has room when the column is the active sort —
-		// without that extra cell padCellANSIRight truncates the arrow
-		// off the right edge (same trick colRst uses in the pod table).
-		colPods   = 5
-		colDeps   = 4
-		colWarn   = 4
-		colLabels = 60
-	)
+func (m Model) renderNamespacesView(maxRows, maxWidth int) string {
+	w := fitColumns(nsColumns, maxWidth-1)
+	colName, colStatus, colAge := w[0], w[1], w[2]
+	colPods, colDeps, colWarn, colLabels := w[3], w[4], w[5], w[6]
 
 	// Single-pass count of pods / deploys / warning events per
 	// namespace. Avoids O(N · (P+D+E)) inside the row loop.
@@ -235,14 +242,15 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 		}
 		return base + arrowStyle.Render(arrow)
 	}
-	header := " " +
-		padCellANSI(mark(NsSortName, "NAME"), colName) + "  " +
-		padCellANSI(mark(NsSortStatus, "STATUS"), colStatus) + "  " +
-		padCellANSIRight(mark(NsSortAge, "AGE"), colAge) + "  " +
-		padCellANSIRight(mark(NsSortPods, "PODS"), colPods) + "  " +
-		padCellANSIRight(mark(NsSortDeps, "DEP"), colDeps) + "  " +
-		padCellANSIRight(mark(NsSortWarn, "WRN"), colWarn) + "  " +
-		padCellANSI(hdr.Render("LABELS"), colLabels)
+	header := " " + joinCells(
+		padCellANSI(mark(NsSortName, "NAME"), colName),
+		padCellANSI(mark(NsSortStatus, "STATUS"), colStatus),
+		padCellANSIRight(mark(NsSortAge, "AGE"), colAge),
+		padCellANSIRight(mark(NsSortPods, "PODS"), colPods),
+		padCellANSIRight(mark(NsSortDeps, "DEP"), colDeps),
+		padCellANSIRight(mark(NsSortWarn, "WRN"), colWarn),
+		padCellANSI(hdr.Render("LABELS"), colLabels),
+	)
 
 	var b strings.Builder
 	b.WriteString(header)
@@ -299,14 +307,15 @@ func (m Model) renderNamespacesView(maxRows, _ int) string {
 		// One leading space replaces the warnGlyph column that the
 		// pod / deploy / node tables use — namespaces don't have a
 		// useful "has-recent-warning" signal of their own.
-		line := " " +
-			padCol(nsNameCell(r), colName, m.Theme.Base) + "  " +
-			padCol(string(r.Phase), colStatus, statusStyle) + "  " +
-			padColRight(formatAge(r.CreatedAt), colAge, m.Theme.Base) + "  " +
-			padColRight(itoa(c.pods), colPods, m.Theme.Base) + "  " +
-			padColRight(itoa(c.deploys), colDeps, m.Theme.Base) + "  " +
-			padColRight(itoa(c.warnings), colWarn, warnStyle) + "  " +
-			padCol(labelSummary(r.Labels, colLabels), colLabels, m.Theme.Dim)
+		line := " " + joinCells(
+			padCol(nsNameCell(r), colName, m.Theme.Base),
+			padCol(string(r.Phase), colStatus, statusStyle),
+			padColRight(formatAge(r.CreatedAt), colAge, m.Theme.Base),
+			padColRight(itoa(c.pods), colPods, m.Theme.Base),
+			padColRight(itoa(c.deploys), colDeps, m.Theme.Base),
+			padColRight(itoa(c.warnings), colWarn, warnStyle),
+			padCol(labelSummary(r.Labels, colLabels), colLabels, m.Theme.Dim),
+		)
 		if r.UID == m.cursor {
 			line = renderSelected(line)
 		}
