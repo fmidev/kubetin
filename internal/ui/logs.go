@@ -195,6 +195,7 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	m.logs.searchMatches = nil
 	m.logs.searchIdx = 0
 	m.logs.searchFocused = false
+	m.syncDashboardLogTarget(ref, container)
 	cb := m.OnLogsStart
 	focused := m.WatchedContext
 	req := LogStartMsg{Session: m.logs.session, Ref: ref, Container: container, Tail: tail}

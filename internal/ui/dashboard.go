@@ -321,13 +321,43 @@ func (m Model) dashActionTarget() (cluster.DescribeRef, types.UID, bool) {
 	if !ok {
 		return cluster.DescribeRef{}, "", false
 	}
-	if sub, ok := m.dashSubjectNow(); ok && sub.isDeploy() && m.dashboard.focus == dashPaneMain {
+	// No subject means the object has gone from the informer cache and
+	// the pane already says so. Offering Delete on a name that may
+	// since belong to a replacement object is worse than doing
+	// nothing, so Enter is inert there.
+	sub, ok := m.dashSubjectNow()
+	if !ok {
+		return cluster.DescribeRef{}, "", false
+	}
+	if sub.isDeploy() && m.dashboard.focus == dashPaneMain {
 		if i := m.dashboard.podCursor; i >= 0 && i < len(sub.Pods) {
 			p := sub.Pods[i]
 			return podRefFor(p), p.UID, true
 		}
 	}
 	return t.Ref, t.UID, true
+}
+
+// syncDashboardLogTarget re-points the dashboard at a stream started
+// from outside it — the Logs action on a replica picked in the PODS
+// pane, or the container picker. Closing the full-screen viewer over
+// an open dashboard deliberately keeps the stream alive and drops back
+// to the log pane, so without this the pane would render one pod while
+// logRef named another, and `c` would silently cycle the containers of
+// the pod the dashboard originally chose and switch back to it.
+func (m *Model) syncDashboardLogTarget(ref cluster.DescribeRef, container string) {
+	if !m.dashboard.open {
+		return
+	}
+	m.dashboard.logRef = ref
+	m.dashboard.containers = m.containersFor(ref)
+	m.dashboard.containerI = 0
+	for i, c := range m.dashboard.containers {
+		if c == container {
+			m.dashboard.containerI = i
+			break
+		}
+	}
 }
 
 // focusedPaneSize is the content width and height of the pane j/k is

@@ -1416,3 +1416,60 @@ func TestDashEnterAfterDrillIn(t *testing.T) {
 		t.Errorf("menu uid = %q, want %q", o.actionMenu.uid, want.UID)
 	}
 }
+
+// A dashboard whose subject has gone from the cache renders "no longer
+// present"; Enter must not offer actions against that name, which may
+// since have been reused by a replacement object.
+func TestDashEnterInertWhenSubjectGone(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	delete(m.deployments, "dep-uid")
+
+	opened, _ := m.handleDashboardKey(key("enter"))
+	if o := opened.(Model); o.actionMenu.open {
+		t.Errorf("action menu opened for a vanished %s/%s",
+			o.actionMenu.ref.Kind, o.actionMenu.ref.Name)
+	}
+}
+
+// Streaming a replica's logs from the action menu retargets the
+// dashboard too. Closing the viewer keeps the stream and drops back to
+// the log pane, so the pane would otherwise render replica B while `c`
+// cycled replica A's containers and switched the pane back to it.
+func TestDashLogsActionRetargetsLogPane(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { return nil }
+	target, _ := m.dashboard.target()
+	m.prepareLogTarget(target)
+	if m.dashboard.logRef.Name == "payments-api-7f9c8-bbbbb" {
+		t.Fatal("premise broken: the dashboard already streams the replica under test")
+	}
+
+	// Select the second replica and take Logs from its action menu.
+	// The action itself is driven directly: the menu's own Enter is
+	// RBAC-gated, which is orthogonal to what's under test here.
+	moved, _ := m.handleDashboardKey(key("j"))
+	menu, _ := moved.(Model).handleDashboardKey(key("enter"))
+	picking, _ := menu.(Model).executeAction(ActLogs)
+	// Two containers, so the picker stands between here and a stream.
+	chosen, _ := picking.(Model).handleContainerPickerKey(key("j"))
+	streaming, _ := chosen.(Model).handleContainerPickerKey(key("enter"))
+	o := streaming.(Model)
+
+	if o.dashboard.logRef.Name != "payments-api-7f9c8-bbbbb" {
+		t.Errorf("dashboard logRef = %q, want the selected replica", o.dashboard.logRef.Name)
+	}
+	if got := o.dashboard.containers; len(got) != 2 || got[1] != "envoy" {
+		t.Errorf("dashboard containers = %v, want the selected replica's", got)
+	}
+	if o.dashboard.containerI != 1 {
+		t.Errorf("containerI = %d, want 1 (the container the picker chose)", o.dashboard.containerI)
+	}
+
+	// And `c` from the dashboard now cycles that replica, not the one
+	// the dashboard picked for itself when it opened.
+	back, _ := o.closeLogs()
+	cycled, _ := back.(Model).handleDashboardKey(key("c"))
+	if got := cycled.(Model).logs.ref.Name; got != "payments-api-7f9c8-bbbbb" {
+		t.Errorf("c switched the stream to %q", got)
+	}
+}
