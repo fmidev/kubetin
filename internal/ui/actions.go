@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
 )
@@ -209,8 +210,13 @@ type actionItem struct {
 
 // actionMenuState is the modal's state.
 type actionMenuState struct {
-	open    bool
-	ref     cluster.DescribeRef
+	open bool
+	ref  cluster.DescribeRef
+	// uid is the store key for ref. Carried alongside because the
+	// menu can target something the table cursor isn't on (a replica
+	// picked in the dashboard's PODS pane), and Dashboard needs the
+	// UID that goes with the ref rather than whatever the cursor is.
+	uid     types.UID
 	options []actionItem
 	cursor  int
 	notice  string // ephemeral status line (e.g. "Logs: not yet implemented")

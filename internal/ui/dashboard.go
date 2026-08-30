@@ -299,9 +299,35 @@ func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.openDescribeFor(t.Ref)
 		}
 	case "enter":
-		return m.openActionMenu()
+		ref, uid, ok := m.dashActionTarget()
+		if !ok {
+			return m, nil
+		}
+		return m.openActionMenuFor(ref, uid)
 	}
 	return m, nil
+}
+
+// dashActionTarget is what Enter acts on: the replica under the PODS-
+// pane cursor when that pane is focused, otherwise the dashboard's own
+// target. The table cursor — which is what the action menu resolves
+// from everywhere else — is the wrong source here. It still points at
+// the row the dashboard was opened from, so selecting a replica and
+// pressing Enter offered the parent Deployment's Scale and Restart
+// instead of the pod's own actions, and drilling into a pod with `i`
+// had the same problem one level down.
+func (m Model) dashActionTarget() (cluster.DescribeRef, types.UID, bool) {
+	t, ok := m.dashboard.target()
+	if !ok {
+		return cluster.DescribeRef{}, "", false
+	}
+	if sub, ok := m.dashSubjectNow(); ok && sub.isDeploy() && m.dashboard.focus == dashPaneMain {
+		if i := m.dashboard.podCursor; i >= 0 && i < len(sub.Pods) {
+			p := sub.Pods[i]
+			return podRefFor(p), p.UID, true
+		}
+	}
+	return t.Ref, t.UID, true
 }
 
 // focusedPaneSize is the content width and height of the pane j/k is

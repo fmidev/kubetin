@@ -33,6 +33,8 @@ func key(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyShiftTab}
 	case "esc":
 		return tea.KeyMsg{Type: tea.KeyEsc}
+	case "enter":
+		return tea.KeyMsg{Type: tea.KeyEnter}
 	}
 	panic("unhandled key " + s)
 }
@@ -1340,5 +1342,77 @@ func TestDashEventLineCountMatchesNaturalRender(t *testing.T) {
 		if got != want {
 			t.Errorf("n=%d: counted %d lines, natural render has %d", n, got, want)
 		}
+	}
+}
+
+// Enter inside a Deployment dashboard must act on the replica the
+// PODS pane has selected. The action menu resolves from the table
+// cursor everywhere else, and that cursor is still parked on the
+// deployment row the dashboard was opened from — so a selected pod
+// got offered Scale and Restart for its parent.
+func TestDashEnterTargetsSelectedPod(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	moved, _ := m.handleDashboardKey(key("j"))
+	opened, _ := moved.(Model).handleDashboardKey(key("enter"))
+	o := opened.(Model)
+
+	if !o.actionMenu.open {
+		t.Fatal("enter did not open the action menu")
+	}
+	want := m.deployOwnedPods(m.deployments["dep-uid"])[1]
+	if o.actionMenu.ref.Kind != "Pod" || o.actionMenu.ref.Name != want.Name {
+		t.Errorf("menu ref = %s/%s, want Pod/%s",
+			o.actionMenu.ref.Kind, o.actionMenu.ref.Name, want.Name)
+	}
+	if o.actionMenu.uid != want.UID {
+		t.Errorf("menu uid = %q, want %q", o.actionMenu.uid, want.UID)
+	}
+	for _, it := range o.actionMenu.options {
+		if it.Action == ActScale || it.Action == ActRestart {
+			t.Errorf("deployment-only action %q offered for a pod", it.Action.Label())
+		}
+	}
+}
+
+// With focus off the PODS pane the subject is the dashboard's own
+// target again — otherwise a Deployment dashboard could never reach
+// Scale or Restart.
+func TestDashEnterTargetsSubjectOffPodsPane(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	m.dashboard.focus = dashPaneEvents
+
+	opened, _ := m.handleDashboardKey(key("enter"))
+	o := opened.(Model)
+	if o.actionMenu.ref.Kind != "Deployment" || o.actionMenu.ref.Name != "payments-api" {
+		t.Errorf("menu ref = %s/%s, want Deployment/payments-api",
+			o.actionMenu.ref.Kind, o.actionMenu.ref.Name)
+	}
+	if o.actionMenu.uid != types.UID("dep-uid") {
+		t.Errorf("menu uid = %q, want dep-uid", o.actionMenu.uid)
+	}
+}
+
+// Drilling into a pod retargets Enter one level down too: `i` leaves
+// focus on the logs pane, so this is the stack target rather than the
+// pod-cursor path, and the table cursor still says "dep-uid".
+func TestDashEnterAfterDrillIn(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { return nil }
+
+	drilled, _ := m.handleDashboardKey(key("i"))
+	d := drilled.(Model)
+	if d.cursor != "dep-uid" {
+		t.Fatalf("premise broken: table cursor moved to %q", d.cursor)
+	}
+	want := m.deployOwnedPods(m.deployments["dep-uid"])[0]
+
+	opened, _ := d.handleDashboardKey(key("enter"))
+	o := opened.(Model)
+	if o.actionMenu.ref.Kind != "Pod" || o.actionMenu.ref.Name != want.Name {
+		t.Errorf("menu ref = %s/%s, want Pod/%s",
+			o.actionMenu.ref.Kind, o.actionMenu.ref.Name, want.Name)
+	}
+	if o.actionMenu.uid != want.UID {
+		t.Errorf("menu uid = %q, want %q", o.actionMenu.uid, want.UID)
 	}
 }
