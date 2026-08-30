@@ -121,7 +121,7 @@ kubetin -trust
 | Move | `j` / `↓` | next row |
 | | `k` / `↑` | previous row |
 | | `g` / `G` | first / last row |
-| Cluster | `Tab` / `Shift-Tab` | next / previous reachable cluster |
+| Cluster | `Tab` / `Shift-Tab` | next / previous cluster in rail order (prefers reachable) |
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
 | | `1` – `6` | pods / deployments / services / ingresses / nodes / namespaces |
@@ -151,6 +151,7 @@ kubetin -trust
 |---|---|
 | `$XDG_CONFIG_HOME/kubetin/trusted-kubeconfigs` | sha256 allow-list of trusted kubeconfig files |
 | `$XDG_STATE_HOME/kubetin/debug.log` | klog output and audit breadcrumbs (mode `0600`) |
+| `$XDG_STATE_HOME/kubetin/last-context` | cluster to reopen on next launch (mode `0600`) |
 
 ## Layout
 

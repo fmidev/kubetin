@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -122,16 +123,8 @@ func main() {
 }
 
 func openDebugLog() (*os.File, error) {
-	state := os.Getenv("XDG_STATE_HOME")
-	if state == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		state = filepath.Join(home, ".local", "state")
-	}
-	dir := filepath.Join(state, "kubetin")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dir, err := stateDir()
+	if err != nil {
 		return nil, err
 	}
 	// 0o600 — file is the only audit trail for delete + secret-reveal
@@ -152,14 +145,19 @@ func openDebugLog() (*os.File, error) {
 // coordinator goroutine owns the active watcher so focus switches can
 // cancel and replace it without race conditions.
 func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, contexts []string, want string, noWatch, hideSidebar bool, logTail int, restoreStderr func()) {
-	selected, err := pickWatchContext(ctx, store, want, contexts, watchPickTimeout)
+	last := loadLastContext()
+	selected, err := pickWatchContext(ctx, store, want, last, contexts, watchPickTimeout)
 	switch {
 	case errors.Is(err, errNoHealthyCluster):
 		// A fleet that is entirely unreachable is exactly when the user
-		// wants the monitor open, so this opens on the first context and
-		// lets the sidebar report why each cluster is red.
-		klog.Warningf("startup: %v; opening on %q", err, contexts[0])
+		// wants the monitor open, so this opens on the remembered (or
+		// first) context and lets the sidebar report why each cluster
+		// is red.
 		selected = contexts[0]
+		if slices.Contains(contexts, last) {
+			selected = last
+		}
+		klog.Warningf("startup: %v; opening on %q", err, selected)
 	case err != nil:
 		// A bad -watch name or a cancelled startup stays fatal, and must
 		// restore fd 2 before printing — otherwise the message goes to
@@ -187,6 +185,13 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	// Build the watch coordinator first so we can wire its switchTo
 	// into the model before bubbletea takes ownership.
 	var coord *watchCoordinator
+	// focusContext is switchTo plus the "reopen here next time" record.
+	// Wrapped here rather than inside the coordinator so the coordinator
+	// stays about watcher lifetimes.
+	focusContext := func(c string) {
+		saveLastContext(c)
+		coord.switchTo(c)
+	}
 	if !noWatch {
 		coord = &watchCoordinator{
 			parent: ctx,
@@ -195,7 +200,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 			stopCh: make(chan struct{}),
 			doneCh: make(chan struct{}),
 		}
-		m.OnFocusChange = coord.switchTo
+		m.OnFocusChange = focusContext
 	}
 
 	// Wire describe so the UI can fetch live YAML via the supervisor
@@ -451,7 +456,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	if coord != nil {
 		coord.prog = prog
 		go coord.loop()
-		coord.switchTo(selected)
+		focusContext(selected)
 	}
 
 	defer func() {
@@ -918,7 +923,7 @@ func runHeadless(ctx context.Context, store *model.Store, sup *cluster.Superviso
 	if !noWatch {
 		go func() {
 			defer close(watchDone)
-			selected, err := pickWatchContext(ctx, store, want, contexts, watchPickTimeout)
+			selected, err := pickWatchContext(ctx, store, want, "", contexts, watchPickTimeout)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "kubetin: -watch: %v\n", err)
 				return
@@ -982,11 +987,12 @@ var errNoHealthyCluster = errors.New("no healthy cluster appeared")
 var watchPickTimeout = cluster.ProbeTimeout + 3*time.Second
 
 // pickWatchContext chooses the context to open on. An explicit -watch
-// wins outright; otherwise we give the probes `timeout` to report a
-// healthy cluster so we land on one that works. Running out of time is
-// only fatal for the headless caller — runTUI falls back to the first
-// context and starts anyway.
-func pickWatchContext(ctx context.Context, store *model.Store, want string, contexts []string, timeout time.Duration) (string, error) {
+// wins outright; then `prefer` (the cluster the last session ended on)
+// if it comes up healthy; otherwise we give the probes `timeout` to
+// report a healthy cluster so we land on one that works. Running out of
+// time is only fatal for the headless caller — runTUI falls back to the
+// first context and starts anyway.
+func pickWatchContext(ctx context.Context, store *model.Store, want, prefer string, contexts []string, timeout time.Duration) (string, error) {
 	if want != "" {
 		for _, c := range contexts {
 			if c == want {
@@ -995,7 +1001,30 @@ func pickWatchContext(ctx context.Context, store *model.Store, want string, cont
 		}
 		return "", fmt.Errorf("context %q not found in kubeconfig", want)
 	}
+	if !slices.Contains(contexts, prefer) {
+		// Renamed, removed, or from a kubeconfig that is no longer
+		// trusted. Not an error — just nothing to prefer.
+		prefer = ""
+	}
 	firstHealthy := func() (string, bool) {
+		if prefer != "" {
+			st, ok := store.Get(prefer)
+			switch {
+			case ok && (st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded):
+				// Degraded is good enough to reopen on: the API answered,
+				// and Tab already treats it as somewhere you can be. The
+				// unpreferred scan below stays healthy-only — that is a
+				// pick for the user, not a place they asked to return to.
+				return prefer, true
+			case !ok || st.Reach == model.ReachUnknown || st.Reach == model.ReachConnecting:
+				// The remembered cluster has not reported yet. Wait for
+				// it rather than opening on whichever context answered
+				// first, or the preference would only ever hold when the
+				// remembered cluster is also the fastest to probe. The
+				// deadline below drops it if it never resolves.
+				return "", false
+			}
+		}
 		for _, c := range contexts {
 			if st, ok := store.Get(c); ok && st.Reach == model.ReachHealthy {
 				return c, true
@@ -1027,6 +1056,10 @@ func pickWatchContext(ctx context.Context, store *model.Store, want string, cont
 			// this timer firing — the scan only runs every 500ms. Look
 			// once more before writing the fleet off, or we open on
 			// contexts[0] with a healthy cluster sitting in the store.
+			// Without the preference this time: a remembered cluster
+			// still stuck at "connecting" must not mask the rest of a
+			// fleet that is up.
+			prefer = ""
 			if c, ok := firstHealthy(); ok {
 				return c, nil
 			}

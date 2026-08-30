@@ -164,3 +164,98 @@ func TestHiddenRailKeepsClusterSwitching(t *testing.T) {
 		t.Errorf("WatchedContext = %q, want beta", m.WatchedContext)
 	}
 }
+
+// Tab used to walk m.Contexts (kubeconfig discovery order) while the
+// rail draws clusters sorted by reach tier then name, so a press could
+// jump anywhere in the visible list. Here the discovery order is the
+// exact reverse of the rail order.
+func TestTabFollowsRailOrder(t *testing.T) {
+	m := sidebarModel([]string{"gamma", "beta", "alpha"}, 120, 20)
+	for _, c := range []string{"alpha", "beta", "gamma"} {
+		m.Store.ApplyProbe(c, model.ProbeFields{Reach: model.ReachHealthy})
+	}
+	m.OnFocusChange = func(string) {}
+
+	for _, want := range []string{"beta", "gamma", "alpha"} {
+		if cmd := m.cycleFocus(+1); cmd == nil {
+			t.Fatalf("cycleFocus returned no command before %q", want)
+		}
+		if m.WatchedContext != want {
+			t.Fatalf("Tab went to %q, want %q (rail order)", m.WatchedContext, want)
+		}
+	}
+	for _, want := range []string{"gamma", "beta", "alpha"} {
+		if cmd := m.cycleFocus(-1); cmd == nil {
+			t.Fatalf("cycleFocus returned no command before %q", want)
+		}
+		if m.WatchedContext != want {
+			t.Fatalf("Shift-Tab went to %q, want %q (rail order)", m.WatchedContext, want)
+		}
+	}
+}
+
+// The rail sorts unreachable clusters last, so an unhealthy cluster
+// changes where its neighbours sit — Tab has to track that, not the
+// kubeconfig order it had at startup.
+func TestTabOrderTracksReachTier(t *testing.T) {
+	m := sidebarModel([]string{"alpha", "beta", "gamma"}, 120, 20)
+	m.Store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	m.Store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachUnreachable})
+	m.Store.ApplyProbe("gamma", model.ProbeFields{Reach: model.ReachHealthy})
+	m.OnFocusChange = func(string) {}
+
+	// Rail order is alpha, gamma, beta — so Tab from alpha skips the
+	// unreachable beta and lands on gamma.
+	m.cycleFocus(+1)
+	if m.WatchedContext != "gamma" {
+		t.Fatalf("Tab went to %q, want gamma (beta is unreachable)", m.WatchedContext)
+	}
+	m.cycleFocus(+1)
+	if m.WatchedContext != "alpha" {
+		t.Fatalf("Tab went to %q, want alpha (wrapping past unreachable beta)", m.WatchedContext)
+	}
+}
+
+// With only the focused cluster reachable, Tab used to land back on it
+// at the last step: a full watcher teardown and re-list that looked to
+// the user like the key had simply stopped working. Move to the
+// neighbour instead — its rail row says why it is red.
+func TestTabFallsBackToUnreachableNeighbour(t *testing.T) {
+	m := sidebarModel([]string{"alpha", "beta", "gamma"}, 120, 20)
+	m.Store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	m.Store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachUnreachable})
+	m.Store.ApplyProbe("gamma", model.ProbeFields{Reach: model.ReachAuthFailed})
+	m.OnFocusChange = func(string) {}
+
+	// Rail order: alpha (healthy), beta, gamma (both tier 4/3 — auth
+	// sorts before unreachable, so gamma is next).
+	if cmd := m.cycleFocus(+1); cmd == nil {
+		t.Fatal("Tab dead-ended with two unreachable clusters to visit")
+	}
+	if m.WatchedContext == "alpha" {
+		t.Fatal("Tab re-selected the focused cluster instead of moving")
+	}
+	first := m.WatchedContext
+
+	if cmd := m.cycleFocus(-1); cmd == nil {
+		t.Fatal("Shift-Tab dead-ended")
+	}
+	if m.WatchedContext != "alpha" {
+		t.Fatalf("Shift-Tab from %q went to %q, want back to alpha", first, m.WatchedContext)
+	}
+}
+
+// A context the store has not answered for yet must not be a hole Tab
+// falls through: it is drawn in the rail, so it is reachable by Tab.
+func TestTabReachesUnprobedContext(t *testing.T) {
+	m := sidebarModel([]string{"alpha", "beta"}, 120, 20)
+	m.Store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	m.OnFocusChange = func(string) {}
+
+	if cmd := m.cycleFocus(+1); cmd == nil {
+		t.Fatal("Tab refused to move to an unprobed context")
+	}
+	if m.WatchedContext != "beta" {
+		t.Errorf("WatchedContext = %q, want beta", m.WatchedContext)
+	}
+}

@@ -169,12 +169,12 @@ func TestPickWatchContextExplicit(t *testing.T) {
 
 	// An explicit -watch is honoured without waiting on a probe: the
 	// whole point is opening a cluster that may well be down.
-	got, err := pickWatchContext(context.Background(), store, "beta", contexts, watchPickTimeout)
+	got, err := pickWatchContext(context.Background(), store, "beta", "", contexts, watchPickTimeout)
 	if err != nil || got != "beta" {
 		t.Fatalf("want beta/nil, got %q/%v", got, err)
 	}
 
-	if _, err := pickWatchContext(context.Background(), store, "nope", contexts, watchPickTimeout); err == nil {
+	if _, err := pickWatchContext(context.Background(), store, "nope", "", contexts, watchPickTimeout); err == nil {
 		t.Fatal("unknown -watch context should be an error")
 	}
 }
@@ -184,7 +184,7 @@ func TestPickWatchContextPrefersHealthy(t *testing.T) {
 	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachUnreachable})
 	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachHealthy})
 
-	got, err := pickWatchContext(context.Background(), store, "", []string{"alpha", "beta"}, watchPickTimeout)
+	got, err := pickWatchContext(context.Background(), store, "", "", []string{"alpha", "beta"}, watchPickTimeout)
 	if err != nil || got != "beta" {
 		t.Fatalf("want the healthy context, got %q/%v", got, err)
 	}
@@ -197,7 +197,7 @@ func TestPickWatchContextTimeoutIsRecoverable(t *testing.T) {
 	store := model.NewStore()
 	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachUnreachable})
 
-	_, err := pickWatchContext(context.Background(), store, "", []string{"alpha"}, 10*time.Millisecond)
+	_, err := pickWatchContext(context.Background(), store, "", "", []string{"alpha"}, 10*time.Millisecond)
 	if !errors.Is(err, errNoHealthyCluster) {
 		t.Fatalf("timeout must be recoverable so runTUI falls back; got %v", err)
 	}
@@ -220,7 +220,7 @@ func TestPickWatchContextHealthyOnTheDeadline(t *testing.T) {
 		store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachHealthy})
 	}()
 
-	got, err := pickWatchContext(context.Background(), store, "", []string{"alpha", "beta"}, 200*time.Millisecond)
+	got, err := pickWatchContext(context.Background(), store, "", "", []string{"alpha", "beta"}, 200*time.Millisecond)
 	if err != nil || got != "beta" {
 		t.Fatalf("want beta/nil, got %q/%v", got, err)
 	}
@@ -237,7 +237,7 @@ func TestPickWatchContextCancelledBeatsDeadline(t *testing.T) {
 	cancel()
 
 	for i := 0; i < 200; i++ {
-		_, err := pickWatchContext(ctx, store, "", []string{"alpha"}, time.Nanosecond)
+		_, err := pickWatchContext(ctx, store, "", "", []string{"alpha"}, time.Nanosecond)
 		if errors.Is(err, errNoHealthyCluster) {
 			t.Fatalf("run %d: aborted startup classified as a recoverable timeout", i)
 		}
@@ -251,11 +251,133 @@ func TestPickWatchContextCancelledIsFatal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := pickWatchContext(ctx, store, "", []string{"alpha"}, watchPickTimeout)
+	_, err := pickWatchContext(ctx, store, "", "", []string{"alpha"}, watchPickTimeout)
 	if err == nil {
 		t.Fatal("cancelled context should be an error")
 	}
 	if errors.Is(err, errNoHealthyCluster) {
 		t.Fatal("a cancelled startup must not be mistaken for a probe timeout")
+	}
+}
+
+// The remembered cluster wins over the merely-first-healthy one, so a
+// restart reopens where the user left off.
+func TestPickWatchContextPrefersRememberedContext(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachHealthy})
+
+	got, err := pickWatchContext(context.Background(), store, "", "beta", []string{"alpha", "beta"}, watchPickTimeout)
+	if err != nil || got != "beta" {
+		t.Fatalf("want the remembered context, got %q/%v", got, err)
+	}
+}
+
+// A remembered cluster that is down (renamed, decommissioned, VPN off)
+// must not hold startup hostage — the rest of the fleet still opens.
+func TestPickWatchContextRememberedUnhealthy(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachUnreachable})
+
+	got, err := pickWatchContext(context.Background(), store, "", "beta", []string{"alpha", "beta"}, watchPickTimeout)
+	if err != nil || got != "alpha" {
+		t.Fatalf("want the healthy context, got %q/%v", got, err)
+	}
+}
+
+// A stale name from a kubeconfig that has since changed is not an
+// error: it just stops being a preference.
+func TestPickWatchContextRememberedGone(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+
+	got, err := pickWatchContext(context.Background(), store, "", "deleted", []string{"alpha"}, watchPickTimeout)
+	if err != nil || got != "alpha" {
+		t.Fatalf("want alpha/nil, got %q/%v", got, err)
+	}
+}
+
+// The preference is worth waiting a probe round for — otherwise it only
+// ever holds when the remembered cluster is also the fastest to answer.
+func TestPickWatchContextWaitsForRememberedContext(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachConnecting})
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachHealthy})
+	}()
+
+	got, err := pickWatchContext(context.Background(), store, "", "beta", []string{"alpha", "beta"}, 2*time.Second)
+	if err != nil || got != "beta" {
+		t.Fatalf("want beta once its probe lands, got %q/%v", got, err)
+	}
+}
+
+// …but only for as long as the deadline. A remembered cluster stuck at
+// "connecting" must not mask a fleet that is up.
+func TestPickWatchContextRememberedNeverResolves(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachConnecting})
+
+	got, err := pickWatchContext(context.Background(), store, "", "beta", []string{"alpha", "beta"}, 100*time.Millisecond)
+	if err != nil || got != "alpha" {
+		t.Fatalf("want the deadline to drop the preference, got %q/%v", got, err)
+	}
+}
+
+// -watch is an explicit override and outranks the remembered context.
+func TestPickWatchContextWantBeatsRemembered(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachHealthy})
+
+	got, err := pickWatchContext(context.Background(), store, "alpha", "beta", []string{"alpha", "beta"}, watchPickTimeout)
+	if err != nil || got != "alpha" {
+		t.Fatalf("want -watch to win, got %q/%v", got, err)
+	}
+}
+
+func TestLastContextRoundTrip(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	if got := loadLastContext(); got != "" {
+		t.Errorf("missing state file should read as empty, got %q", got)
+	}
+	saveLastContext("prod (rke2/config)")
+	if got := loadLastContext(); got != "prod (rke2/config)" {
+		t.Errorf("loadLastContext = %q, want the saved name", got)
+	}
+	saveLastContext("staging")
+	if got := loadLastContext(); got != "staging" {
+		t.Errorf("loadLastContext = %q, want the overwritten name", got)
+	}
+}
+
+// Degraded means the API answered, and Tab already treats it as a
+// place you can be — so it is also a place you can be returned to.
+func TestPickWatchContextRememberedDegraded(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachDegraded})
+
+	got, err := pickWatchContext(context.Background(), store, "", "beta", []string{"alpha", "beta"}, watchPickTimeout)
+	if err != nil || got != "beta" {
+		t.Fatalf("want the remembered degraded context, got %q/%v", got, err)
+	}
+}
+
+// Context names are external identifiers: they have to come back out
+// byte for byte or they stop matching Discover()'s list.
+func TestLastContextPreservesSurroundingSpace(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	const name = " odd name (cfg) "
+	saveLastContext(name)
+	if got := loadLastContext(); got != name {
+		t.Errorf("loadLastContext = %q, want %q unchanged", got, name)
 	}
 }
