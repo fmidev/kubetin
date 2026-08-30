@@ -423,22 +423,6 @@ func (s *Supervisor) probePodAccess(ctx context.Context, ns string, clientset *k
 // nodeProbeResult bundles what probeNodes derived from a single
 // nodes.list call. Reach + err describe the call's success; count and
 // AllocCPU/Mem are the aggregated allocatable resources.
-// isTimeout reports whether err is us giving up on a call rather than
-// the cluster answering. The distinction matters: a deadline we chose
-// is not a finding about the cluster's health. Over a relayed link a
-// single list can stall for 10s while the API server answers the same
-// query in 50ms when asked locally.
-func isTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
-}
-
 type nodeProbeResult struct {
 	Reach         model.Reach
 	Count         int
@@ -607,6 +591,22 @@ func isNetworkError(err error) bool {
 		}
 	}
 	return false
+}
+
+// isTimeout reports whether err is us giving up on a call rather than
+// the cluster answering. The distinction matters: a deadline we chose
+// is not a finding about the cluster's health. Over a relayed link a
+// single list can stall for 10s while the API server answers the same
+// query in 50ms when asked locally.
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func trimError(err error) string {
