@@ -151,6 +151,7 @@ kubetin -trust
 |---|---|
 | `$XDG_CONFIG_HOME/kubetin/trusted-kubeconfigs` | sha256 allow-list of trusted kubeconfig files |
 | `$XDG_STATE_HOME/kubetin/debug.log` | klog output and audit breadcrumbs (mode `0600`) |
+| `$XDG_STATE_HOME/kubetin/last-context` | cluster to reopen on next launch (mode `0600`) |
 
 ## Layout
 
