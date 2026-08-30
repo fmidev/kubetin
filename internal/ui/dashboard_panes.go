@@ -444,7 +444,7 @@ func (m Model) renderDashLogs(w, h int) string {
 
 	out := make([]string, 0, h)
 	for _, ln := range lines[start:end] {
-		out = append(out, " "+truncate(oneLine(ln), w-1))
+		out = append(out, " "+fitLogLine(oneLine(ln), w-1))
 	}
 	return clampCanvas(strings.Join(out, "\n"), w, h)
 }

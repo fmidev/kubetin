@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -672,6 +673,178 @@ func highlightMatches(s, needle string, bold bool) string {
 	return b.String()
 }
 
+// sanitizeLogLine reduces a raw log line to text plus SGR colour
+// sequences. Everything else a container can write to its stdout —
+// cursor moves, screen erases, OSC title sets, charset switches, bare
+// control bytes — is dropped instead of being forwarded to the
+// terminal, where it would move the cursor outside the box we drew or
+// leave a mode set that survives closing the viewer.
+//
+// Sanitizing at ingest rather than at render is deliberate: the ring
+// buffer is also what search reads and what the dashboard's splice
+// helpers walk, and those assume every escape in a line is `CSI … m`.
+func sanitizeLogLine(s string) string {
+	if !needsSanitizing(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
+		case c == 0x1b:
+			i = copySGR(&b, s, i)
+			continue
+		case c == '\t':
+			// A raw tab jumps to the terminal's own tab stops, which
+			// the box we render into doesn't share, and measures as
+			// zero cells so the padding maths under-counts it too.
+			b.WriteString("    ")
+			i++
+			continue
+		case c < 0x20 || c == 0x7f:
+			i++
+			continue
+		case c < utf8.RuneSelf:
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		// Non-ASCII. Decode rather than copy bytes: a lone 0x9b is
+		// CSI to a terminal that hasn't been switched into UTF-8
+		// mode, and it reaches us intact because Scanner.Text() does
+		// no validation. Drop the C1 range in both its raw and its
+		// UTF-8 form, and drop bytes that decode to nothing at all.
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if (r == utf8.RuneError && size == 1) || r <= 0x9f {
+			i += size
+			continue
+		}
+		b.WriteString(s[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+// needsSanitizing is sanitizeLogLine's fast path. A line of printable
+// text — ASCII or well-formed multibyte — keeps its backing string
+// with no copy.
+func needsSanitizing(s string) bool {
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < 0x20 || c == 0x7f {
+			return true
+		}
+		if c < utf8.RuneSelf {
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if (r == utf8.RuneError && size == 1) || r <= 0x9f {
+			return true
+		}
+		i += size
+	}
+	return false
+}
+
+// copySGR consumes the escape sequence starting at s[i] (which is
+// ESC), writing it through only when it is an SGR sequence — `CSI … m`,
+// the colours the viewer is built to preserve. Returns the index one
+// past the sequence.
+func copySGR(b *strings.Builder, s string, i int) int {
+	if i+1 >= len(s) {
+		return len(s)
+	}
+	switch s[i+1] {
+	case '[':
+		// CSI: parameter and intermediate bytes (0x20–0x3f) followed
+		// by one final byte (0x40–0x7e).
+		j := i + 2
+		sgr := true
+		for j < len(s) && s[j] >= 0x20 && s[j] <= 0x3f {
+			// A final 'm' alone doesn't make it a colour: SGR takes
+			// digits, ';' and ':' (true-colour subparameters) and
+			// nothing else. `CSI > 4;2 m` sets xterm's modifyOtherKeys
+			// — a terminal mode that changes what keys the app sees,
+			// which no reset undoes and which outlives the viewer.
+			if (s[j] < '0' || s[j] > '9') && s[j] != ';' && s[j] != ':' {
+				sgr = false
+			}
+			j++
+		}
+		if j >= len(s) || s[j] < 0x40 || s[j] > 0x7e {
+			return j // line ended mid-sequence
+		}
+		if sgr && s[j] == 'm' {
+			b.WriteString(s[i : j+1])
+		}
+		return j + 1
+	case ']', 'P', 'X', '^', '_':
+		// OSC/DCS/SOS/PM/APC carry a payload the terminal swallows.
+		// Where it stops swallowing is what we have to match: consume
+		// less and the payload shows up as text, consume more and we
+		// eat the real log line behind it. Follows the vt500 parser:
+		// ST in all three spellings ends any of them, CAN and SUB
+		// cancel any of them, BEL ends OSC only (it is data inside a
+		// DCS), and any other ESC aborts the string and starts a new
+		// sequence — so hand that ESC back to the caller's loop.
+		osc := s[i+1] == ']'
+		for j := i + 2; j < len(s); j++ {
+			switch {
+			case s[j] == 0x18 || s[j] == 0x1a || s[j] == 0x9c:
+				return j + 1
+			case osc && s[j] == 0x07:
+				return j + 1
+			case s[j] == 0x1b:
+				if j+1 < len(s) && s[j+1] == '\\' {
+					return j + 2
+				}
+				return j
+			case s[j] == 0xc2 && j+1 < len(s) && s[j+1] == 0x9c:
+				return j + 2
+			}
+		}
+		return len(s)
+	}
+	// Everything else: optional intermediates, then one final byte.
+	j := i + 1
+	for j < len(s) && s[j] >= 0x20 && s[j] <= 0x2f {
+		j++
+	}
+	if j < len(s) {
+		j++
+	}
+	return j
+}
+
+// fitLogLine truncates a sanitized log line to width visible cells and
+// terminates any colour it leaves open.
+//
+// Both halves matter. `truncate` measures escape bytes as visible
+// cells and slices at a byte offset, so a coloured line came out cut
+// mid-sequence (`ESC [ 3` + the ellipsis) *and* stripped of its
+// closing `ESC [ 39 m` — the terminal then ate the following bytes
+// looking for a final byte, and the colour bled down the rest of the
+// screen and outlived the viewer. visiblePrefix cuts on visible-cell
+// boundaries and never splits an escape; the trailing reset covers
+// both the codes the cut dropped and producers that never reset at
+// all.
+func fitLogLine(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	out := s
+	if lipgloss.Width(s) > width {
+		prefix, _ := visiblePrefix(s, width-1)
+		out = prefix + "…"
+	}
+	if strings.IndexByte(out, 0x1b) >= 0 {
+		out += "\x1b[0m"
+	}
+	return out
+}
+
 // applyLogLine appends a line to the ring buffer with capacity bound.
 // While the user is paused (!follow), bump scroll by the number of
 // new lines so the visible window stays anchored to the same absolute
@@ -688,7 +861,9 @@ func (m *Model) applyLogLines(lines []string) {
 	if len(lines) == 0 {
 		return
 	}
-	m.logs.lines = append(m.logs.lines, lines...)
+	for _, ln := range lines {
+		m.logs.lines = append(m.logs.lines, sanitizeLogLine(ln))
+	}
 	added := len(lines)
 
 	// Trim the head if we're over cap. A trim of N means the absolute
@@ -788,7 +963,7 @@ func (m Model) renderLogs(canvasWidth, canvasHeight int) string {
 
 	for i, ln := range lines[start:end] {
 		absIdx := start + i
-		rendered := truncate(ln, innerW)
+		rendered := fitLogLine(ln, innerW)
 		if matchSet != nil {
 			if _, hit := matchSet[absIdx]; hit {
 				bold := absIdx == currentMatchLine

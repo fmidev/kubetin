@@ -199,6 +199,20 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.logs.cap = 100
 			m.logs.follow = true
 		}},
+		// A pod that colours its output: the codes must not be counted
+		// as visible cells (the line would be cut short) nor sliced by
+		// the cut (the terminal would eat what follows).
+		{"logs-ansi-noise", 100, 24, ViewPods, func(m *Model) {
+			m.logs.open = true
+			m.logs.cap = 100
+			m.logs.follow = true
+			m.logs.container = "main"
+			m.applyLogLines([]string{
+				"2026-08-29T21:29:59Z \x1b[42m\x1b[1m\x1b[37m" +
+					strings.Repeat("Launched Synapse server ", 12) + "\x1b[39m\x1b[22m\x1b[49m",
+				"progress\t50%\rprogress\t100%",
+			})
+		}},
 		{"logs-search-active", 120, 40, ViewPods, func(m *Model) {
 			m.logs.open = true
 			m.logs.lines = []string{"hello world", "matchme", "noise", "matchme again"}
