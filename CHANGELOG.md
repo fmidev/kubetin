@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.8.1](https://github.com/fmidev/kubetin/compare/v1.8.0...v1.8.1) (2026-08-30)
+
+
+### Bug Fixes
+
+* act on the selected pod in the dashboard's action menu ([#61](https://github.com/fmidev/kubetin/issues/61)) ([70fdaee](https://github.com/fmidev/kubetin/commit/70fdaeef4a690118ca9e6e25be4bda1fd217f9a2))
+* colour node container dots by state, not readiness ([#64](https://github.com/fmidev/kubetin/issues/64)) ([4b7a55d](https://github.com/fmidev/kubetin/commit/4b7a55db906230fe23a8c7fe43245dfda6467f50))
+* Tab cluster cycling order + remember the last cluster ([#65](https://github.com/fmidev/kubetin/issues/65)) ([cb32e31](https://github.com/fmidev/kubetin/commit/cb32e31691835ee49dd5c643e13d3677c6f16ab3))
+
 ## [1.8.0](https://github.com/fmidev/kubetin/compare/v1.7.0...v1.8.0) (2026-08-30)
 
 
