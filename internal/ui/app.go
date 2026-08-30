@@ -1395,8 +1395,11 @@ func (m Model) handleFilterKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// cycleFocus moves focus to the next/previous context with a healthy
-// or degraded probe state. Falls back to any context if none qualify.
+// cycleFocus moves focus to the next/previous context in the order the
+// cluster rail draws them, preferring one with a healthy or degraded
+// probe state. Falls back to the next context in the direction of
+// travel if none qualify, so Tab can never dead-end on a fleet where
+// only the focused cluster is up.
 func (m *Model) cycleFocus(delta int) tea.Cmd {
 	// <=1 rather than ==0: with a single context the loop below lands
 	// back on the context already focused and "switches" to it, which
@@ -1406,37 +1409,57 @@ func (m *Model) cycleFocus(delta int) tea.Cmd {
 	if len(m.Contexts) <= 1 || m.OnFocusChange == nil {
 		return nil
 	}
+	order := m.focusOrder()
 	idx := -1
-	for i, c := range m.Contexts {
+	for i, c := range order {
 		if c == m.WatchedContext {
 			idx = i
 			break
 		}
 	}
-	n := len(m.Contexts)
+	n := len(order)
+	fallback := ""
 	for step := 1; step <= n; step++ {
 		j := ((idx+delta*step)%n + n) % n
-		c := m.Contexts[j]
-		st, ok := m.Store.Get(c)
-		if !ok {
+		c := order[j]
+		// The last step lands back on the focused context; re-selecting
+		// it is the same no-navigation resync the guard above avoids.
+		// (With idx == -1 — focus not in the list at all — nothing
+		// matches and every context stays a candidate.)
+		if c == m.WatchedContext {
 			continue
 		}
-		if st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded {
-			m.WatchedContext = c
-			// Permissions are per-cluster — a stale entry from the old
-			// context would let the new view paint a confident wrong
-			// answer (the RBAC overlay especially, which renders straight
-			// from cache). Drop both caches; they refill on demand.
-			m.permissions = make(map[string]permState)
-			m.permissionsInFlight = make(map[string]struct{})
-			cb := m.OnFocusChange
-			return func() tea.Msg {
-				cb(c)
-				return PodsClearedMsg{}
-			}
+		st, ok := m.Store.Get(c)
+		if ok && (st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded) {
+			return m.focusContext(c)
+		}
+		if fallback == "" {
+			fallback = c
 		}
 	}
+	// Nothing reachable to move to, but the user still asked to move:
+	// take the immediate neighbour. Its rail row already says why it is
+	// red, which beats a key that silently does nothing.
+	if fallback != "" {
+		return m.focusContext(fallback)
+	}
 	return nil
+}
+
+// focusContext points the watchers and the tables at ctx.
+func (m *Model) focusContext(c string) tea.Cmd {
+	m.WatchedContext = c
+	// Permissions are per-cluster — a stale entry from the old
+	// context would let the new view paint a confident wrong
+	// answer (the RBAC overlay especially, which renders straight
+	// from cache). Drop both caches; they refill on demand.
+	m.permissions = make(map[string]permState)
+	m.permissionsInFlight = make(map[string]struct{})
+	cb := m.OnFocusChange
+	return func() tea.Msg {
+		cb(c)
+		return PodsClearedMsg{}
+	}
 }
 
 func (m *Model) moveCursor(delta int) {

@@ -62,6 +62,25 @@ func (m Model) renderSidebar(height int) string {
 	)
 }
 
+// focusOrder returns the switchable contexts in the order the rail
+// draws them. Tab used to walk m.Contexts — kubeconfig discovery order
+// — while the rail (and the overview, and the debug view) all sort by
+// sortKey, so every press jumped to a seemingly random row and the
+// order changed again whenever a probe moved a cluster between tiers.
+func (m Model) focusOrder() []string {
+	out := append([]string(nil), m.Contexts...)
+	key := func(c string) string {
+		st, ok := m.Store.Get(c)
+		if !ok {
+			// Not probed yet: same tier the rail gives ReachUnknown.
+			st = model.ClusterState{Context: c}
+		}
+		return sortKey(st)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return key(out[i]) < key(out[j]) })
+	return out
+}
+
 func sortKey(st model.ClusterState) string {
 	// Healthy and degraded first, unreachable last; then alpha.
 	tier := 5
