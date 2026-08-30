@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.8.0](https://github.com/fmidev/kubetin/compare/v1.7.0...v1.8.0) (2026-08-30)
+
+
+### Features
+
+* events become a lens, not a view ([#50](https://github.com/fmidev/kubetin/issues/50)) ([b70192f](https://github.com/fmidev/kubetin/commit/b70192fbfd436177bcf3b0077464009885b3b760))
+* scrollable help, and `l` for logs ([#51](https://github.com/fmidev/kubetin/issues/51)) ([e723185](https://github.com/fmidev/kubetin/commit/e7231855784bc087155b13889ab59cfdee0d9e92))
+
+
+### Bug Fixes
+
+* don't exit silently when no cluster is reachable at startup ([#58](https://github.com/fmidev/kubetin/issues/58)) ([2c21274](https://github.com/fmidev/kubetin/commit/2c21274640e6c8646280473469dab1b76d13d24c))
+* let the stacked dashboard's log pane fill a tall window ([#54](https://github.com/fmidev/kubetin/issues/54)) ([8a4eeda](https://github.com/fmidev/kubetin/commit/8a4eeda0d1de7425ecf09e6d66b97f4458a974ea))
+* scroll the focused pane in the stacked dashboard ([#56](https://github.com/fmidev/kubetin/issues/56)) ([deeec37](https://github.com/fmidev/kubetin/commit/deeec3741d28f8822aed443ce5769585edf3dd11))
+* stop pod log colours from corrupting the screen ([#59](https://github.com/fmidev/kubetin/issues/59)) ([4ee0f65](https://github.com/fmidev/kubetin/commit/4ee0f653bb816491ee8be5cd74f2abe68ff41ed2))
+
+
+### Performance Improvements
+
+* format only the event rows the pane displays ([#57](https://github.com/fmidev/kubetin/issues/57)) ([ac9f273](https://github.com/fmidev/kubetin/commit/ac9f273252d4b4860de97c0fc753561237a75182))
+
 ## [1.7.0](https://github.com/fmidev/kubetin/compare/v1.6.0...v1.7.0) (2026-08-26)
 
 
