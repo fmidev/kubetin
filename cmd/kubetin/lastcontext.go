@@ -43,7 +43,12 @@ func loadLastContext() string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(b))
+	// Only the newline saveLastContext appends: context names are
+	// external identifiers that have to match Discover()'s list byte for
+	// byte, and a kubeconfig may legally quote one with leading or
+	// trailing spaces. TrimSpace would silently stop such a name from
+	// ever matching again.
+	return strings.TrimSuffix(string(b), "\n")
 }
 
 // saveLastContext records ctx as the context to reopen on. Best effort:

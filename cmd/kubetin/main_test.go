@@ -356,3 +356,28 @@ func TestLastContextRoundTrip(t *testing.T) {
 		t.Errorf("loadLastContext = %q, want the overwritten name", got)
 	}
 }
+
+// Degraded means the API answered, and Tab already treats it as a
+// place you can be — so it is also a place you can be returned to.
+func TestPickWatchContextRememberedDegraded(t *testing.T) {
+	store := model.NewStore()
+	store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
+	store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachDegraded})
+
+	got, err := pickWatchContext(context.Background(), store, "", "beta", []string{"alpha", "beta"}, watchPickTimeout)
+	if err != nil || got != "beta" {
+		t.Fatalf("want the remembered degraded context, got %q/%v", got, err)
+	}
+}
+
+// Context names are external identifiers: they have to come back out
+// byte for byte or they stop matching Discover()'s list.
+func TestLastContextPreservesSurroundingSpace(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	const name = " odd name (cfg) "
+	saveLastContext(name)
+	if got := loadLastContext(); got != name {
+		t.Errorf("loadLastContext = %q, want %q unchanged", got, name)
+	}
+}

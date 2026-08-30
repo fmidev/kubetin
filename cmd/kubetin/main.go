@@ -1010,7 +1010,11 @@ func pickWatchContext(ctx context.Context, store *model.Store, want, prefer stri
 		if prefer != "" {
 			st, ok := store.Get(prefer)
 			switch {
-			case ok && st.Reach == model.ReachHealthy:
+			case ok && (st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded):
+				// Degraded is good enough to reopen on: the API answered,
+				// and Tab already treats it as somewhere you can be. The
+				// unpreferred scan below stays healthy-only — that is a
+				// pick for the user, not a place they asked to return to.
 				return prefer, true
 			case !ok || st.Reach == model.ReachUnknown || st.Reach == model.ReachConnecting:
 				// The remembered cluster has not reported yet. Wait for
