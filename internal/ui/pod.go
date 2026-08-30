@@ -26,8 +26,7 @@ type podRow struct {
 	Restarts        int32
 	Node            string
 	Containers      []string
-	ContainerReady  []bool                   // parallel to apiserver ContainerStatuses
-	ContainerStates []cluster.ContainerState // parallel to ContainerReady, drives Lens-style colours
+	ContainerStates []cluster.ContainerState // parallel to apiserver ContainerStatuses, drives Lens-style colours
 	CreatedAt       time.Time
 	Updated         time.Time
 
@@ -131,7 +130,6 @@ func applyPodEvent(m map[types.UID]podRow, ev cluster.PodEvent) {
 		r.Restarts = ev.Restarts
 		r.Node = ev.NodeName
 		r.Containers = ev.Containers
-		r.ContainerReady = ev.ContainerReady
 		r.ContainerStates = ev.ContainerStates
 		r.CreatedAt = ev.CreatedAt
 		r.Updated = time.Now()

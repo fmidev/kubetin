@@ -47,9 +47,9 @@ const (
 )
 
 // ContainerInfo is the per-container projection the status dashboard
-// renders. ContainerReady / ContainerStates are derived from this same
-// slice in emit, so the table's dot colours and the dashboard's
-// container rows can never disagree about a container's state.
+// renders. ContainerStates is derived from this same slice in emit,
+// so the tables' dot colours and the dashboard's container rows can
+// never disagree about a container's state.
 type ContainerInfo struct {
 	Name     string
 	Image    string
@@ -103,24 +103,18 @@ type PodEvent struct {
 	CreatedAt  time.Time
 	Containers []string // names of spec.containers (excluding init/ephemeral)
 
-	// Per-container readiness, parallel to ContainerStatuses ordering
-	// in the apiserver response. Drives the per-container dot column
-	// in the Node view; we project just the bool because the rest of
-	// the status (image, state) isn't needed downstream and we don't
-	// want to pin the full *corev1.Pod in memory.
-	ContainerReady []bool
-
-	// Per-container coarse state, parallel to ContainerReady. Drives
-	// the four-colour dot column in the Pod view (green/yellow/red/
-	// dim). Kept alongside ContainerReady because the Node view's
-	// aggregate cares only about ready/not-ready and we don't want
-	// every consumer to re-project from a richer enum.
+	// Per-container coarse state, parallel to ContainerStatuses
+	// ordering in the apiserver response. Drives the four-colour dot
+	// column in both the Pod and Node views (green/yellow/red/dim).
+	// We project just the enum because the rest of the status isn't
+	// needed downstream and we don't want to pin the full
+	// *corev1.Pod in memory.
 	ContainerStates []ContainerState
 
 	// Rich per-container detail for the status dashboard. Same
-	// ordering and length as ContainerReady / ContainerStates (both
-	// are derived from this), so it is likewise shorter than
-	// Containers until kubelet reports every status.
+	// ordering and length as ContainerStates (which is derived from
+	// this), so it is likewise shorter than Containers until kubelet
+	// reports every status.
 	ContainerInfo     []ContainerInfo
 	InitContainerInfo []ContainerInfo
 
@@ -227,10 +221,8 @@ func (w *PodWatcher) emit(kind PodEventKind, obj any) {
 	// shorter than Containers; consumers treat missing entries as
 	// "not yet known".
 	info := projectContainerInfo(pod.Status.ContainerStatuses)
-	ready := make([]bool, 0, len(info))
 	states := make([]ContainerState, 0, len(info))
 	for _, ci := range info {
-		ready = append(ready, ci.Ready)
 		states = append(states, ci.State)
 	}
 	var started time.Time
@@ -248,7 +240,6 @@ func (w *PodWatcher) emit(kind PodEventKind, obj any) {
 		Restarts:          totalRestarts(pod),
 		CreatedAt:         pod.CreationTimestamp.Time,
 		Containers:        containers,
-		ContainerReady:    ready,
 		ContainerStates:   states,
 		ContainerInfo:     info,
 		InitContainerInfo: projectContainerInfo(pod.Status.InitContainerStatuses),

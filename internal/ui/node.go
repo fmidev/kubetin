@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -86,14 +87,18 @@ func nodeRolesLabel(r nodeRow) string {
 	return strings.Join(r.Roles, ",")
 }
 
-// nodeContainerCounts is a per-node tally of container readiness,
+// nodeContainerCounts is a per-node tally of container states,
 // computed once per render and reused across all rows.
 type nodeContainerCounts struct {
-	ready, notReady int
+	ready, waiting, errored, terminated int
 }
 
-// nodeContainerStates walks the pod cache and groups container ready
-// states by spec.nodeName. Pods without a NodeName (Pending/scheduling)
+func (c nodeContainerCounts) total() int {
+	return c.ready + c.waiting + c.errored + c.terminated
+}
+
+// nodeContainerStates walks the pod cache and groups container states
+// by spec.nodeName. Pods without a NodeName (Pending/scheduling)
 // are skipped — they're not on a node yet so they wouldn't render
 // anywhere useful.
 func nodeContainerStates(pods map[types.UID]podRow) map[string]nodeContainerCounts {
@@ -103,11 +108,16 @@ func nodeContainerStates(pods map[types.UID]podRow) map[string]nodeContainerCoun
 			continue
 		}
 		c := out[p.Node]
-		for _, ready := range p.ContainerReady {
-			if ready {
+		for _, st := range p.ContainerStates {
+			switch st {
+			case cluster.ContainerReady:
 				c.ready++
-			} else {
-				c.notReady++
+			case cluster.ContainerWaiting:
+				c.waiting++
+			case cluster.ContainerError:
+				c.errored++
+			case cluster.ContainerTerminated:
+				c.terminated++
 			}
 		}
 		out[p.Node] = c
@@ -115,13 +125,18 @@ func nodeContainerStates(pods map[types.UID]podRow) map[string]nodeContainerCoun
 	return out
 }
 
-// containerDots renders one square dot per container — red for not-
-// ready, green for ready, with a single blank cell between dots so
-// each one reads as a distinct box (Lens-style). Not-ready dots come
-// first so the eye lands on them. Visible width = 2N − 1 cells per N
-// dots. Overflow surfaces as a dim "+N" suffix.
+// containerDots renders one square dot per container using the same
+// four colours as the Pod view — green ready, yellow waiting, red
+// errored, dim cleanly-terminated — with a single blank cell between
+// dots so each one reads as a distinct box (Lens-style). Visible
+// width = 2N − 1 cells per N dots. Overflow surfaces as a dim "+N"
+// suffix.
+//
+// Dots are emitted worst-first, so the ones that fit are the ones
+// worth seeing: a node hosting more containers than the column can
+// show still surfaces its crash loops.
 func containerDots(c nodeContainerCounts, width int, th Theme) string {
-	total := c.ready + c.notReady
+	total := c.total()
 	if total == 0 {
 		return th.Dim.Render("—")
 	}
@@ -144,28 +159,26 @@ func containerDots(c nodeContainerCounts, width int, th Theme) string {
 		overflow = total - maxDots
 	}
 
-	// Distribute red/green dots within budget, red first.
-	red := c.notReady
-	green := c.ready
-	if red > maxDots {
-		red = maxDots
-		green = 0
-	} else if red+green > maxDots {
-		green = maxDots - red
+	buckets := []struct {
+		n     int
+		style lipgloss.Style
+	}{
+		{c.errored, th.StatusBad},
+		{c.waiting, th.StatusWrn},
+		{c.ready, th.StatusOK},
+		{c.terminated, th.StatusDim},
 	}
 
 	var b strings.Builder
-	for i := 0; i < red; i++ {
-		if b.Len() > 0 {
-			b.WriteByte(' ')
+	drawn := 0
+	for _, bk := range buckets {
+		for i := 0; i < bk.n && drawn < maxDots; i++ {
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteString(bk.style.Render(dot))
+			drawn++
 		}
-		b.WriteString(th.StatusBad.Render(dot))
-	}
-	for i := 0; i < green; i++ {
-		if b.Len() > 0 {
-			b.WriteByte(' ')
-		}
-		b.WriteString(th.StatusOK.Render(dot))
 	}
 	if overflow > 0 {
 		b.WriteString(" " + th.Dim.Render(fmt.Sprintf("+%d", overflow)))

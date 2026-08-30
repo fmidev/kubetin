@@ -7,9 +7,8 @@ import (
 )
 
 // ContainerInfo is the single source of truth the coarse
-// ContainerReady / ContainerStates slices are derived from, so the
-// reason/exit-code detail must line up with the four-bucket state on
-// every entry.
+// ContainerStates slice is derived from, so the reason/exit-code
+// detail must line up with the four-bucket state on every entry.
 func TestProjectContainerInfo(t *testing.T) {
 	statuses := []corev1.ContainerStatus{
 		{
