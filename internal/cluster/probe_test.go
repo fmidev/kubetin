@@ -294,6 +294,61 @@ func TestProbeOnceKeepsAMeasuredZeroNodeCount(t *testing.T) {
 	}
 }
 
+// Not knowing is not the same as being fine. A cluster held at
+// Degraded by a real pod-access denial must not be promoted to Healthy
+// by a round whose pod check merely timed out — the timeout carries no
+// verdict, so the standing one stands.
+func TestProbeOncePodCheckTimeoutDoesNotClearADenial(t *testing.T) {
+	old := ProbeTimeout
+	ProbeTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { ProbeTimeout = old })
+
+	// Calls 1 and 2 are the scope probe and the first round's pod
+	// check, both denied. The third — the second round's pod check —
+	// stalls past the deadline.
+	var podCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/version":
+			io.WriteString(w, `{"major":"1","minor":"30","gitVersion":"v1.30.0"}`)
+		case "/api/v1/nodes":
+			io.WriteString(w, `{"kind":"NodeList","apiVersion":"v1","metadata":{},"items":[{`+
+				`"metadata":{"name":"n1"},`+
+				`"status":{"allocatable":{"cpu":"4","memory":"8Gi"},`+
+				`"conditions":[{"type":"Ready","status":"True"}]}}]}`)
+		case "/api/v1/pods":
+			if podCalls.Add(1) > 2 {
+				time.Sleep(600 * time.Millisecond)
+			}
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure",`+
+				`"message":"pods is forbidden","reason":"Forbidden","code":403}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	sup, store := newProbeFixture(t, srv, "")
+
+	sup.probeOnce(context.Background(), "slow")
+	if st, _ := store.Get("slow"); st.Reach != model.ReachDegraded {
+		t.Fatalf("first round: Reach = %v (%q), want degraded from the 403", st.Reach, st.LastError)
+	}
+
+	sup.probeOnce(context.Background(), "slow")
+
+	st, _ := store.Get("slow")
+	if st.Reach != model.ReachDegraded {
+		t.Errorf("Reach = %v (%q), want the denial to stand — the check timed out, it did not pass",
+			st.Reach, st.LastError)
+	}
+	if !strings.Contains(st.LastError, "timed out") {
+		t.Errorf("LastError = %q, want it to say the check timed out", st.LastError)
+	}
+}
+
 // A namespace-restricted context whose scope call stalls. ResolveScope
 // deliberately does not cache a transient failure, so NamespaceFor
 // still answers "" — and the pod access probe used to read that "" and

@@ -367,8 +367,22 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 		cancelPods()
 		switch {
 		case isTimeout(perr):
-			// Abandoning the call is not a finding. A 403 here is; a
-			// stalled relay is not.
+			// Abandoning the call is not a finding — and it is not a
+			// clean bill of health either. Leaving finalReach at the
+			// node result would let one stalled check clear a standing
+			// pod-access denial: a cluster with a real 403 would flip
+			// to Healthy the first time the link hiccuped. Carry the
+			// previous verdict instead, as the node path does.
+			//
+			// prev.Reach cannot say *which* check degraded the cluster,
+			// so a degradation the nodes have since recovered from
+			// lingers one round when the pod check also times out. It
+			// clears on the next conclusive round, and the alternative
+			// clears real findings, which is worse.
+			prev, _ := s.store.Get(ctxName)
+			if prev.Reach == model.ReachDegraded {
+				finalReach = model.ReachDegraded
+			}
 			if pf.LastError == "" {
 				pf.LastError = "pod access check timed out"
 			}
