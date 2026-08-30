@@ -50,7 +50,7 @@ Or grab a prebuilt binary from
 [Releases](https://github.com/fmidev/kubetin/releases):
 
 ```sh
-VERSION=v1.6.0
+VERSION=v1.8.0
 ARCH=darwin-arm64   # or linux-amd64, linux-arm64
 
 curl -fsSLO https://github.com/fmidev/kubetin/releases/download/$VERSION/kubetin-$VERSION-$ARCH.tar.gz
@@ -58,31 +58,10 @@ tar -xzf kubetin-$VERSION-$ARCH.tar.gz
 sudo install -m 755 kubetin-$VERSION-$ARCH/kubetin /usr/local/bin/kubetin
 ```
 
-### macOS: "Apple could not verify kubetin is free of malware"
-
-Release binaries are not notarized — that needs a paid Apple Developer
-account, which this project doesn't have. Nothing is wrong with the
-binary: the Go linker ad-hoc signs it, so it's intact and runnable.
-macOS refuses it because it arrived carrying a *quarantine* flag and
-Apple has never seen it. `spctl -a` reports `rejected` for the same
-reason.
-
-The `curl` + `tar` route above never sets that flag, so the prompt
-doesn't appear at all. It shows up when you download through a browser
-and unpack with Finder, which copies the flag onto the extracted files.
-
-If you've already hit it, clear the flag:
-
-```sh
-xattr -d com.apple.quarantine /usr/local/bin/kubetin
-```
-
-Or allow it through **System Settings → Privacy & Security**, where a
-"kubetin was blocked" row with an **Open Anyway** button appears
-immediately after a blocked launch attempt.
-
-`go install` compiles on your own machine, so nothing is ever
-quarantined and none of this applies.
+The macOS binaries are signed with a Developer ID and notarized by
+Apple, so they run without a Gatekeeper prompt. The first launch on a
+machine has to be online: a bare executable can't carry a stapled
+notarization ticket, so Gatekeeper fetches it once.
 
 ## Run
 
