@@ -781,16 +781,26 @@ func copySGR(b *strings.Builder, s string, i int) int {
 		}
 		return j + 1
 	case ']', 'P', 'X', '^', '_':
-		// OSC/DCS/SOS/PM/APC carry a payload up to BEL or ST. ST has
-		// three spellings and a terminal honours all of them, so we
-		// have to as well — stopping only at `ESC \` would swallow
-		// the ordinary log text after a C1-terminated one.
+		// OSC/DCS/SOS/PM/APC carry a payload the terminal swallows.
+		// Where it stops swallowing is what we have to match: consume
+		// less and the payload shows up as text, consume more and we
+		// eat the real log line behind it. Follows the vt500 parser:
+		// ST in all three spellings ends any of them, CAN and SUB
+		// cancel any of them, BEL ends OSC only (it is data inside a
+		// DCS), and any other ESC aborts the string and starts a new
+		// sequence — so hand that ESC back to the caller's loop.
+		osc := s[i+1] == ']'
 		for j := i + 2; j < len(s); j++ {
 			switch {
-			case s[j] == 0x07 || s[j] == 0x9c:
+			case s[j] == 0x18 || s[j] == 0x1a || s[j] == 0x9c:
 				return j + 1
-			case s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\':
-				return j + 2
+			case osc && s[j] == 0x07:
+				return j + 1
+			case s[j] == 0x1b:
+				if j+1 < len(s) && s[j+1] == '\\' {
+					return j + 2
+				}
+				return j
 			case s[j] == 0xc2 && j+1 < len(s) && s[j+1] == 0x9c:
 				return j + 2
 			}

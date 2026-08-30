@@ -292,6 +292,16 @@ func TestSanitizeLogLine(t *testing.T) {
 		// part of the control string.
 		{"osc c1-st-terminated dropped", "a\x1b]0;pwn\x9crest", "arest"},
 		{"osc utf8-st-terminated dropped", "a\x1b]0;pwn\u009crest", "arest"},
+		// BEL ends an OSC but is data inside a DCS, so the payload
+		// after it must keep being swallowed rather than surfacing
+		// as text.
+		{"dcs bel is not a terminator", "a\x1bPone\x07two\x1b\\b", "ab"},
+		// CAN and SUB return the terminal to ground from any control
+		// string; the log text after one has to survive.
+		{"can cancels a control string", "a\x1b]0;pwn\x18rest", "arest"},
+		{"sub cancels a control string", "a\x1bPpwn\x1arest", "arest"},
+		// Any other ESC aborts the string and begins a new sequence.
+		{"esc ends a control string", "a\x1b]0;pwn\x1b[31mred\x1b[0m", "a\x1b[31mred\x1b[0m"},
 		{"charset switch dropped", "a\x1b(0b", "ab"},
 		{"carriage return dropped", "50%\r100%", "50%100%"},
 		{"backspace dropped", "ab\x08c", "abc"},
