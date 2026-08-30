@@ -90,7 +90,13 @@ type contextSource struct {
 // "" if the context is cluster-scoped or hasn't been resolved yet.
 // Callers that need a definitive answer (the watchers, on startup)
 // should call ResolveScope with a clientset instead — this lookup is
-// the cheap read-only path used after resolution and by the UI.
+// the cheap read-only path.
+//
+// The two "" answers are indistinguishable here, which is a trap: a
+// scope call that failed transiently is deliberately not cached, so a
+// namespace-restricted context reads as cluster-scoped until a probe
+// succeeds. Anything that would act on that "" — listing cluster-wide,
+// say — must take the scope the round actually resolved instead.
 func (s *Supervisor) NamespaceFor(ctxName string) string {
 	if v, ok := s.scopes.Load(ctxName); ok {
 		return v.(string)
@@ -357,7 +363,7 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	finalReach := res.Reach
 	if finalReach == model.ReachHealthy {
 		podCtx, cancelPods := context.WithTimeout(parent, ProbeTimeout)
-		perr := s.probePodAccess(podCtx, ctxName, clientset)
+		perr := s.probePodAccess(podCtx, scopedNS, clientset)
 		cancelPods()
 		switch {
 		case isTimeout(perr):
@@ -377,16 +383,23 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 }
 
 // probePodAccess does a single LIST pods?limit=1 to confirm pod-list
-// access. Scoped to the kubeconfig-context's default namespace when
-// one is set — namespace-restricted users (typical OpenShift) will
-// always 403 on the cluster-wide ("") form. The scope decision matches
-// what the watcher loop will use, so a successful probe here implies
-// the watcher will sync.
+// access. ns is the scope this round resolved — the kubeconfig
+// context's default namespace when one is set, since namespace-
+// restricted users (typical OpenShift) always 403 on the cluster-wide
+// ("") form. The scope decision matches what the watcher loop will
+// use, so a successful probe here implies the watcher will sync.
+//
+// Taking ns as an argument rather than re-reading NamespaceFor is the
+// point: NamespaceFor only knows the *cached* scope, and ResolveScope
+// deliberately does not cache a transient failure. A scope call that
+// timed out would leave NamespaceFor answering "" for a restricted
+// user, sending this probe cluster-wide into a certain 403 — turning a
+// stalled call into a confident demotion, the exact thing the timeout
+// handling above exists to prevent.
 //
 // RBAC failures surface as "rbac: list pods denied"; transient list
 // failures as the raw error.
-func (s *Supervisor) probePodAccess(ctx context.Context, ctxName string, clientset *kubernetes.Clientset) error {
-	ns := s.NamespaceFor(ctxName)
+func (s *Supervisor) probePodAccess(ctx context.Context, ns string, clientset *kubernetes.Clientset) error {
 	type result struct{ err error }
 	ch := make(chan result, 1)
 	go func() {

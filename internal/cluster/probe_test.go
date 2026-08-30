@@ -99,7 +99,7 @@ func TestProbeOnceDeadlineIsPerCallNotPerRound(t *testing.T) {
 
 	srv := httptest.NewServer((&probeSrv{everyCall: perCall}).handler())
 	defer srv.Close()
-	sup, store := newProbeFixture(t, srv)
+	sup, store := newProbeFixture(t, srv, "")
 
 	sup.probeOnce(context.Background(), "slow")
 
@@ -158,7 +158,7 @@ func (p *probeSrv) handler() http.HandlerFunc {
 	}
 }
 
-func newProbeFixture(t *testing.T, srv *httptest.Server) (*Supervisor, *model.Store) {
+func newProbeFixture(t *testing.T, srv *httptest.Server, ns string) (*Supervisor, *model.Store) {
 	t.Helper()
 	cfg := clientcmdapi.NewConfig()
 	cfg.Clusters["c"] = &clientcmdapi.Cluster{Server: srv.URL}
@@ -169,7 +169,7 @@ func newProbeFixture(t *testing.T, srv *httptest.Server) (*Supervisor, *model.St
 	store := model.NewStore()
 	sup := New(&kubeconfig.Discovered{
 		Files:    []string{"/fake"},
-		Refs:     []kubeconfig.ContextRef{{Name: "slow", RawName: "ctx", File: "/fake"}},
+		Refs:     []kubeconfig.ContextRef{{Name: "slow", RawName: "ctx", File: "/fake", Namespace: ns}},
 		Configs:  map[string]*clientcmdapi.Config{"/fake": cfg},
 		Contexts: []string{"slow"},
 	}, store, time.Hour)
@@ -190,7 +190,7 @@ func TestProbeOnceKeepsLastKnownWhenNodeListTimesOut(t *testing.T) {
 	ps := &probeSrv{delay: 600 * time.Millisecond}
 	srv := httptest.NewServer(ps.handler())
 	defer srv.Close()
-	sup, store := newProbeFixture(t, srv)
+	sup, store := newProbeFixture(t, srv, "")
 
 	sup.probeOnce(context.Background(), "slow")
 	if st, _ := store.Get("slow"); st.Reach != model.ReachHealthy || st.NodeCount != 1 {
@@ -230,7 +230,7 @@ func TestProbeOnceFirstRoundNodeTimeoutReportsUnknownNotZero(t *testing.T) {
 	ps.slowNodes.Store(true)
 	srv := httptest.NewServer(ps.handler())
 	defer srv.Close()
-	sup, store := newProbeFixture(t, srv)
+	sup, store := newProbeFixture(t, srv, "")
 
 	sup.probeOnce(context.Background(), "slow")
 
@@ -253,7 +253,7 @@ func TestProbeOnceStillDegradesOnPodAccessDenied(t *testing.T) {
 	ps.forbidPods.Store(true)
 	srv := httptest.NewServer(ps.handler())
 	defer srv.Close()
-	sup, store := newProbeFixture(t, srv)
+	sup, store := newProbeFixture(t, srv, "")
 
 	sup.probeOnce(context.Background(), "slow")
 
@@ -278,7 +278,7 @@ func TestProbeOnceKeepsAMeasuredZeroNodeCount(t *testing.T) {
 	ps.slowNodes.Store(true)
 	srv := httptest.NewServer(ps.handler())
 	defer srv.Close()
-	sup, store := newProbeFixture(t, srv)
+	sup, store := newProbeFixture(t, srv, "")
 
 	// A completed round that measured an empty cluster.
 	store.ApplyProbe("slow", model.ProbeFields{
@@ -291,5 +291,54 @@ func TestProbeOnceKeepsAMeasuredZeroNodeCount(t *testing.T) {
 
 	if st, _ := store.Get("slow"); st.NodeCount != 0 {
 		t.Errorf("NodeCount = %d, want the measured 0 kept, not rewritten to unknown", st.NodeCount)
+	}
+}
+
+// A namespace-restricted context whose scope call stalls. ResolveScope
+// deliberately does not cache a transient failure, so NamespaceFor
+// still answers "" — and the pod access probe used to read that "" and
+// list cluster-wide, which for a restricted user is a certain 403 and
+// a confident Degraded. The round already knows the namespace; the
+// probe has to use it.
+func TestProbeOnceScopedPodCheckSurvivesAScopeTimeout(t *testing.T) {
+	old := ProbeTimeout
+	ProbeTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { ProbeTimeout = old })
+
+	var clusterWide, scoped atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/version":
+			io.WriteString(w, `{"major":"1","minor":"30","gitVersion":"v1.30.0"}`)
+		case "/api/v1/pods":
+			// The scope probe. Stalls the first time — the transient
+			// that never gets cached — then answers the only way a
+			// namespace-restricted user is ever answered.
+			if clusterWide.Add(1) == 1 {
+				time.Sleep(600 * time.Millisecond)
+			}
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure",`+
+				`"message":"pods is forbidden","reason":"Forbidden","code":403}`)
+		case "/api/v1/namespaces/team-a/pods":
+			scoped.Add(1)
+			io.WriteString(w, `{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	sup, store := newProbeFixture(t, srv, "team-a")
+	sup.probeOnce(context.Background(), "slow")
+
+	if scoped.Load() == 0 {
+		t.Error("pod access went cluster-wide; it should use the namespace this round resolved")
+	}
+	st, _ := store.Get("slow")
+	if st.Reach != model.ReachHealthy {
+		t.Errorf("Reach = %v (%q), want healthy — a stalled scope call is not a denial",
+			st.Reach, st.LastError)
 	}
 }
