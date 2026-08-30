@@ -184,7 +184,8 @@ func itoa(n int) string {
 // nsColumns is the Namespace table in display order. The three count
 // columns are one cell wider than their header labels so the sort
 // arrow has room — without it padCellANSIRight truncates the arrow off
-// the right edge (same trick colRst uses in the pod table).
+// the right edge. podColumns does the same for RESTARTS: an 8-cell
+// label given min 9.
 //
 // LABELS is dropped first: it is the widest column and the least load-
 // bearing, and this table used to hardcode 60 cells for it on a row
