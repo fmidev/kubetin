@@ -979,8 +979,17 @@ func (m Model) openActionMenu() (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
+	return m.openActionMenuFor(ref, m.cursor)
+}
+
+// openActionMenuFor is openActionMenu against an explicit resource,
+// for callers whose subject isn't the table cursor — the dashboard
+// acts on the target it drilled into, and on the replica selected in
+// its PODS pane.
+func (m Model) openActionMenuFor(ref cluster.DescribeRef, uid types.UID) (tea.Model, tea.Cmd) {
 	m.actionMenu.open = true
 	m.actionMenu.ref = ref
+	m.actionMenu.uid = uid
 	m.actionMenu.options = m.classifiedActions(ref)
 	m.actionMenu.cursor = firstSelectable(m.actionMenu.options)
 	m.actionMenu.notice = ""
@@ -1175,9 +1184,9 @@ func (m Model) handleActionMenuKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 	switch a {
 	case ActDashboard:
-		ref := m.actionMenu.ref
+		ref, uid := m.actionMenu.ref, m.actionMenu.uid
 		m.actionMenu.open = false
-		return m.openDashboard(ref, m.cursor)
+		return m.openDashboard(ref, uid)
 	case ActDescribe:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false

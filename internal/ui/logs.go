@@ -195,6 +195,7 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	m.logs.searchMatches = nil
 	m.logs.searchIdx = 0
 	m.logs.searchFocused = false
+	m.syncDashboardLogTarget(ref, container)
 	cb := m.OnLogsStart
 	focused := m.WatchedContext
 	req := LogStartMsg{Session: m.logs.session, Ref: ref, Container: container, Tail: tail}
@@ -231,17 +232,15 @@ func (m Model) logStatusIndicator() string {
 }
 
 // openLogsForCursor handles the "Logs" action selection. For a Pod
-// row we use the cursor directly; for a Deployment row we pick a
-// running pod owned by the deployment from the local cache.
+// we resolve its containers from the ref, not the table cursor — the
+// action menu can target a pod the cursor isn't on (a replica picked
+// in the dashboard's PODS pane), and a cursor lookup then found
+// nothing and streamed with no container name at all.
 func (m Model) openLogsForCursor(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
 	if ref.Kind == "Deployment" {
 		return m.openLogsForDeployment(ref)
 	}
-	containers := []string{}
-	if r, ok := m.pods[m.cursor]; ok {
-		containers = r.Containers
-	}
-	return m.openLogsForPod(ref, containers)
+	return m.openLogsForPod(ref, m.containersFor(ref))
 }
 
 // openLogsForPod is the shared entry from both the Pod cursor path

@@ -33,6 +33,8 @@ func key(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyShiftTab}
 	case "esc":
 		return tea.KeyMsg{Type: tea.KeyEsc}
+	case "enter":
+		return tea.KeyMsg{Type: tea.KeyEnter}
 	}
 	panic("unhandled key " + s)
 }
@@ -1340,5 +1342,134 @@ func TestDashEventLineCountMatchesNaturalRender(t *testing.T) {
 		if got != want {
 			t.Errorf("n=%d: counted %d lines, natural render has %d", n, got, want)
 		}
+	}
+}
+
+// Enter inside a Deployment dashboard must act on the replica the
+// PODS pane has selected. The action menu resolves from the table
+// cursor everywhere else, and that cursor is still parked on the
+// deployment row the dashboard was opened from — so a selected pod
+// got offered Scale and Restart for its parent.
+func TestDashEnterTargetsSelectedPod(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	moved, _ := m.handleDashboardKey(key("j"))
+	opened, _ := moved.(Model).handleDashboardKey(key("enter"))
+	o := opened.(Model)
+
+	if !o.actionMenu.open {
+		t.Fatal("enter did not open the action menu")
+	}
+	want := m.deployOwnedPods(m.deployments["dep-uid"])[1]
+	if o.actionMenu.ref.Kind != "Pod" || o.actionMenu.ref.Name != want.Name {
+		t.Errorf("menu ref = %s/%s, want Pod/%s",
+			o.actionMenu.ref.Kind, o.actionMenu.ref.Name, want.Name)
+	}
+	if o.actionMenu.uid != want.UID {
+		t.Errorf("menu uid = %q, want %q", o.actionMenu.uid, want.UID)
+	}
+	for _, it := range o.actionMenu.options {
+		if it.Action == ActScale || it.Action == ActRestart {
+			t.Errorf("deployment-only action %q offered for a pod", it.Action.Label())
+		}
+	}
+}
+
+// With focus off the PODS pane the subject is the dashboard's own
+// target again — otherwise a Deployment dashboard could never reach
+// Scale or Restart.
+func TestDashEnterTargetsSubjectOffPodsPane(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	m.dashboard.focus = dashPaneEvents
+
+	opened, _ := m.handleDashboardKey(key("enter"))
+	o := opened.(Model)
+	if o.actionMenu.ref.Kind != "Deployment" || o.actionMenu.ref.Name != "payments-api" {
+		t.Errorf("menu ref = %s/%s, want Deployment/payments-api",
+			o.actionMenu.ref.Kind, o.actionMenu.ref.Name)
+	}
+	if o.actionMenu.uid != types.UID("dep-uid") {
+		t.Errorf("menu uid = %q, want dep-uid", o.actionMenu.uid)
+	}
+}
+
+// Drilling into a pod retargets Enter one level down too: `i` leaves
+// focus on the logs pane, so this is the stack target rather than the
+// pod-cursor path, and the table cursor still says "dep-uid".
+func TestDashEnterAfterDrillIn(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { return nil }
+
+	drilled, _ := m.handleDashboardKey(key("i"))
+	d := drilled.(Model)
+	if d.cursor != "dep-uid" {
+		t.Fatalf("premise broken: table cursor moved to %q", d.cursor)
+	}
+	want := m.deployOwnedPods(m.deployments["dep-uid"])[0]
+
+	opened, _ := d.handleDashboardKey(key("enter"))
+	o := opened.(Model)
+	if o.actionMenu.ref.Kind != "Pod" || o.actionMenu.ref.Name != want.Name {
+		t.Errorf("menu ref = %s/%s, want Pod/%s",
+			o.actionMenu.ref.Kind, o.actionMenu.ref.Name, want.Name)
+	}
+	if o.actionMenu.uid != want.UID {
+		t.Errorf("menu uid = %q, want %q", o.actionMenu.uid, want.UID)
+	}
+}
+
+// A dashboard whose subject has gone from the cache renders "no longer
+// present"; Enter must not offer actions against that name, which may
+// since have been reused by a replacement object.
+func TestDashEnterInertWhenSubjectGone(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	delete(m.deployments, "dep-uid")
+
+	opened, _ := m.handleDashboardKey(key("enter"))
+	if o := opened.(Model); o.actionMenu.open {
+		t.Errorf("action menu opened for a vanished %s/%s",
+			o.actionMenu.ref.Kind, o.actionMenu.ref.Name)
+	}
+}
+
+// Streaming a replica's logs from the action menu retargets the
+// dashboard too. Closing the viewer keeps the stream and drops back to
+// the log pane, so the pane would otherwise render replica B while `c`
+// cycled replica A's containers and switched the pane back to it.
+func TestDashLogsActionRetargetsLogPane(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	m.OnLogsStart = func(string, LogStartMsg) tea.Msg { return nil }
+	target, _ := m.dashboard.target()
+	m.prepareLogTarget(target)
+	if m.dashboard.logRef.Name == "payments-api-7f9c8-bbbbb" {
+		t.Fatal("premise broken: the dashboard already streams the replica under test")
+	}
+
+	// Select the second replica and take Logs from its action menu.
+	// The action itself is driven directly: the menu's own Enter is
+	// RBAC-gated, which is orthogonal to what's under test here.
+	moved, _ := m.handleDashboardKey(key("j"))
+	menu, _ := moved.(Model).handleDashboardKey(key("enter"))
+	picking, _ := menu.(Model).executeAction(ActLogs)
+	// Two containers, so the picker stands between here and a stream.
+	chosen, _ := picking.(Model).handleContainerPickerKey(key("j"))
+	streaming, _ := chosen.(Model).handleContainerPickerKey(key("enter"))
+	o := streaming.(Model)
+
+	if o.dashboard.logRef.Name != "payments-api-7f9c8-bbbbb" {
+		t.Errorf("dashboard logRef = %q, want the selected replica", o.dashboard.logRef.Name)
+	}
+	if got := o.dashboard.containers; len(got) != 2 || got[1] != "envoy" {
+		t.Errorf("dashboard containers = %v, want the selected replica's", got)
+	}
+	if o.dashboard.containerI != 1 {
+		t.Errorf("containerI = %d, want 1 (the container the picker chose)", o.dashboard.containerI)
+	}
+
+	// And `c` from the dashboard now cycles that replica, not the one
+	// the dashboard picked for itself when it opened.
+	back, _ := o.closeLogs()
+	cycled, _ := back.(Model).handleDashboardKey(key("c"))
+	if got := cycled.(Model).logs.ref.Name; got != "payments-api-7f9c8-bbbbb" {
+		t.Errorf("c switched the stream to %q", got)
 	}
 }

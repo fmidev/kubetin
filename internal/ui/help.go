@@ -138,6 +138,8 @@ var helpGroups = []helpGroup{
 			{"c", "next container"},
 			{"l", "logs full-screen"},
 			{"i", "(Deployment) open pod"},
+			{"Enter", "actions for the focused pane"},
+			{"d", "describe"},
 			{"Esc", "back / close"},
 		},
 	},

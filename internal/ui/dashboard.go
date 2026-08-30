@@ -299,9 +299,65 @@ func (m Model) handleDashboardKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.openDescribeFor(t.Ref)
 		}
 	case "enter":
-		return m.openActionMenu()
+		ref, uid, ok := m.dashActionTarget()
+		if !ok {
+			return m, nil
+		}
+		return m.openActionMenuFor(ref, uid)
 	}
 	return m, nil
+}
+
+// dashActionTarget is what Enter acts on: the replica under the PODS-
+// pane cursor when that pane is focused, otherwise the dashboard's own
+// target. The table cursor — which is what the action menu resolves
+// from everywhere else — is the wrong source here. It still points at
+// the row the dashboard was opened from, so selecting a replica and
+// pressing Enter offered the parent Deployment's Scale and Restart
+// instead of the pod's own actions, and drilling into a pod with `i`
+// had the same problem one level down.
+func (m Model) dashActionTarget() (cluster.DescribeRef, types.UID, bool) {
+	t, ok := m.dashboard.target()
+	if !ok {
+		return cluster.DescribeRef{}, "", false
+	}
+	// No subject means the object has gone from the informer cache and
+	// the pane already says so. Offering Delete on a name that may
+	// since belong to a replacement object is worse than doing
+	// nothing, so Enter is inert there.
+	sub, ok := m.dashSubjectNow()
+	if !ok {
+		return cluster.DescribeRef{}, "", false
+	}
+	if sub.isDeploy() && m.dashboard.focus == dashPaneMain {
+		if i := m.dashboard.podCursor; i >= 0 && i < len(sub.Pods) {
+			p := sub.Pods[i]
+			return podRefFor(p), p.UID, true
+		}
+	}
+	return t.Ref, t.UID, true
+}
+
+// syncDashboardLogTarget re-points the dashboard at a stream started
+// from outside it — the Logs action on a replica picked in the PODS
+// pane, or the container picker. Closing the full-screen viewer over
+// an open dashboard deliberately keeps the stream alive and drops back
+// to the log pane, so without this the pane would render one pod while
+// logRef named another, and `c` would silently cycle the containers of
+// the pod the dashboard originally chose and switch back to it.
+func (m *Model) syncDashboardLogTarget(ref cluster.DescribeRef, container string) {
+	if !m.dashboard.open {
+		return
+	}
+	m.dashboard.logRef = ref
+	m.dashboard.containers = m.containersFor(ref)
+	m.dashboard.containerI = 0
+	for i, c := range m.dashboard.containers {
+		if c == container {
+			m.dashboard.containerI = i
+			break
+		}
+	}
 }
 
 // focusedPaneSize is the content width and height of the pane j/k is
