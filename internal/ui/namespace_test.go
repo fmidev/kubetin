@@ -1,13 +1,16 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
+	"github.com/fmidev/kubetin/internal/model"
 )
 
 // TestCollectNsCounts pins the three documented invariants of the
@@ -232,5 +235,55 @@ func TestCollectNsCounts_NormalEventsIgnored(t *testing.T) {
 	got := m.collectNsCounts()
 	if len(got) != 0 {
 		t.Fatalf("Normal-only events should not appear in counts; got %#v", got)
+	}
+}
+
+// The Namespace table hardcoded its column widths and threw away the
+// pane width it was handed, so every row came to 141 cells whatever
+// the terminal. In a 90-cell pane — a 120-column terminal with the
+// cluster rail — lipgloss wrapped the overflow onto the next line,
+// straight over the rail. The layout test never saw it: clampCanvas
+// still produced a correctly sized canvas, so the dimensions were
+// right and only the content was wrong.
+func TestNamespaceRowsFitThePane(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha", "beta"})
+	m.view = ViewNamespaces
+	m.syncedNamespaces = true
+	m.namespaces["n1"] = nsRow{
+		UID: "n1", Name: "payments-production", Phase: corev1.NamespaceActive,
+		Labels: map[string]string{
+			"app.kubernetes.io/managed-by":       "Helm",
+			"kubernetes.io/metadata.name":        "payments-production",
+			"pod-security.kubernetes.io/enforce": "privileged",
+		},
+	}
+
+	// 50 is below the sum of the minimum widths, so LABELS and the
+	// count columns get dropped; 90 is the rail-plus-120 case.
+	for _, pane := range []int{50, 60, 90, 120} {
+		body := m.renderNamespacesView(10, pane)
+		for i, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
+			if got := lipgloss.Width(line); got > pane {
+				t.Errorf("pane %d: line %d is %d cells; it will wrap over the rail", pane, i, got)
+			}
+		}
+	}
+}
+
+// Dropping a column must not leave its gap behind — that is what
+// joinCells is for, and it is why the row is assembled through it
+// rather than by concatenating "  " separators.
+func TestNamespaceHeaderDropsLabelsWhenNarrow(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha", "beta"})
+	m.view = ViewNamespaces
+	m.syncedNamespaces = true
+
+	wide := m.renderNamespacesView(10, 120)
+	if !strings.Contains(wide, "LABELS") {
+		t.Error("a 120-cell pane should have room for LABELS")
+	}
+	narrow := m.renderNamespacesView(10, 55)
+	if strings.Contains(narrow, "LABELS") {
+		t.Errorf("LABELS should be dropped at 55 cells, got:\n%s", narrow)
 	}
 }
