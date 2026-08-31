@@ -317,8 +317,13 @@ func effectiveMemLimits(pod *corev1.Pod) map[string]int64 {
 			if cs.Resources == nil {
 				continue
 			}
+			// A non-nil status is authoritative even when it omits
+			// memory: mid-resize the spec already carries a desired
+			// limit that isn't enforced yet.
 			if q, ok := cs.Resources.Limits[corev1.ResourceMemory]; ok {
 				out[cs.Name] = q.Value()
+			} else {
+				delete(out, cs.Name)
 			}
 		}
 	}

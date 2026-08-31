@@ -225,6 +225,20 @@ func TestPodMemLimit(t *testing.T) {
 			want: 512 << 20,
 		},
 		{
+			name: "status without memory entry drops the spec limit",
+			pod: corev1.Pod{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{
+					{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				}},
+				Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+					{Name: "api", Resources: &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+						corev1.ResourceCPU: resource.MustParse("500m"),
+					}}},
+				}},
+			},
+			want: 0,
+		},
+		{
 			name: "nil status resources fall back to spec",
 			pod: corev1.Pod{
 				Spec: corev1.PodSpec{Containers: []corev1.Container{
