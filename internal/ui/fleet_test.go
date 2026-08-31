@@ -3,9 +3,11 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
 )
 
@@ -153,6 +155,95 @@ func TestFleetEscClearsFilterBeforeLeaving(t *testing.T) {
 	}
 }
 
+func TestFleetEnterExpandsAndFetches(t *testing.T) {
+	m := fleetTestModel()
+	var asked string
+	m.OnFleetDetail = func(ctx string) tea.Msg {
+		asked = ctx
+		return FleetDetailMsg{Context: ctx, At: time.Now()}
+	}
+	m.fleet.cursorCtx = "bad"
+
+	m, cmd := fleetPress(t, m, key("enter"))
+	if m.fleet.expanded != "bad" || !m.fleet.detail.loading {
+		t.Fatalf("enter should expand and start loading; expanded=%q loading=%v",
+			m.fleet.expanded, m.fleet.detail.loading)
+	}
+	if cmd == nil {
+		t.Fatal("enter must dispatch the fetch cmd")
+	}
+	msg := cmd()
+	if asked != "bad" {
+		t.Fatalf("fetch asked for %q, want bad", asked)
+	}
+	res, _ := m.Update(msg)
+	m = res.(Model)
+	if m.fleet.detail.loading || m.fleet.detail.result.Context != "bad" {
+		t.Errorf("result should land; loading=%v ctx=%q",
+			m.fleet.detail.loading, m.fleet.detail.result.Context)
+	}
+
+	m, _ = fleetPress(t, m, key("enter"))
+	if m.fleet.expanded != "" {
+		t.Errorf("enter again should collapse, expanded=%q", m.fleet.expanded)
+	}
+}
+
+func TestFleetDetailGuardDropsStaleResults(t *testing.T) {
+	m := fleetTestModel()
+	m.fleet.expanded = "bad"
+
+	// A result for a cluster the user is no longer expanding.
+	res, _ := m.Update(FleetDetailMsg{Context: "fine", At: time.Now()})
+	m = res.(Model)
+	if m.fleet.detail.result.Context != "" {
+		t.Errorf("mismatched result must be dropped, got %q", m.fleet.detail.result.Context)
+	}
+
+	// Same cluster, but the user already left the dashboard.
+	m.view = ViewPods
+	res, _ = m.Update(FleetDetailMsg{Context: "bad", At: time.Now()})
+	m = res.(Model)
+	if m.fleet.detail.result.Context != "" {
+		t.Errorf("result after leaving the view must be dropped, got %q", m.fleet.detail.result.Context)
+	}
+}
+
+func TestFleetExpandDoesNotShowAnotherClustersRows(t *testing.T) {
+	m := fleetTestModel()
+	m.OnFleetDetail = func(ctx string) tea.Msg { return FleetDetailMsg{Context: ctx} }
+	m.fleet.expanded = "fine"
+	m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult{
+		Context: "fine",
+		Pods:    []cluster.FleetPodIssue{{Namespace: "x", Name: "y", Phase: "Pending"}},
+		At:      time.Now(),
+	}}
+
+	// Move to another cluster and expand it: the old cluster's rows
+	// must not render under the new card while the fetch is in flight.
+	m.fleet.cursorCtx = "bad"
+	m.fleet.expanded = ""
+	m, _ = fleetPress(t, m, key("enter"))
+	if got := m.fleet.detail.result.Context; got != "" {
+		t.Errorf("stale detail for %q survived a cross-cluster expand", got)
+	}
+}
+
+func TestFleetEscCollapsesDetailFirst(t *testing.T) {
+	m := fleetTestModel()
+	m.fleet.returnView = ViewNodes
+	m.fleet.expanded = "bad"
+
+	m, _ = fleetPress(t, m, key("esc"))
+	if m.fleet.expanded != "" || m.view != ViewFleet {
+		t.Fatalf("first esc collapses the detail; expanded=%q view=%v", m.fleet.expanded, m.view)
+	}
+	m, _ = fleetPress(t, m, key("esc"))
+	if m.view != ViewNodes {
+		t.Errorf("second esc leaves the dashboard, got %v", m.view)
+	}
+}
+
 func TestFleetFilterIsolatedFromResourceFilter(t *testing.T) {
 	m := fleetTestModel()
 	m.view = ViewPods
@@ -281,5 +372,42 @@ func TestFleetOfflineSectionRendersLastAsCompactRows(t *testing.T) {
 	}
 	if p := derivePulse(m.fleetGroupsFiltered()); p.NeedAction != 1 {
 		t.Errorf("NeedAction = %d, want 1 — offline is not attention", p.NeedAction)
+	}
+}
+
+func TestFleetEnterOnOfflineExplainsInsteadOfFetching(t *testing.T) {
+	m := fleetTestModel()
+	store := model.NewStore()
+	seedFleetCluster(store, "vpn-off", func(pf *model.ProbeFields) {
+		pf.Reach = model.ReachUnreachable
+		pf.ServerVersion = ""
+		pf.LastError = "dial tcp 10.8.0.1:6443: i/o timeout"
+	})
+	m.Store = store
+	fetched := false
+	m.OnFleetDetail = func(string) tea.Msg { fetched = true; return nil }
+	m.fleet.cursorCtx = "vpn-off"
+
+	m, cmd := fleetPress(t, m, key("enter"))
+	if cmd != nil || fetched {
+		t.Fatal("enter on an offline cluster must not dispatch a fetch")
+	}
+	if m.fleet.expanded != "vpn-off" {
+		t.Fatalf("panel should still expand, expanded=%q", m.fleet.expanded)
+	}
+
+	out := m.renderFleet(20, 100)
+	if !strings.Contains(out, "details can't be fetched") ||
+		!strings.Contains(out, "dial tcp 10.8.0.1:6443") {
+		t.Errorf("panel must explain the offline state, got:\n%s", out)
+	}
+	for _, lie := range []string{"look clean", "fetching"} {
+		if strings.Contains(out, lie) {
+			t.Errorf("panel must not claim %q for a cluster it can't see", lie)
+		}
+	}
+
+	if _, cmd := fleetPress(t, m, key("r")); cmd != nil {
+		t.Error("r must not refetch an offline cluster")
 	}
 }

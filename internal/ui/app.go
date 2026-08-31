@@ -140,6 +140,10 @@ type Model struct {
 	// import the supervisor directly.
 	OnDescribe func(req DescribeRequestMsg, focusedCtx string) tea.Msg
 
+	// OnFleetDetail runs the fleet dashboard's on-demand cluster
+	// drill-down off-thread and returns a FleetDetailMsg.
+	OnFleetDetail func(ctxName string) tea.Msg
+
 	// OnCanI runs a SelfSubjectAccessReview off-thread.
 	OnCanI func(ctxName, verb, group, resource, namespace string) tea.Msg
 
@@ -737,8 +741,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case FleetDetailMsg:
+		// Guard on the cluster the dashboard requested, not on
+		// WatchedContext — the dashboard shows all clusters. A result
+		// for a card the user already collapsed or moved past is
+		// stale and must not attach to another cluster's card.
+		if m.view != ViewFleet || msg.Context != m.fleet.expanded {
+			return m, nil
+		}
+		m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult(msg)}
+		return m, nil
+
 	case ProbeTickMsg:
 		m.sampleFleetTrends()
+		if m.view == ViewFleet && m.fleet.expanded != "" && !m.fleet.detail.loading &&
+			!m.fleetOffline(m.fleet.expanded) &&
+			!m.fleet.detail.result.At.IsZero() &&
+			time.Since(m.fleet.detail.result.At) > 30*time.Second {
+			cmd := m.fetchFleetDetail(m.fleet.expanded)
+			return m, tea.Batch(tickCmd(), cmd)
+		}
 		return m, tickCmd()
 	}
 	return m, nil
@@ -1946,7 +1968,7 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 func (m Model) renderFooter() string {
 	hint := " ?:help  F1:fleet  1:pods  2:deploy  3:svc  4:ing  5:nodes  6:ns  e:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
 	if m.view == ViewFleet && !m.dashboard.open {
-		hint = " j/k:cluster  o:open  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
+		hint = " j/k:cluster  Enter:details  o:open  r:refresh  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
 	}
 	if m.dashboard.open {
 		hint = " Tab:pane  j/k:move  g/G:top/bottom  f:follow  i:open pod  c:container  l:logs  d:describe  Enter:actions  Esc:back "

@@ -6,7 +6,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	corev1 "k8s.io/api/core/v1"
 
+	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
 )
 
@@ -21,6 +23,7 @@ type fleetState struct {
 	// view owns m.filterText — the two filter different things (rows
 	// vs cluster names) and must not leak into each other.
 	savedFilter string
+	detail      fleetDetailState
 }
 
 // enterFleet/leaveFleet are the only transitions in and out of the
@@ -38,6 +41,17 @@ func (m *Model) leaveFleet(to View) {
 	m.fleet.savedFilter = ""
 	m.view = to
 }
+
+type fleetDetailState struct {
+	loading bool
+	result  cluster.FleetDetailResult
+}
+
+// FleetDetailMsg carries an on-demand cluster drill-down back to the
+// dashboard. The receiver guards on the cluster it requested
+// (m.fleet.expanded), not on WatchedContext — the dashboard shows all
+// clusters.
+type FleetDetailMsg cluster.FleetDetailResult
 
 // fleetGroupsFiltered derives the triage groups from the store with
 // the name filter applied — the single source both the renderer and
@@ -139,8 +153,27 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
-		// Detail expansion arrives in a follow-up; swallowed so the
-		// action menu can't open on the empty resource cursor.
+		ctx := m.fleetCursor()
+		if ctx == "" {
+			return m, nil
+		}
+		if m.fleet.expanded == ctx {
+			m.fleet.expanded = ""
+			return m, nil
+		}
+		m.fleet.expanded = ctx
+		if m.fleetOffline(ctx) {
+			// Nothing to fetch from a cluster we can't reach; the
+			// panel renders the offline reason instead. Fetching
+			// anyway risks a 10s hang at best and, if the cluster
+			// half-answers, a false "all clean".
+			return m, nil
+		}
+		return m, m.fetchFleetDetail(ctx)
+	case "r":
+		if m.fleet.expanded != "" && !m.fleet.detail.loading && !m.fleetOffline(m.fleet.expanded) {
+			return m, m.fetchFleetDetail(m.fleet.expanded)
+		}
 		return m, nil
 	case "o":
 		ctx := m.fleetCursor()
@@ -157,6 +190,10 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterFocused = true
 		return m, nil
 	case "esc":
+		if m.fleet.expanded != "" {
+			m.fleet.expanded = ""
+			return m, nil
+		}
 		if m.filterText != "" {
 			m.filterText = ""
 			return m, nil
@@ -262,7 +299,11 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 			m.fleetSectionHeader("NEEDS ATTENTION", m.Theme.StatusBad, len(g.Attention), width),
 		}})
 		for _, e := range g.Attention {
-			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: m.renderFleetCard(e, width)})
+			lines := m.renderFleetCard(e, width)
+			if e.St.Context == m.fleet.expanded {
+				lines = append(lines, m.renderFleetDetail(m.cardSpine(e), width)...)
+			}
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: lines})
 		}
 		blocks = append(blocks, blank)
 	}
@@ -271,8 +312,11 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 			m.fleetSectionHeader("HEALTHY", m.Theme.StatusOK, len(g.Healthy), width),
 		}})
 		for _, e := range g.Healthy {
-			blocks = append(blocks, fleetBlock{ctx: e.St.Context,
-				lines: []string{m.renderFleetCompactRow(e.St, width)}})
+			lines := []string{m.renderFleetCompactRow(e.St, width)}
+			if e.St.Context == m.fleet.expanded {
+				lines = append(lines, m.renderFleetDetail(m.Theme.StatusDim.Render("▏"), width)...)
+			}
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: lines})
 		}
 	}
 	if len(g.Starting) > 0 {
@@ -295,8 +339,11 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 			m.fleetSectionHeader("OFFLINE", m.Theme.Dim, len(g.Offline), width),
 		}})
 		for _, e := range g.Offline {
-			blocks = append(blocks, fleetBlock{ctx: e.St.Context,
-				lines: []string{m.renderFleetCompactRow(e.St, width)}})
+			lines := []string{m.renderFleetCompactRow(e.St, width)}
+			if e.St.Context == m.fleet.expanded {
+				lines = append(lines, m.renderFleetOfflineDetail(e.St, width)...)
+			}
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: lines})
 		}
 	}
 	return blocks
@@ -534,4 +581,113 @@ func (m Model) sampleFleetTrends() {
 		}
 		r.push(pct(st.UsageMemBytes, st.AllocMemBytes), st.MetricsAt)
 	}
+}
+
+// fetchFleetDetail dispatches the on-demand drill-down for ctx. The
+// previous result stays visible through a same-cluster refresh, but a
+// different cluster's rows must never show under this card.
+func (m *Model) fetchFleetDetail(ctx string) tea.Cmd {
+	if m.OnFleetDetail == nil {
+		return nil
+	}
+	prev := m.fleet.detail.result
+	if prev.Context != ctx {
+		prev = cluster.FleetDetailResult{}
+	}
+	m.fleet.detail = fleetDetailState{loading: true, result: prev}
+	cb := m.OnFleetDetail
+	return func() tea.Msg { return cb(ctx) }
+}
+
+// renderFleetDetail renders the fetched drill-down under an expanded
+// cluster. Everything here is cluster-produced text: it goes through
+// cleanDetail + the plain truncate pipeline, never raw ANSI.
+func (m Model) renderFleetDetail(spine string, width int) []string {
+	th := m.Theme
+	d := m.fleet.detail
+	pad := spine + "     "
+	if d.result.At.IsZero() {
+		return []string{pad + th.Dim.Render("… fetching details")}
+	}
+	r := d.result
+	var lines []string
+	if r.Err != "" {
+		lines = append(lines, pad+th.StatusBad.Render("✗ ")+
+			truncate("detail fetch: "+cleanDetail(r.Err), width-10))
+	}
+	half := width / 2
+	if half < 20 {
+		half = 20
+	}
+	for _, p := range r.Pods {
+		s := pad + th.Dim.Render("pod ") + truncate(p.Namespace+"/"+p.Name, half) +
+			" " + th.styleForPhase(corev1.PodPhase(p.Phase)).Render(p.Phase)
+		if p.Reason != "" {
+			s += " " + th.StatusWrn.Render(truncate(cleanDetail(p.Reason), 24))
+		}
+		if p.Restarts > 0 {
+			s += " " + restartStyle(p.Restarts, th).Render(fmt.Sprintf("↻%d", p.Restarts))
+		}
+		lines = append(lines, s)
+	}
+	for _, dep := range r.Deploys {
+		lines = append(lines, pad+th.Dim.Render("dep ")+
+			truncate(dep.Namespace+"/"+dep.Name, half)+" "+
+			readyStyle(int(dep.Ready), int(dep.Desired), th).Render(
+				fmt.Sprintf("%d/%d", dep.Ready, dep.Desired)))
+	}
+	for _, ev := range r.Events {
+		head := pad + th.Dim.Render("evt ") +
+			th.StatusWrn.Render(truncate(cleanDetail(ev.Reason), 24)) +
+			th.Dim.Render(fmt.Sprintf(" ×%d %s ", ev.Count, formatAge(ev.LastSeen)))
+		if avail := width - lipgloss.Width(head) - 1; avail > 4 {
+			head += truncate(cleanDetail(ev.Message), avail)
+		}
+		lines = append(lines, head)
+	}
+	if r.Err == "" && len(r.Pods)+len(r.Deploys)+len(r.Events) == 0 {
+		lines = append(lines, pad+th.Dim.Render("no problem detail — pods, deployments and events look clean"))
+	}
+	status := fmt.Sprintf("fetched %s ago · r to refresh · Enter to collapse", formatAge(r.At))
+	if d.loading {
+		status = "… refreshing"
+	}
+	lines = append(lines, pad+th.Dim.Render(status))
+	return lines
+}
+
+// cleanDetail flattens whitespace and control characters out of
+// cluster-sourced strings so one multi-line event message can't
+// inject rows into the layout.
+func cleanDetail(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// fleetOffline reports whether ctx is currently classified offline —
+// the states whose detail cannot be fetched, only explained.
+func (m Model) fleetOffline(ctx string) bool {
+	st, ok := m.Store.Get(ctx)
+	return ok && (st.Reach == model.ReachUnreachable || st.Reach == model.ReachAuthFailed)
+}
+
+// renderFleetOfflineDetail is the expanded panel for an offline
+// cluster: the full reason and the probe age — everything kubetin
+// actually knows, and no claim about anything it cannot.
+func (m Model) renderFleetOfflineDetail(st model.ClusterState, width int) []string {
+	th := m.Theme
+	pad := th.StatusDim.Render("▏") + "     "
+	label := "unreachable"
+	if st.Reach == model.ReachAuthFailed {
+		label = "auth failed — a re-login may fix this"
+	}
+	lines := []string{pad + th.StatusBad.Render("✕ ") + th.Dim.Render(label+" — details can't be fetched")}
+	if st.LastError != "" {
+		lines = append(lines, pad+truncate(cleanDetail(st.LastError), width-8))
+	}
+	status := "never probed successfully"
+	if !st.LastProbe.IsZero() {
+		status = fmt.Sprintf("last probe attempt %s ago", formatAge(st.LastProbe))
+	}
+	lines = append(lines, pad+th.Dim.Render(status+" · Enter to collapse"))
+	return lines
 }

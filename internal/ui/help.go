@@ -126,6 +126,8 @@ var helpGroups = []helpGroup{
 		Bindings: [][2]string{
 			{"j / k", "next / previous cluster"},
 			{"g / G", "first / last cluster"},
+			{"Enter", "expand / collapse cluster details"},
+			{"r", "refresh details"},
 			{"o", "open cluster (pods view)"},
 			{"Esc / F1", "back to previous view"},
 		},

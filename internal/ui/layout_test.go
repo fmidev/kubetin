@@ -115,6 +115,31 @@ func TestViewFitsCanvas(t *testing.T) {
 		{"fleet/filter-no-match", 100, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
 			m.filterText = "zzz"
 		})},
+		{"fleet/expanded", 120, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.fleet.cursorCtx = "beta"
+			m.fleet.expanded = "beta"
+			m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult{
+				Context: "beta",
+				Pods: []cluster.FleetPodIssue{
+					{Namespace: "prod", Name: "smartmet-server-7f9c8-x2k4l", Phase: "Pending", Reason: "ImagePullBackOff", Restarts: 3},
+					{Namespace: "デフォルト", Name: strings.Repeat("名前", 40), Phase: "Failed", Reason: strings.Repeat("R", 80)},
+				},
+				Deploys: []cluster.FleetDeployIssue{{Namespace: "prod", Name: "smartmet-server", Ready: 0, Desired: 5}},
+				Events:  []cluster.FleetEventGroup{{Reason: "BackOff", Message: strings.Repeat("m", 300) + "\nsecond line", Count: 12, LastSeen: time.Now()}},
+				At:      time.Now(),
+			}}
+		})},
+		{"fleet/expanded-loading", 120, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.fleet.cursorCtx = "alpha"
+			m.fleet.expanded = "alpha"
+			m.fleet.detail = fleetDetailState{loading: true}
+		})},
+		{"fleet/expanded-error", 100, 24, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.fleet.expanded = "gamma"
+			m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult{
+				Context: "gamma", Err: strings.Repeat("connection refused ", 12), At: time.Now(),
+			}}
+		})},
 		{"help-over-fleet", 120, 40, ViewFleet, fleetLayoutFixture(func(m *Model) {
 			m.helpOpen = true
 		})},
