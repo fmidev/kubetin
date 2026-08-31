@@ -403,12 +403,12 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	case signalOK:
 		pf.DeploysTotal = wh.deploys.total
 		pf.DeploysDegraded = wh.deploys.degraded
-		pf.DeploysZeroAvail = wh.deploys.zeroAvail
+		pf.DeploysZeroReady = wh.deploys.zeroReady
 		pf.DegradedDeployNames = wh.deploys.names
 	case signalTimeout:
 		pf.DeploysTotal = prev.DeploysTotal
 		pf.DeploysDegraded = prev.DeploysDegraded
-		pf.DeploysZeroAvail = prev.DeploysZeroAvail
+		pf.DeploysZeroReady = prev.DeploysZeroReady
 		pf.DegradedDeployNames = prev.DegradedDeployNames
 	}
 	switch wh.events.outcome {
@@ -651,7 +651,7 @@ type podPhaseSignal struct {
 
 type deploySignal struct {
 	outcome                    signalOutcome
-	total, degraded, zeroAvail int
+	total, degraded, zeroReady int
 	names                      []string
 }
 
@@ -695,7 +695,7 @@ func carryHealth(pf *model.ProbeFields, prev model.ClusterState) {
 	pf.PodsUnknownPhase = prev.PodsUnknownPhase
 	pf.DeploysTotal = prev.DeploysTotal
 	pf.DeploysDegraded = prev.DeploysDegraded
-	pf.DeploysZeroAvail = prev.DeploysZeroAvail
+	pf.DeploysZeroReady = prev.DeploysZeroReady
 	pf.DegradedDeployNames = prev.DegradedDeployNames
 	pf.WarnEvents15m = prev.WarnEvents15m
 }
@@ -790,8 +790,12 @@ func probeDeployHealth(parent context.Context, ns string, cs *kubernetes.Clients
 				continue
 			}
 			sig.degraded++
-			if d.Status.AvailableReplicas == 0 {
-				sig.zeroAvail++
+			// Full-outage signal keyed on Ready, not Available:
+			// readiness is what gates endpoints, and with
+			// minReadySeconds a healthy rollout sits at
+			// available=0 while its ready pods already serve.
+			if d.Status.ReadyReplicas == 0 {
+				sig.zeroReady++
 			}
 			worst = append(worst, degraded{
 				label: fmt.Sprintf("%s/%s %d/%d", d.Namespace, d.Name, d.Status.ReadyReplicas, desired),

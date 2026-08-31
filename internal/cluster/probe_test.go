@@ -542,9 +542,9 @@ func TestProbeOnceCollectsHealthSignals(t *testing.T) {
 	if st.PodsTotal != 42 {
 		t.Errorf("PodsTotal = %d, want 42 (1 item + 41 remaining)", st.PodsTotal)
 	}
-	if st.DeploysTotal != 4 || st.DeploysDegraded != 2 || st.DeploysZeroAvail != 1 {
-		t.Errorf("deploys = total %d degraded %d zeroAvail %d, want 4/2/1",
-			st.DeploysTotal, st.DeploysDegraded, st.DeploysZeroAvail)
+	if st.DeploysTotal != 4 || st.DeploysDegraded != 2 || st.DeploysZeroReady != 1 {
+		t.Errorf("deploys = total %d degraded %d zeroReady %d, want 4/2/1",
+			st.DeploysTotal, st.DeploysDegraded, st.DeploysZeroReady)
 	}
 	wantNames := []string{"a/d2 0/2", "a/d1 3/5"}
 	if len(st.DegradedDeployNames) != 2 ||

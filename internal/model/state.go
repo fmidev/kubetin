@@ -98,7 +98,7 @@ type ClusterState struct {
 	PodsUnknownPhase    int
 	DeploysTotal        int
 	DeploysDegraded     int      // ready < desired
-	DeploysZeroAvail    int      // desired > 0 with zero available
+	DeploysZeroReady    int      // degraded deployments with zero ready replicas
 	DegradedDeployNames []string // "ns/name R/D", worst ratio first
 	WarnEvents15m       int      // Warning events seen in the last 15 min
 }
@@ -173,7 +173,7 @@ type ProbeFields struct {
 	PodsUnknownPhase    int
 	DeploysTotal        int
 	DeploysDegraded     int
-	DeploysZeroAvail    int
+	DeploysZeroReady    int
 	DegradedDeployNames []string
 	WarnEvents15m       int
 }
@@ -195,7 +195,7 @@ func NewProbeFields() ProbeFields {
 		PodsUnknownPhase:  -1,
 		DeploysTotal:      -1,
 		DeploysDegraded:   -1,
-		DeploysZeroAvail:  -1,
+		DeploysZeroReady:  -1,
 		WarnEvents15m:     -1,
 	}
 }
@@ -238,7 +238,7 @@ func (s *Store) ApplyProbe(ctx string, p ProbeFields) {
 	st.PodsUnknownPhase = p.PodsUnknownPhase
 	st.DeploysTotal = p.DeploysTotal
 	st.DeploysDegraded = p.DeploysDegraded
-	st.DeploysZeroAvail = p.DeploysZeroAvail
+	st.DeploysZeroReady = p.DeploysZeroReady
 	st.DegradedDeployNames = p.DegradedDeployNames
 	st.WarnEvents15m = p.WarnEvents15m
 	s.m[ctx] = st
