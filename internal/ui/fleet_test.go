@@ -514,3 +514,41 @@ func TestFleetOfflinePromotionTriggersFetchOnTick(t *testing.T) {
 		t.Error("promotion while expanded must dispatch the fetch on the next tick")
 	}
 }
+
+func TestFleetReExpandAfterGoingOfflineOrphansInFlightFetch(t *testing.T) {
+	m := fleetTestModel()
+	m.OnFleetDetail = func(ctx string) cluster.FleetDetailResult {
+		return cluster.FleetDetailResult{Context: ctx, Err: "stale in-flight", At: time.Now()}
+	}
+	m.fleet.cursorCtx = "bad"
+
+	m, cmd := fleetPress(t, m, key("enter")) // fetch in flight for reachable "bad"
+	m, _ = fleetPress(t, m, key("enter"))    // collapse; fetch still flying
+
+	// The cluster drops offline before the user looks again.
+	seedFleetCluster(m.Store, "bad", func(pf *model.ProbeFields) {
+		pf.Reach = model.ReachUnreachable
+		pf.LastError = "dial tcp: i/o timeout"
+	})
+
+	m, cmd2 := fleetPress(t, m, key("enter")) // re-expand, now offline
+	if cmd2 != nil {
+		t.Fatal("offline expand must not fetch")
+	}
+	if m.fleet.detail.loading {
+		t.Fatal("offline expand must clear the dangling loading state")
+	}
+	res, _ := m.Update(cmd()) // the pre-collapse result finally lands
+	m = res.(Model)
+	if m.fleet.detail.result.Err == "stale in-flight" {
+		t.Error("orphaned generation must not land under the offline panel")
+	}
+
+	// Promotion while expanded: next tick must be able to fetch.
+	seedFleetCluster(m.Store, "bad", nil)
+	res, _ = m.Update(ProbeTickMsg(time.Now()))
+	m = res.(Model)
+	if !m.fleet.detail.loading {
+		t.Error("promoted cluster must auto-fetch on the next tick")
+	}
+}

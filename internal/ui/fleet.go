@@ -187,7 +187,14 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// Nothing to fetch from a cluster we can't reach; the
 			// panel renders the offline reason instead. Fetching
 			// anyway risks a 10s hang at best and, if the cluster
-			// half-answers, a false "all clean".
+			// half-answers, a false "all clean". This is also the one
+			// re-expansion path that skips fetchFleetDetail, so it
+			// must do fetchFleetDetail's bookkeeping itself: reset
+			// the detail state (a dangling loading=true would block
+			// every future refresh) and advance the generation so a
+			// pre-collapse in-flight result can't land here.
+			m.fleet.detail = fleetDetailState{}
+			m.fleet.detailSeq++
 			return m, nil
 		}
 		return m, m.fetchFleetDetail(ctx)
