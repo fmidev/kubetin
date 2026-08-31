@@ -78,6 +78,29 @@ type ClusterState struct {
 
 	MetricsAvailable bool // false = metrics-server absent or last call failed
 	MetricsAt        time.Time
+
+	// Fleet-wide health signals, probe-owned. Counts use -1 for
+	// "unknown" (never measured, RBAC-denied, or namespace-scoped
+	// where the signal is meaningless); a plain 0 is a measurement.
+	// Name slices are bounded (≤3) display samples, rebuilt fresh
+	// each round and never mutated after commit, so the value-copy
+	// contract of ClusterState holds despite the shared backing
+	// arrays.
+	NodesNotReadyNames  []string // sample of NotReady node names
+	NodesMemPressure    int      // nodes with MemoryPressure=True
+	NodesDiskPressure   int      // nodes with DiskPressure=True
+	NodesPIDPressure    int      // nodes with PIDPressure=True
+	NodesCordoned       int      // nodes with spec.unschedulable
+	NodesPressureNames  []string // sample of nodes with any pressure condition
+	PodsTotal           int      // best-effort total pod count
+	PodsPending         int
+	PodsFailed          int
+	PodsUnknownPhase    int
+	DeploysTotal        int
+	DeploysDegraded     int      // ready < desired
+	DeploysZeroAvail    int      // desired > 0 with zero available
+	DegradedDeployNames []string // "ns/name R/D", worst ratio first
+	WarnEvents15m       int      // Warning events seen in the last 15 min
 }
 
 // Store is a concurrency-safe map of cluster context name -> latest state.
@@ -137,6 +160,44 @@ type ProbeFields struct {
 	ProbeLatency  time.Duration
 	AllocCPUMilli int64
 	AllocMemBytes int64
+
+	NodesNotReadyNames  []string
+	NodesMemPressure    int
+	NodesDiskPressure   int
+	NodesPIDPressure    int
+	NodesCordoned       int
+	NodesPressureNames  []string
+	PodsTotal           int
+	PodsPending         int
+	PodsFailed          int
+	PodsUnknownPhase    int
+	DeploysTotal        int
+	DeploysDegraded     int
+	DeploysZeroAvail    int
+	DegradedDeployNames []string
+	WarnEvents15m       int
+}
+
+// NewProbeFields returns a ProbeFields with every health count set to
+// -1 ("unknown") — the safe default for a round that may fail before
+// measuring them. A zero-valued ProbeFields would instead commit a
+// batch of confident zeros ("no pending pods") for signals the round
+// never looked at. Callers overwrite what they actually measured.
+func NewProbeFields() ProbeFields {
+	return ProbeFields{
+		NodesMemPressure:  -1,
+		NodesDiskPressure: -1,
+		NodesPIDPressure:  -1,
+		NodesCordoned:     -1,
+		PodsTotal:         -1,
+		PodsPending:       -1,
+		PodsFailed:        -1,
+		PodsUnknownPhase:  -1,
+		DeploysTotal:      -1,
+		DeploysDegraded:   -1,
+		DeploysZeroAvail:  -1,
+		WarnEvents15m:     -1,
+	}
 }
 
 // MetricsFields are the slots the metrics ticker owns.
@@ -165,6 +226,21 @@ func (s *Store) ApplyProbe(ctx string, p ProbeFields) {
 	st.ProbeLatency = p.ProbeLatency
 	st.AllocCPUMilli = p.AllocCPUMilli
 	st.AllocMemBytes = p.AllocMemBytes
+	st.NodesNotReadyNames = p.NodesNotReadyNames
+	st.NodesMemPressure = p.NodesMemPressure
+	st.NodesDiskPressure = p.NodesDiskPressure
+	st.NodesPIDPressure = p.NodesPIDPressure
+	st.NodesCordoned = p.NodesCordoned
+	st.NodesPressureNames = p.NodesPressureNames
+	st.PodsTotal = p.PodsTotal
+	st.PodsPending = p.PodsPending
+	st.PodsFailed = p.PodsFailed
+	st.PodsUnknownPhase = p.PodsUnknownPhase
+	st.DeploysTotal = p.DeploysTotal
+	st.DeploysDegraded = p.DeploysDegraded
+	st.DeploysZeroAvail = p.DeploysZeroAvail
+	st.DegradedDeployNames = p.DegradedDeployNames
+	st.WarnEvents15m = p.WarnEvents15m
 	s.m[ctx] = st
 }
 

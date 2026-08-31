@@ -152,6 +152,10 @@ func (p *probeSrv) handler() http.HandlerFunc {
 				return
 			}
 			io.WriteString(w, `{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[]}`)
+		case "/apis/apps/v1/deployments":
+			io.WriteString(w, `{"kind":"DeploymentList","apiVersion":"apps/v1","metadata":{},"items":[]}`)
+		case "/api/v1/events":
+			io.WriteString(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -303,10 +307,12 @@ func TestProbeOncePodCheckTimeoutDoesNotClearADenial(t *testing.T) {
 	ProbeTimeout = 250 * time.Millisecond
 	t.Cleanup(func() { ProbeTimeout = old })
 
-	// Calls 1 and 2 are the scope probe and the first round's pod
-	// check, both denied. The third — the second round's pod check —
-	// stalls past the deadline.
-	var podCalls atomic.Int32
+	// The pod-summary check is the only pods list without a field
+	// selector and without resourceVersion=0 — the scope probe and the
+	// non-green health list both carry rv=0. First summary call is
+	// denied; the second — the second round's — stalls past the
+	// deadline.
+	var summaryCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -317,9 +323,16 @@ func TestProbeOncePodCheckTimeoutDoesNotClearADenial(t *testing.T) {
 				`"metadata":{"name":"n1"},`+
 				`"status":{"allocatable":{"cpu":"4","memory":"8Gi"},`+
 				`"conditions":[{"type":"Ready","status":"True"}]}}]}`)
+		case "/apis/apps/v1/deployments":
+			io.WriteString(w, `{"kind":"DeploymentList","apiVersion":"apps/v1","metadata":{},"items":[]}`)
+		case "/api/v1/events":
+			io.WriteString(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
 		case "/api/v1/pods":
-			if podCalls.Add(1) > 2 {
-				time.Sleep(600 * time.Millisecond)
+			q := r.URL.Query()
+			if q.Get("fieldSelector") == "" && q.Get("resourceVersion") == "" {
+				if summaryCalls.Add(1) > 1 {
+					time.Sleep(600 * time.Millisecond)
+				}
 			}
 			w.WriteHeader(http.StatusForbidden)
 			io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure",`+
@@ -379,6 +392,10 @@ func TestProbeOnceScopedPodCheckSurvivesAScopeTimeout(t *testing.T) {
 		case "/api/v1/namespaces/team-a/pods":
 			scoped.Add(1)
 			io.WriteString(w, `{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[]}`)
+		case "/apis/apps/v1/namespaces/team-a/deployments":
+			io.WriteString(w, `{"kind":"DeploymentList","apiVersion":"apps/v1","metadata":{},"items":[]}`)
+		case "/api/v1/namespaces/team-a/events":
+			io.WriteString(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[]}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -395,5 +412,264 @@ func TestProbeOnceScopedPodCheckSurvivesAScopeTimeout(t *testing.T) {
 	if st.Reach != model.ReachHealthy {
 		t.Errorf("Reach = %v (%q), want healthy — a stalled scope call is not a denial",
 			st.Reach, st.LastError)
+	}
+}
+
+// healthSrv is an API server stand-in with interesting fleet-health
+// data: a NotReady node, pressure conditions, a cordon, non-green
+// pods, degraded deployments, and warning events of varying age.
+// slowHealth stalls (and forbidHealth denies) exactly the three
+// health lists — the field-selected pod list, deployments, events —
+// leaving the liveness calls untouched.
+type healthSrv struct {
+	forbidHealth atomic.Bool
+	slowHealth   atomic.Bool
+	delay        time.Duration
+	podFS        atomic.Value // fieldSelector seen on the non-green pod list
+	eventFS      atomic.Value // fieldSelector seen on the event list
+}
+
+func (h *healthSrv) handler() http.HandlerFunc {
+	now := time.Now()
+	recent := now.Add(-2 * time.Minute).Format(time.RFC3339)
+	stale := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	recentMicro := now.Add(-3 * time.Minute).Format("2006-01-02T15:04:05.000000Z07:00")
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		q := r.URL.Query()
+		isHealthList := (r.URL.Path == "/api/v1/pods" && q.Get("fieldSelector") != "") ||
+			r.URL.Path == "/apis/apps/v1/deployments" ||
+			r.URL.Path == "/api/v1/events"
+		if isHealthList {
+			if h.slowHealth.Load() {
+				time.Sleep(h.delay)
+			}
+			if h.forbidHealth.Load() {
+				w.WriteHeader(http.StatusForbidden)
+				io.WriteString(w, `{"kind":"Status","apiVersion":"v1","status":"Failure",`+
+					`"message":"forbidden","reason":"Forbidden","code":403}`)
+				return
+			}
+		}
+		switch r.URL.Path {
+		case "/version":
+			io.WriteString(w, `{"major":"1","minor":"30","gitVersion":"v1.30.0"}`)
+		case "/api/v1/nodes":
+			io.WriteString(w, `{"kind":"NodeList","apiVersion":"v1","metadata":{},"items":[`+
+				`{"metadata":{"name":"n1"},"status":{"allocatable":{"cpu":"4","memory":"8Gi"},`+
+				`"conditions":[{"type":"Ready","status":"True"}]}},`+
+				`{"metadata":{"name":"n2"},"status":{"allocatable":{"cpu":"4","memory":"8Gi"},`+
+				`"conditions":[{"type":"Ready","status":"False"},{"type":"MemoryPressure","status":"True"}]}},`+
+				`{"metadata":{"name":"n3"},"spec":{"unschedulable":true},`+
+				`"status":{"allocatable":{"cpu":"4","memory":"8Gi"},`+
+				`"conditions":[{"type":"Ready","status":"True"},{"type":"DiskPressure","status":"True"},`+
+				`{"type":"PIDPressure","status":"True"}]}}]}`)
+		case "/api/v1/pods":
+			if fs := q.Get("fieldSelector"); fs != "" {
+				h.podFS.Store(fs)
+				io.WriteString(w, `{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[`+
+					`{"metadata":{"name":"p1","namespace":"a"},"status":{"phase":"Pending"}},`+
+					`{"metadata":{"name":"p2","namespace":"a"},"status":{"phase":"Pending"}},`+
+					`{"metadata":{"name":"p3","namespace":"a"},"status":{"phase":"Failed"}},`+
+					`{"metadata":{"name":"p4","namespace":"a"},"status":{"phase":"Unknown"}}]}`)
+				return
+			}
+			if q.Get("resourceVersion") == "" {
+				// The pod summary: one page plus a best-effort remainder.
+				io.WriteString(w, `{"kind":"PodList","apiVersion":"v1",`+
+					`"metadata":{"continue":"tok","remainingItemCount":41},"items":[`+
+					`{"metadata":{"name":"p1","namespace":"a"}}]}`)
+				return
+			}
+			// The scope probe.
+			io.WriteString(w, `{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[]}`)
+		case "/apis/apps/v1/deployments":
+			io.WriteString(w, `{"kind":"DeploymentList","apiVersion":"apps/v1","metadata":{},"items":[`+
+				`{"metadata":{"name":"d1","namespace":"a"},"spec":{"replicas":5},`+
+				`"status":{"readyReplicas":3,"availableReplicas":2}},`+
+				`{"metadata":{"name":"d2","namespace":"a"},"spec":{"replicas":2},`+
+				`"status":{"availableReplicas":0}},`+
+				`{"metadata":{"name":"d3","namespace":"a"},"spec":{},`+
+				`"status":{"readyReplicas":1,"availableReplicas":1}},`+
+				`{"metadata":{"name":"d4","namespace":"a"},"spec":{"replicas":0},"status":{}}]}`)
+		case "/api/v1/events":
+			h.eventFS.Store(q.Get("fieldSelector"))
+			io.WriteString(w, `{"kind":"EventList","apiVersion":"v1","metadata":{},"items":[`+
+				`{"metadata":{"name":"e1","namespace":"a"},"lastTimestamp":"`+recent+`",`+
+				`"type":"Warning","reason":"BackOff"},`+
+				`{"metadata":{"name":"e2","namespace":"a"},"lastTimestamp":"`+stale+`",`+
+				`"type":"Warning","reason":"Failed"},`+
+				`{"metadata":{"name":"e3","namespace":"a"},"eventTime":"`+recentMicro+`",`+
+				`"type":"Warning","reason":"FailedScheduling"}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+}
+
+func TestProbeOnceCollectsHealthSignals(t *testing.T) {
+	hs := &healthSrv{}
+	srv := httptest.NewServer(hs.handler())
+	defer srv.Close()
+	sup, store := newProbeFixture(t, srv, "")
+
+	sup.probeOnce(context.Background(), "slow")
+
+	st, ok := store.Get("slow")
+	if !ok {
+		t.Fatal("probe committed nothing")
+	}
+	if st.Reach != model.ReachDegraded || !strings.Contains(st.LastError, "nodes 2/3 ready") {
+		t.Errorf("reach = %v (%q), want degraded from the NotReady node", st.Reach, st.LastError)
+	}
+	if got := st.NodesNotReadyNames; len(got) != 1 || got[0] != "n2" {
+		t.Errorf("NodesNotReadyNames = %v, want [n2]", got)
+	}
+	if st.NodesMemPressure != 1 || st.NodesDiskPressure != 1 || st.NodesPIDPressure != 1 {
+		t.Errorf("pressure = mem %d disk %d pid %d, want 1/1/1",
+			st.NodesMemPressure, st.NodesDiskPressure, st.NodesPIDPressure)
+	}
+	if st.NodesCordoned != 1 {
+		t.Errorf("NodesCordoned = %d, want 1", st.NodesCordoned)
+	}
+	if got := st.NodesPressureNames; len(got) != 2 || got[0] != "n2" || got[1] != "n3" {
+		t.Errorf("NodesPressureNames = %v, want [n2 n3]", got)
+	}
+	if st.PodsPending != 2 || st.PodsFailed != 1 || st.PodsUnknownPhase != 1 {
+		t.Errorf("pods = pending %d failed %d unknown %d, want 2/1/1",
+			st.PodsPending, st.PodsFailed, st.PodsUnknownPhase)
+	}
+	if st.PodsTotal != 42 {
+		t.Errorf("PodsTotal = %d, want 42 (1 item + 41 remaining)", st.PodsTotal)
+	}
+	if st.DeploysTotal != 4 || st.DeploysDegraded != 2 || st.DeploysZeroAvail != 1 {
+		t.Errorf("deploys = total %d degraded %d zeroAvail %d, want 4/2/1",
+			st.DeploysTotal, st.DeploysDegraded, st.DeploysZeroAvail)
+	}
+	wantNames := []string{"a/d2 0/2", "a/d1 3/5"}
+	if len(st.DegradedDeployNames) != 2 ||
+		st.DegradedDeployNames[0] != wantNames[0] || st.DegradedDeployNames[1] != wantNames[1] {
+		t.Errorf("DegradedDeployNames = %v, want %v (worst ratio first)", st.DegradedDeployNames, wantNames)
+	}
+	if st.WarnEvents15m != 2 {
+		t.Errorf("WarnEvents15m = %d, want 2 (recent lastTimestamp + eventTime-only)", st.WarnEvents15m)
+	}
+	if fs, _ := hs.podFS.Load().(string); fs != "status.phase!=Running,status.phase!=Succeeded" {
+		t.Errorf("pod list fieldSelector = %q", fs)
+	}
+	if fs, _ := hs.eventFS.Load().(string); fs != "type=Warning" {
+		t.Errorf("event list fieldSelector = %q", fs)
+	}
+}
+
+// Denied health lists leave the "unknown" sentinels and must not touch
+// reach or LastError — they are dashboard signals, not liveness checks.
+func TestProbeOnceHealthDenialsLeaveUnknownAndReachAlone(t *testing.T) {
+	hs := &healthSrv{}
+	hs.forbidHealth.Store(true)
+	srv := httptest.NewServer(hs.handler())
+	defer srv.Close()
+	sup, store := newProbeFixture(t, srv, "")
+
+	sup.probeOnce(context.Background(), "slow")
+
+	st, _ := store.Get("slow")
+	if st.Reach != model.ReachDegraded || !strings.Contains(st.LastError, "nodes 2/3 ready") {
+		t.Errorf("reach = %v (%q), want the node verdict untouched by health denials",
+			st.Reach, st.LastError)
+	}
+	if st.PodsPending != -1 || st.PodsFailed != -1 || st.PodsUnknownPhase != -1 {
+		t.Errorf("pod phases = %d/%d/%d, want -1 sentinels on denial",
+			st.PodsPending, st.PodsFailed, st.PodsUnknownPhase)
+	}
+	if st.DeploysTotal != -1 || st.WarnEvents15m != -1 {
+		t.Errorf("deploys %d / warnEvents %d, want -1 sentinels on denial",
+			st.DeploysTotal, st.WarnEvents15m)
+	}
+	if st.PodsTotal != 42 {
+		t.Errorf("PodsTotal = %d, want 42 — the summary call is not a health list", st.PodsTotal)
+	}
+	if st.NodesMemPressure != 1 {
+		t.Errorf("NodesMemPressure = %d, want 1 — node health rides the node list", st.NodesMemPressure)
+	}
+}
+
+// A stalled health list is not a finding: the previous round's values
+// stand, exactly like the node-list timeout path.
+func TestProbeOnceHealthTimeoutCarriesForward(t *testing.T) {
+	old := ProbeTimeout
+	ProbeTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { ProbeTimeout = old })
+
+	hs := &healthSrv{delay: 600 * time.Millisecond}
+	srv := httptest.NewServer(hs.handler())
+	defer srv.Close()
+	sup, store := newProbeFixture(t, srv, "")
+
+	sup.probeOnce(context.Background(), "slow")
+	if st, _ := store.Get("slow"); st.PodsPending != 2 {
+		t.Fatalf("first round: PodsPending = %d, want 2", st.PodsPending)
+	}
+
+	hs.slowHealth.Store(true)
+	sup.probeOnce(context.Background(), "slow")
+
+	st, _ := store.Get("slow")
+	if st.PodsPending != 2 || st.PodsFailed != 1 || st.PodsUnknownPhase != 1 {
+		t.Errorf("pod phases = %d/%d/%d, want the last known 2/1/1 carried",
+			st.PodsPending, st.PodsFailed, st.PodsUnknownPhase)
+	}
+	if st.DeploysTotal != 4 || st.DeploysDegraded != 2 {
+		t.Errorf("deploys = %d/%d, want the last known 4/2 carried",
+			st.DeploysTotal, st.DeploysDegraded)
+	}
+	if st.WarnEvents15m != 2 {
+		t.Errorf("WarnEvents15m = %d, want the last known 2 carried", st.WarnEvents15m)
+	}
+}
+
+// With nothing to carry, a first-round health timeout reports unknown.
+// Run seeds every context with the -1 sentinels before the first round;
+// the seed here mimics that.
+func TestProbeOnceFirstRoundHealthTimeoutReportsUnknown(t *testing.T) {
+	old := ProbeTimeout
+	ProbeTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { ProbeTimeout = old })
+
+	hs := &healthSrv{delay: 600 * time.Millisecond}
+	hs.slowHealth.Store(true)
+	srv := httptest.NewServer(hs.handler())
+	defer srv.Close()
+	sup, store := newProbeFixture(t, srv, "")
+
+	seed := model.NewProbeFields()
+	seed.Reach = model.ReachUnknown
+	store.ApplyProbe("slow", seed)
+
+	sup.probeOnce(context.Background(), "slow")
+
+	st, _ := store.Get("slow")
+	if st.PodsPending != -1 || st.DeploysTotal != -1 || st.WarnEvents15m != -1 {
+		t.Errorf("health = pods %d deploys %d events %d, want -1 unknowns, not fabricated zeros",
+			st.PodsPending, st.DeploysTotal, st.WarnEvents15m)
+	}
+}
+
+// An empty healthy cluster measures zeros — which are findings, not
+// unknowns.
+func TestProbeOnceHealthZerosAreMeasurements(t *testing.T) {
+	srv := httptest.NewServer((&probeSrv{}).handler())
+	defer srv.Close()
+	sup, store := newProbeFixture(t, srv, "")
+
+	sup.probeOnce(context.Background(), "slow")
+
+	st, _ := store.Get("slow")
+	if st.PodsPending != 0 || st.PodsFailed != 0 || st.DeploysTotal != 0 || st.WarnEvents15m != 0 {
+		t.Errorf("health = pending %d failed %d deploys %d events %d, want measured zeros",
+			st.PodsPending, st.PodsFailed, st.DeploysTotal, st.WarnEvents15m)
+	}
+	if st.PodsTotal != 0 {
+		t.Errorf("PodsTotal = %d, want an exact 0 from a complete list", st.PodsTotal)
 	}
 }
