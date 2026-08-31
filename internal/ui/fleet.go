@@ -466,6 +466,9 @@ func (m Model) fleetRow(st model.ClusterState, spine, badges string, width int) 
 	case st.NodeCount > 0:
 		lbl := fmt.Sprintf("%dn", st.NodeCount)
 		style := th.Dim
+		if st.NodesCordonedReady > 0 {
+			style = th.StatusWrn
+		}
 		if st.NodeReady != st.NodeCount {
 			lbl = fmt.Sprintf("%d/%dn", st.NodeReady, st.NodeCount)
 			style = th.StatusWrn

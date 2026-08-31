@@ -274,28 +274,41 @@ func clampCanvas(s string, w, h int) string {
 		Render(s)
 }
 
-// nodeDots renders one glyph per node coloured by Ready vs NotReady.
-// We don't have per-node identity for non-focused clusters, only the
-// (ready, total) counts — that's enough to render the right palette.
+// nodeDots renders one glyph per node: green Ready, amber cordoned
+// (but otherwise Ready — same palette the node table gives Cordoned),
+// red NotReady. We don't have per-node identity for non-focused
+// clusters, only counts — enough to render the right palette. A node
+// both cordoned and NotReady paints red only.
 func nodeDots(st model.ClusterState, th Theme) string {
 	if st.NodeCount <= 0 {
 		return ""
 	}
 	const cap = 12
 	total := st.NodeCount
+	bad := total - st.NodeReady
+	if bad < 0 {
+		bad = 0
+	}
+	cordoned := st.NodesCordonedReady
+	if cordoned < 0 {
+		cordoned = 0
+	}
+	if cordoned > total-bad {
+		cordoned = total - bad
+	}
+	ok := total - bad - cordoned
 	if total > cap {
 		// Big cluster: don't render N dots, just one glyph.
-		if st.NodeReady < total {
+		switch {
+		case bad > 0:
+			return th.StatusBad.Render("●")
+		case cordoned > 0:
 			return th.StatusWrn.Render("●")
 		}
 		return th.StatusOK.Render("●")
 	}
-	ok := st.NodeReady
-	if ok > total {
-		ok = total
-	}
-	bad := total - ok
 	return th.StatusOK.Render(strings.Repeat("●", ok)) +
+		th.StatusWrn.Render(strings.Repeat("●", cordoned)) +
 		th.StatusBad.Render(strings.Repeat("●", bad))
 }
 

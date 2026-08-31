@@ -281,3 +281,30 @@ func TestSparkline(t *testing.T) {
 		t.Errorf("oversized history must clip to width, got %d runes", w)
 	}
 }
+
+func TestNodeDotsPalette(t *testing.T) {
+	th := DefaultTheme()
+	st := healthyState() // 3 nodes
+	st.NodeReady = 2
+	st.NodesCordonedReady = 1
+	want := th.StatusOK.Render("●") + th.StatusWrn.Render("●") + th.StatusBad.Render("●")
+	if got := nodeDots(st, th); got != want {
+		t.Errorf("dots = %q, want green+amber+red for ready/cordoned/notready", got)
+	}
+
+	// The cordoned node IS the NotReady one: red only, no phantom amber.
+	st.NodesCordonedReady = 0
+	st.NodesCordoned = 1
+	want = th.StatusOK.Render(strings.Repeat("●", 2)) + th.StatusWrn.Render("") + th.StatusBad.Render("●")
+	if got := nodeDots(st, th); got != want {
+		t.Errorf("dots = %q, want green×2+red — cordoned+NotReady paints red once", got)
+	}
+
+	// Unknown sentinel never paints amber.
+	st = healthyState()
+	st.NodesCordonedReady = -1
+	want = th.StatusOK.Render(strings.Repeat("●", 3)) + th.StatusWrn.Render("") + th.StatusBad.Render("")
+	if got := nodeDots(st, th); got != want {
+		t.Errorf("dots = %q, want all green for unknown cordon count", got)
+	}
+}
