@@ -773,8 +773,7 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// The resource cursor deliberately survives the round trip;
 		// Esc/F1 in the dashboard restores returnView with the row
 		// still selected.
-		m.fleet.returnView = m.view
-		m.view = ViewFleet
+		m.enterFleet()
 	case "f2":
 		m.debugMode = !m.debugMode
 	case "?":

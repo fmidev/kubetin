@@ -17,6 +17,26 @@ type fleetState struct {
 	cursorCtx  string
 	expanded   string // context with the detail panel open; "" = none
 	returnView View   // restored on Esc / F1
+	// savedFilter parks the resource views' filter while the fleet
+	// view owns m.filterText — the two filter different things (rows
+	// vs cluster names) and must not leak into each other.
+	savedFilter string
+}
+
+// enterFleet/leaveFleet are the only transitions in and out of the
+// fleet view; every path routes through them so the filter swap and
+// returnView bookkeeping can't be missed.
+func (m *Model) enterFleet() {
+	m.fleet.returnView = m.view
+	m.fleet.savedFilter = m.filterText
+	m.filterText = ""
+	m.view = ViewFleet
+}
+
+func (m *Model) leaveFleet(to View) {
+	m.filterText = m.fleet.savedFilter
+	m.fleet.savedFilter = ""
+	m.view = to
 }
 
 // fleetGroupsFiltered derives the triage groups from the store with
@@ -128,7 +148,7 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if ctx != m.WatchedContext && m.OnFocusChange != nil {
 			cmd = m.focusContext(ctx)
 		}
-		m.view = ViewPods
+		m.leaveFleet(ViewPods)
 		return m, cmd
 	case "/":
 		m.filterFocused = true
@@ -138,11 +158,17 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filterText = ""
 			return m, nil
 		}
-		m.view = m.fleet.returnView
+		m.leaveFleet(m.fleet.returnView)
 		return m, nil
 	case "f1":
-		m.view = m.fleet.returnView
+		m.leaveFleet(m.fleet.returnView)
 		return m, nil
+	case "1", "2", "3", "4", "5", "6":
+		// switchView will set the destination; restore the parked
+		// resource filter before it applies.
+		m.filterText = m.fleet.savedFilter
+		m.fleet.savedFilter = ""
+		return m.handleKey(k)
 	}
 	return m.handleKey(k)
 }
@@ -205,8 +231,14 @@ func (m Model) renderFleet(height, width int) string {
 	}
 
 	if len(lines) > regionH {
+		// Centre the cursor block when it fits; anchor an oversized
+		// block at its first line so the title and the worst-first
+		// alerts stay visible rather than the card's tail.
 		blockLen := cursorEnd - cursorStart + 1
-		start := cursorStart - (regionH-blockLen)/2
+		start := cursorStart
+		if blockLen < regionH {
+			start = cursorStart - (regionH-blockLen)/2
+		}
 		if start < 0 {
 			start = 0
 		}
@@ -288,7 +320,7 @@ func (m Model) renderFleetPulse(g fleetGroups, width int) string {
 		}
 		parts = append(parts, nodes)
 	}
-	if p.Pods > 0 {
+	if p.Pods > 0 || p.PodsBad > 0 || !p.AllPodsKnown {
 		pods := fmt.Sprintf("%d", p.Pods)
 		if !p.AllPodsKnown {
 			pods += "+"

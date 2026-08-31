@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -149,5 +150,101 @@ func TestFleetEscClearsFilterBeforeLeaving(t *testing.T) {
 	m, _ = fleetPress(t, m, key("esc"))
 	if m.view != ViewNodes {
 		t.Errorf("second esc should leave to the return view, got %v", m.view)
+	}
+}
+
+func TestFleetFilterIsolatedFromResourceFilter(t *testing.T) {
+	m := fleetTestModel()
+	m.view = ViewPods
+	m.filterText = "kube-system"
+
+	res, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyF1})
+	m = res.(Model)
+	if m.filterText != "" {
+		t.Fatalf("pod filter leaked into the fleet view: %q", m.filterText)
+	}
+	if got := len(m.fleetOrder()); got != 3 {
+		t.Fatalf("fleet should be unfiltered on entry, %d clusters visible", got)
+	}
+
+	m.filterText = "fi" // a fleet-side filter
+	m, _ = fleetPress(t, m, tea.KeyMsg{Type: tea.KeyF1})
+	if m.view != ViewPods || m.filterText != "kube-system" {
+		t.Errorf("leaving must restore the resource filter; view=%v filter=%q", m.view, m.filterText)
+	}
+}
+
+func TestFleetOpenRestoresResourceFilter(t *testing.T) {
+	m := fleetTestModel()
+	m.view = ViewPods
+	m.filterText = "payments"
+	res, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyF1})
+	m = res.(Model)
+	m.OnFocusChange = func(string) {}
+	m.fleet.cursorCtx = "bad"
+	m.filterText = "ba" // fleet filter
+
+	m, _ = fleetPress(t, m, key("o"))
+	if m.view != ViewPods || m.filterText != "payments" {
+		t.Errorf("o must restore the resource filter; view=%v filter=%q", m.view, m.filterText)
+	}
+}
+
+func TestFleetViewKeyRestoresResourceFilter(t *testing.T) {
+	m := fleetTestModel()
+	m.view = ViewPods
+	m.filterText = "payments"
+	res, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyF1})
+	m = res.(Model)
+	m.filterText = "prod" // fleet filter
+
+	m, _ = fleetPress(t, m, key("2"))
+	if m.view != ViewDeployments || m.filterText != "payments" {
+		t.Errorf("1-6 must restore the resource filter; view=%v filter=%q", m.view, m.filterText)
+	}
+}
+
+func TestFleetOversizedCardAnchorsAtItsTitle(t *testing.T) {
+	m := fleetTestModel()
+	store := model.NewStore()
+	seedFleetCluster(store, "bad", func(pf *model.ProbeFields) {
+		pf.Reach = model.ReachDegraded
+		pf.NodeCount, pf.NodeReady = 5, 3
+		pf.NodesNotReadyNames = []string{"n4", "n5"}
+		pf.NodesMemPressure, pf.NodesDiskPressure, pf.NodesPIDPressure = 1, 1, 1
+		pf.NodesPressureNames = []string{"n4"}
+		pf.NodesCordoned = 2
+		pf.PodsFailed, pf.PodsUnknownPhase, pf.PodsPending = 2, 1, 9
+		pf.DeploysTotal, pf.DeploysDegraded = 5, 3
+		pf.WarnEvents15m = 99
+	})
+	m.Store = store
+	m.fleet.cursorCtx = "bad"
+
+	// Region of 5 lines, card of ~12: the card cannot fit. Its first
+	// line — the title naming the cluster — must still be the first
+	// thing shown, not a slice from the middle.
+	out := m.renderFleet(6, 80)
+	visible := strings.Split(out, "\n")
+	if len(visible) < 2 || !strings.Contains(visible[1], "bad") {
+		t.Errorf("oversized card should anchor at its title line; got:\n%s", out)
+	}
+}
+
+func TestFleetPulseHonestWhenAllPodTotalsUnknown(t *testing.T) {
+	m := fleetTestModel()
+	store := model.NewStore()
+	seedFleetCluster(store, "a", func(pf *model.ProbeFields) {
+		pf.PodsTotal = -1
+		pf.PodsFailed = 2
+	})
+	m.Store = store
+
+	out := m.renderFleetPulse(m.fleetGroupsFiltered(), 120)
+	if !strings.Contains(out, "0+ pods") {
+		t.Errorf("unknown totals must render as 0+ pods, got %q", out)
+	}
+	if !strings.Contains(out, "2✗") {
+		t.Errorf("known bad-pod count must not be suppressed, got %q", out)
 	}
 }
