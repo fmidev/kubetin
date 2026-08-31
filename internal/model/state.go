@@ -91,6 +91,7 @@ type ClusterState struct {
 	NodesDiskPressure   int      // nodes with DiskPressure=True
 	NodesPIDPressure    int      // nodes with PIDPressure=True
 	NodesCordoned       int      // nodes with spec.unschedulable
+	NodesCordonedReady  int      // of those, the otherwise-Ready ones (drives amber dots)
 	NodesPressureNames  []string // sample of nodes with any pressure condition
 	PodsTotal           int      // best-effort total pod count
 	PodsPending         int
@@ -166,6 +167,7 @@ type ProbeFields struct {
 	NodesDiskPressure   int
 	NodesPIDPressure    int
 	NodesCordoned       int
+	NodesCordonedReady  int
 	NodesPressureNames  []string
 	PodsTotal           int
 	PodsPending         int
@@ -185,18 +187,19 @@ type ProbeFields struct {
 // never looked at. Callers overwrite what they actually measured.
 func NewProbeFields() ProbeFields {
 	return ProbeFields{
-		NodesMemPressure:  -1,
-		NodesDiskPressure: -1,
-		NodesPIDPressure:  -1,
-		NodesCordoned:     -1,
-		PodsTotal:         -1,
-		PodsPending:       -1,
-		PodsFailed:        -1,
-		PodsUnknownPhase:  -1,
-		DeploysTotal:      -1,
-		DeploysDegraded:   -1,
-		DeploysZeroReady:  -1,
-		WarnEvents15m:     -1,
+		NodesMemPressure:   -1,
+		NodesDiskPressure:  -1,
+		NodesPIDPressure:   -1,
+		NodesCordoned:      -1,
+		NodesCordonedReady: -1,
+		PodsTotal:          -1,
+		PodsPending:        -1,
+		PodsFailed:         -1,
+		PodsUnknownPhase:   -1,
+		DeploysTotal:       -1,
+		DeploysDegraded:    -1,
+		DeploysZeroReady:   -1,
+		WarnEvents15m:      -1,
 	}
 }
 
@@ -231,6 +234,7 @@ func (s *Store) ApplyProbe(ctx string, p ProbeFields) {
 	st.NodesDiskPressure = p.NodesDiskPressure
 	st.NodesPIDPressure = p.NodesPIDPressure
 	st.NodesCordoned = p.NodesCordoned
+	st.NodesCordonedReady = p.NodesCordonedReady
 	st.NodesPressureNames = p.NodesPressureNames
 	st.PodsTotal = p.PodsTotal
 	st.PodsPending = p.PodsPending

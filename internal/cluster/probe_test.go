@@ -532,6 +532,9 @@ func TestProbeOnceCollectsHealthSignals(t *testing.T) {
 	if st.NodesCordoned != 1 {
 		t.Errorf("NodesCordoned = %d, want 1", st.NodesCordoned)
 	}
+	if st.NodesCordonedReady != 1 {
+		t.Errorf("NodesCordonedReady = %d, want 1 — n3 is cordoned yet Ready", st.NodesCordonedReady)
+	}
 	if got := st.NodesPressureNames; len(got) != 2 || got[0] != "n2" || got[1] != "n3" {
 		t.Errorf("NodesPressureNames = %v, want [n2 n3]", got)
 	}

@@ -82,8 +82,45 @@ func TestViewFitsCanvas(t *testing.T) {
 		})},
 		{"namespaces/wide", 200, 50, ViewNamespaces, nil},
 		{"namespaces/narrow", 80, 24, ViewNamespaces, nil},
-		{"overview/wide", 200, 50, ViewOverview, nil},
-		{"overview/narrow", 80, 24, ViewOverview, nil},
+		{"fleet/empty-store", 120, 30, ViewFleet, nil},
+		{"fleet/wide", 200, 50, ViewFleet, fleetLayoutFixture(nil)},
+		{"fleet/narrow", 80, 24, ViewFleet, fleetLayoutFixture(nil)},
+		{"fleet/very-narrow", 60, 20, ViewFleet, fleetLayoutFixture(nil)},
+		{"fleet/tiny", 40, 12, ViewFleet, fleetLayoutFixture(nil)},
+		{"fleet/cursor-on-card", 120, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.fleet.cursorCtx = "beta"
+		})},
+		{"fleet/cursor-windowed", 100, 14, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.fleet.cursorCtx = "gamma"
+		})},
+		{"fleet/all-clear", 120, 30, ViewFleet, func(m *Model) {
+			store := model.NewStore()
+			seedFleetCluster(store, "alpha", nil)
+			seedFleetCluster(store, "beta", nil)
+			m.Store = store
+		}},
+		{"fleet/starting", 120, 30, ViewFleet, func(m *Model) {
+			store := model.NewStore()
+			for _, c := range []string{"alpha", "beta", "gamma"} {
+				pf := model.NewProbeFields()
+				pf.Reach = model.ReachUnknown
+				store.ApplyProbe(c, pf)
+			}
+			m.Store = store
+		}},
+		{"fleet/filter-focused", 100, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.filterFocused = true
+			m.filterText = "al"
+		})},
+		{"fleet/filter-no-match", 100, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.filterText = "zzz"
+		})},
+		{"help-over-fleet", 120, 40, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.helpOpen = true
+		})},
+		{"rbac-over-fleet", 120, 40, ViewFleet, fleetLayoutFixture(func(m *Model) {
+			m.rbacOpen = true
+		})},
 
 		{"with-filter", 100, 30, ViewPods, func(m *Model) { m.filterText = "kube-system" }},
 		{"with-filter-focused", 100, 30, ViewPods, func(m *Model) {
@@ -337,7 +374,7 @@ func TestViewFitsCanvas(t *testing.T) {
 		{"single-cluster/narrow", 80, 24, ViewPods, singleContext(nil)},
 		{"single-cluster/tiny", 40, 12, ViewPods, singleContext(nil)},
 		{"single-cluster/nodes", 120, 30, ViewNodes, singleContext(nil)},
-		{"single-cluster/overview", 120, 30, ViewOverview, singleContext(nil)},
+		{"single-cluster/fleet", 120, 30, ViewFleet, singleContext(nil)},
 		{"single-cluster/with-filter", 120, 30, ViewPods, singleContext(func(m *Model) {
 			m.filterFocused = true
 			m.filterText = "kube"
@@ -764,4 +801,48 @@ func truncForErr(s string) string {
 		return s[:80] + "…"
 	}
 	return s
+}
+
+// fleetLayoutFixture swaps m.Store for a per-case store — the shared
+// store must stay empty for every other case — seeded with a mixed
+// fleet: a healthy cluster with metrics, an alert-heavy degraded one
+// with a CJK display name and a long error, and an unreachable one.
+func fleetLayoutFixture(extra func(*Model)) func(*Model) {
+	return func(m *Model) {
+		store := model.NewStore()
+		seedFleetCluster(store, "alpha", nil)
+		store.ApplyMetrics("alpha", model.MetricsFields{
+			UsageCPUMilli: 4000, UsageMemBytes: 60 << 20,
+			MetricsAvailable: true, MetricsAt: time.Now(),
+		})
+		seedFleetCluster(store, "beta", func(pf *model.ProbeFields) {
+			pf.RawName = "本番環境クラスタ北"
+			pf.Reach = model.ReachDegraded
+			pf.NodeCount, pf.NodeReady = 5, 3
+			pf.NodesNotReadyNames = []string{"node-2", "node-5"}
+			pf.NodesMemPressure = 1
+			pf.NodesPressureNames = []string{"node-2"}
+			pf.NodesCordoned = 1
+			pf.DeploysTotal, pf.DeploysDegraded, pf.DeploysZeroReady = 12, 3, 1
+			pf.DegradedDeployNames = []string{"prod/smartmet-server 0/5", "prod/api 3/5", "prod/web 4/5"}
+			pf.PodsPending, pf.PodsFailed = 7, 2
+			pf.WarnEvents15m = 42
+			pf.PodsTotal = 240
+		})
+		store.ApplyMetrics("beta", model.MetricsFields{
+			UsageCPUMilli: 11000, UsageMemBytes: 95 << 20,
+			MetricsAvailable: true, MetricsAt: time.Now(),
+		})
+		seedFleetCluster(store, "gamma", func(pf *model.ProbeFields) {
+			pf.Reach = model.ReachUnreachable
+			pf.ServerVersion = ""
+			pf.NodeCount, pf.NodeReady = 0, 0
+			pf.PodsTotal = -1
+			pf.LastError = strings.Repeat("dial tcp 10.0.0.1:6443: i/o timeout ", 4)
+		})
+		m.Store = store
+		if extra != nil {
+			extra(m)
+		}
+	}
 }

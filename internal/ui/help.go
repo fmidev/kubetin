@@ -52,7 +52,8 @@ func (m Model) handleHelpKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 // the renderer agree on how much fits, the same way dashCanvasSize
 // does for the dashboard.
 func (m Model) helpCanvas() (int, int) {
-	h := m.height - lipgloss.Height(m.renderHeader()) - lipgloss.Height(m.renderFooter())
+	headerH, footerH := m.chromeHeights()
+	h := m.height - headerH - footerH
 	if h < 1 {
 		h = 1
 	}
@@ -84,7 +85,7 @@ var helpGroups = []helpGroup{
 			{"4", "ingresses"},
 			{"5", "nodes"},
 			{"6", "namespaces"},
-			{"F1", "fleet overview"},
+			{"F1", "fleet dashboard (toggle)"},
 		},
 	},
 	{
@@ -118,6 +119,15 @@ var helpGroups = []helpGroup{
 		Bindings: [][2]string{
 			{"Tab / Shift-Tab", "next / previous cluster"},
 			{"C", "show / hide cluster rail"},
+		},
+	},
+	{
+		Title: "Fleet dashboard",
+		Bindings: [][2]string{
+			{"j / k", "next / previous cluster"},
+			{"g / G", "first / last cluster"},
+			{"o", "open cluster (pods view)"},
+			{"Esc / F1", "back to previous view"},
 		},
 	},
 	{

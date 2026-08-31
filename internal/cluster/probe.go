@@ -343,6 +343,7 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 			pf.NodesDiskPressure = prev.NodesDiskPressure
 			pf.NodesPIDPressure = prev.NodesPIDPressure
 			pf.NodesCordoned = prev.NodesCordoned
+			pf.NodesCordonedReady = prev.NodesCordonedReady
 			pf.NodesPressureNames = prev.NodesPressureNames
 			if prev.ServerVersion == "" {
 				// No round has ever completed, so there is no detail to
@@ -371,6 +372,7 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 				pf.NodesDiskPressure = res.DiskPressure
 				pf.NodesPIDPressure = res.PIDPressure
 				pf.NodesCordoned = res.Cordoned
+				pf.NodesCordonedReady = res.CordonedReady
 				pf.NodesPressureNames = res.PressureNames
 			}
 			if res.Reach == model.ReachDegraded && nodeErr == nil {
@@ -536,6 +538,7 @@ type nodeProbeResult struct {
 	DiskPressure  int
 	PIDPressure   int
 	Cordoned      int
+	CordonedReady int
 	PressureNames []string
 }
 
@@ -597,6 +600,9 @@ func (s *Supervisor) probeNodes(ctx context.Context, clientset *kubernetes.Clien
 			}
 			if n.Spec.Unschedulable {
 				health.Cordoned++
+				if nodeReady {
+					health.CordonedReady++
+				}
 			}
 		}
 		// Reach: all nodes ready → Healthy; some NotReady → Degraded.
@@ -688,6 +694,7 @@ func carryHealth(pf *model.ProbeFields, prev model.ClusterState) {
 	pf.NodesDiskPressure = prev.NodesDiskPressure
 	pf.NodesPIDPressure = prev.NodesPIDPressure
 	pf.NodesCordoned = prev.NodesCordoned
+	pf.NodesCordonedReady = prev.NodesCordonedReady
 	pf.NodesPressureNames = prev.NodesPressureNames
 	pf.PodsTotal = prev.PodsTotal
 	pf.PodsPending = prev.PodsPending

@@ -151,6 +151,20 @@ func (m Model) renderSidebarRow(st model.ClusterState) string {
 	metaVisibleWidth := lipgloss.Width(meta)
 	meta = m.Theme.Dim.Render(meta)
 
+	// Alert badge: the fleet dashboard's derivation, compressed to
+	// "✗2"/"⚠1" so degradation elsewhere is visible while working in
+	// another cluster.
+	if crit, warn := alertCounts(clusterAlerts(st)); crit > 0 || warn > 0 {
+		badge := fmt.Sprintf("⚠%d", warn)
+		style := m.Theme.StatusWrn
+		if crit > 0 {
+			badge = fmt.Sprintf("✗%d", crit)
+			style = m.Theme.StatusBad
+		}
+		metaVisibleWidth += lipgloss.Width(badge) + 1
+		meta = style.Render(badge) + " " + meta
+	}
+
 	nameWidth := SidebarWidth - metaVisibleWidth - 6
 	if nameWidth < 1 {
 		nameWidth = 1

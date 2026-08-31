@@ -1,10 +1,13 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/fmidev/kubetin/internal/model"
 )
 
 // padCol returns a cell of exactly `width` visible cells: the input
@@ -269,4 +272,91 @@ func clampCanvas(s string, w, h int) string {
 		Width(w).MaxWidth(w).
 		Height(h).MaxHeight(h).
 		Render(s)
+}
+
+// nodeDots renders one glyph per node: green Ready, amber cordoned
+// (but otherwise Ready — same palette the node table gives Cordoned),
+// red NotReady. We don't have per-node identity for non-focused
+// clusters, only counts — enough to render the right palette. A node
+// both cordoned and NotReady paints red only.
+func nodeDots(st model.ClusterState, th Theme) string {
+	if st.NodeCount <= 0 {
+		return ""
+	}
+	const cap = 12
+	total := st.NodeCount
+	bad := total - st.NodeReady
+	if bad < 0 {
+		bad = 0
+	}
+	cordoned := st.NodesCordonedReady
+	if cordoned < 0 {
+		cordoned = 0
+	}
+	if cordoned > total-bad {
+		cordoned = total - bad
+	}
+	ok := total - bad - cordoned
+	if total > cap {
+		// Big cluster: don't render N dots, just one glyph.
+		switch {
+		case bad > 0:
+			return th.StatusBad.Render("●")
+		case cordoned > 0:
+			return th.StatusWrn.Render("●")
+		}
+		return th.StatusOK.Render("●")
+	}
+	return th.StatusOK.Render(strings.Repeat("●", ok)) +
+		th.StatusWrn.Render(strings.Repeat("●", cordoned)) +
+		th.StatusBad.Render(strings.Repeat("●", bad))
+}
+
+func overviewBar(label string, used, alloc int64, cells int, th Theme, suffix string) string {
+	p := pct(used, alloc)
+	loadStyle := th.loadStyle(p)
+	emptyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("236"))
+	n := p * cells / 100
+	if n < 0 {
+		n = 0
+	}
+	if n > cells {
+		n = cells
+	}
+	filled := loadStyle.Render(strings.Repeat("▬", n))
+	empty := emptyStyle.Render(strings.Repeat("▬", cells-n))
+	return fmt.Sprintf("%s %s%s %3d%%  %s",
+		th.Dim.Render(label),
+		filled,
+		empty,
+		p,
+		th.Dim.Render(suffix))
+}
+
+// coresStr always returns a 5-char string so the CPU suffix has a
+// stable width across rows (otherwise the MEM bar shifts when one
+// cluster reads "500m" and another "1.4").
+//
+//	   1m → "   1m"
+//	 500m → " 500m"
+//	  1.4 → "  1.4"
+//	200.0 → "200.0"
+func coresStr(milli int64) string {
+	if milli == 0 {
+		return "    0"
+	}
+	if milli < 1000 {
+		return fmt.Sprintf("%4dm", milli)
+	}
+	return fmt.Sprintf("%5.1f", float64(milli)/1000)
+}
+
+// memStrFixed returns the human memory string padded to 7 chars so
+// the MEM suffix has a stable width.
+func memStrFixed(b int64) string {
+	s := formatMem(b)
+	if len(s) >= 7 {
+		return s
+	}
+	return strings.Repeat(" ", 7-len(s)) + s
 }
