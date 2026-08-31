@@ -1945,16 +1945,18 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 
 func (m Model) renderFooter() string {
 	hint := " ?:help  F1:fleet  1:pods  2:deploy  3:svc  4:ing  5:nodes  6:ns  e:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
-	if len(m.Contexts) <= 1 {
-		// Nothing to Tab to, and the rail that would have hinted at
-		// other clusters isn't drawn either.
-		hint = strings.Replace(hint, "Tab:cluster  ", "", 1)
-	}
 	if m.view == ViewFleet && !m.dashboard.open {
 		hint = " j/k:cluster  o:open  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
 	}
 	if m.dashboard.open {
 		hint = " Tab:pane  j/k:move  g/G:top/bottom  f:follow  i:open pod  c:container  l:logs  d:describe  Enter:actions  Esc:back "
+	}
+	if len(m.Contexts) <= 1 {
+		// Nothing to Tab to, and the rail that would have hinted at
+		// other clusters isn't drawn either. After the per-mode
+		// overrides so the fleet hint sheds it too ("Tab:pane" in the
+		// dashboard hint is a different key and survives).
+		hint = strings.Replace(hint, "Tab:cluster  ", "", 1)
 	}
 	hint = m.Theme.Footer.Render(hint)
 

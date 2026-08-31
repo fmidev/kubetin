@@ -18,6 +18,7 @@ func healthyState() model.ClusterState {
 		AllocCPUMilli: 12000, AllocMemBytes: 100 << 20,
 		UsageCPUMilli: 3000, UsageMemBytes: 25 << 20,
 		MetricsAvailable: true,
+		MetricsAt:        time.Now(),
 		PodsTotal:        42,
 	}
 }
@@ -112,6 +113,10 @@ func TestClusterAlertsRules(t *testing.T) {
 		{"mem-90-crit", func(st *model.ClusterState) {
 			st.UsageMemBytes = st.AllocMemBytes * 90 / 100
 		}, sevCrit, "memory 90%"},
+		{"mem-stale-sample-never-alerts", func(st *model.ClusterState) {
+			st.UsageMemBytes = st.AllocMemBytes * 95 / 100
+			st.MetricsAt = time.Now().Add(-10 * time.Minute)
+		}, sevInfo, ""},
 		{"mem-ignored-without-metrics", func(st *model.ClusterState) {
 			st.MetricsAvailable = false
 			st.UsageMemBytes = st.AllocMemBytes

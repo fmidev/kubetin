@@ -18,6 +18,10 @@ const (
 	fleetPendingWarn    = 5
 	fleetWarnEventsWarn = 10
 	fleetTrendCap       = 24
+	// fleetMemAlertMaxAge caps how old a metrics sample may be and
+	// still raise the memory alert — four missed 30s poll cycles. A
+	// frozen last sample must not hold a cluster in NEEDS ATTENTION.
+	fleetMemAlertMaxAge = 2 * time.Minute
 )
 
 type alertSeverity uint8
@@ -119,7 +123,7 @@ func clusterAlerts(st model.ClusterState) []clusterAlert {
 		add(sevWarn, fmt.Sprintf("%d warning events /15m", st.WarnEvents15m))
 	}
 
-	if st.MetricsAvailable && st.AllocMemBytes > 0 {
+	if st.MetricsAvailable && st.AllocMemBytes > 0 && time.Since(st.MetricsAt) < fleetMemAlertMaxAge {
 		p := pct(st.UsageMemBytes, st.AllocMemBytes)
 		switch {
 		case p >= fleetMemCritPct:

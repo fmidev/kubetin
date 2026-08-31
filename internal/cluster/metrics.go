@@ -35,7 +35,7 @@ func (s *Supervisor) runMetricsLoop(ctx context.Context, ctxName string) {
 		case <-t.C:
 		}
 		st, ok := s.store.Get(ctxName)
-		if !ok || st.Reach != model.ReachHealthy {
+		if !ok || (st.Reach != model.ReachHealthy && st.Reach != model.ReachDegraded) {
 			continue
 		}
 		if !lastPoll.IsZero() && time.Since(lastPoll) < metricsInterval {
@@ -48,9 +48,13 @@ func (s *Supervisor) runMetricsLoop(ctx context.Context, ctxName string) {
 
 func (s *Supervisor) pollMetricsOnce(parent context.Context, ctxName string) {
 	prev, ok := s.store.Get(ctxName)
-	if !ok || prev.Reach != model.ReachHealthy {
+	if !ok || (prev.Reach != model.ReachHealthy && prev.Reach != model.ReachDegraded) {
 		// Skip clusters we don't yet know are reachable. We'll catch
-		// up next tick once probe promotes them.
+		// up next tick once probe promotes them. Degraded still polls:
+		// its API answers, and a degraded cluster is exactly the one
+		// whose live memory picture matters — freezing its last sample
+		// here is how a stale reading once pinned a cluster in the
+		// fleet dashboard's NEEDS ATTENTION.
 		return
 	}
 
