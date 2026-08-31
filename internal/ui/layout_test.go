@@ -823,7 +823,7 @@ func fleetLayoutFixture(extra func(*Model)) func(*Model) {
 			pf.NodesMemPressure = 1
 			pf.NodesPressureNames = []string{"node-2"}
 			pf.NodesCordoned = 1
-			pf.DeploysTotal, pf.DeploysDegraded, pf.DeploysZeroAvail = 12, 3, 1
+			pf.DeploysTotal, pf.DeploysDegraded, pf.DeploysZeroReady = 12, 3, 1
 			pf.DegradedDeployNames = []string{"prod/smartmet-server 0/5", "prod/api 3/5", "prod/web 4/5"}
 			pf.PodsPending, pf.PodsFailed = 7, 2
 			pf.WarnEvents15m = 42

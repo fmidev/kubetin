@@ -29,7 +29,7 @@ func unknownState() model.ClusterState {
 	st.NodesMemPressure, st.NodesDiskPressure, st.NodesPIDPressure = -1, -1, -1
 	st.NodesCordoned = -1
 	st.PodsTotal, st.PodsPending, st.PodsFailed, st.PodsUnknownPhase = -1, -1, -1, -1
-	st.DeploysTotal, st.DeploysDegraded, st.DeploysZeroAvail = -1, -1, -1
+	st.DeploysTotal, st.DeploysDegraded, st.DeploysZeroReady = -1, -1, -1
 	st.WarnEvents15m = -1
 	return st
 }
@@ -68,9 +68,9 @@ func TestClusterAlertsRules(t *testing.T) {
 			st.DeploysDegraded = 2
 			st.DegradedDeployNames = []string{"a/d1 3/5"}
 		}, sevWarn, "2 deployments below desired (a/d1 3/5 +1 more)"},
-		{"deploys-zero-avail", func(st *model.ClusterState) {
+		{"deploys-zero-ready", func(st *model.ClusterState) {
 			st.DeploysDegraded = 1
-			st.DeploysZeroAvail = 1
+			st.DeploysZeroReady = 1
 			st.DegradedDeployNames = []string{"a/d2 0/2"}
 		}, sevCrit, "1 deployment below desired (a/d2 0/2)"},
 		{"mem-pressure-named", func(st *model.ClusterState) {

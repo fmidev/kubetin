@@ -70,7 +70,7 @@ func clusterAlerts(st model.ClusterState) []clusterAlert {
 
 	if st.DeploysDegraded > 0 {
 		sev := sevWarn
-		if st.DeploysZeroAvail > 0 {
+		if st.DeploysZeroReady > 0 {
 			sev = sevCrit
 		}
 		add(sev, nameList(plural(st.DeploysDegraded, "deployment")+" below desired",
