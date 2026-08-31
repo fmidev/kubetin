@@ -274,22 +274,6 @@ func clampCanvas(s string, w, h int) string {
 		Render(s)
 }
 
-func readyBadge(st model.ClusterState, th Theme) string {
-	switch st.Reach {
-	case model.ReachHealthy:
-		return th.StatusOK.Render("✓ Ready")
-	case model.ReachDegraded:
-		return th.StatusWrn.Render("◐ Degraded")
-	case model.ReachUnreachable:
-		return th.StatusBad.Render("✕ Unreachable")
-	case model.ReachAuthFailed:
-		return th.StatusBad.Render("✕ Auth Failed")
-	case model.ReachConnecting:
-		return th.StatusWrn.Render("◐ Connecting")
-	}
-	return th.StatusDim.Render("○ Unknown")
-}
-
 // nodeDots renders one glyph per node coloured by Ready vs NotReady.
 // We don't have per-node identity for non-focused clusters, only the
 // (ready, total) counts — that's enough to render the right palette.

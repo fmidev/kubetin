@@ -365,22 +365,21 @@ func (m Model) renderFleetPulse(g fleetGroups, width int) string {
 	return left + strings.Repeat(" ", pad) + right
 }
 
-// renderFleetCard is one NEEDS ATTENTION cluster: title row, one line
-// per alert, meters row — every line behind a severity-colored spine
-// so a vertical glance down the left edge ranks the fleet.
+func (m Model) cardSpine(e fleetEntry) string {
+	if worstSeverity(e.Alerts) == sevCrit {
+		return m.Theme.StatusBad.Render("▍")
+	}
+	return m.Theme.StatusWrn.Render("▍")
+}
+
+// renderFleetCard is one NEEDS ATTENTION cluster: the same row every
+// section uses (plus severity spine and alert-count badges), then one
+// line per alert. Same fact, same column, whichever section a cluster
+// is in.
 func (m Model) renderFleetCard(e fleetEntry, width int) []string {
 	th := m.Theme
-	st := e.St
-	spineStyle := th.StatusWrn
-	if worstSeverity(e.Alerts) == sevCrit {
-		spineStyle = th.StatusBad
-	}
-	spine := spineStyle.Render("▍")
+	spine := m.cardSpine(e)
 
-	name := st.RawName
-	if name == "" {
-		name = st.Context
-	}
 	crit, warn := alertCounts(e.Alerts)
 	badges := ""
 	if crit > 0 {
@@ -389,34 +388,7 @@ func (m Model) renderFleetCard(e fleetEntry, width int) []string {
 	if warn > 0 {
 		badges += " " + th.StatusWrn.Render(fmt.Sprintf("⚠%d", warn))
 	}
-	left := spine + " " + th.styleForReach(st.Reach).Render(st.Reach.Glyph()) +
-		" " + th.Header.Render(truncate(name, width/2)) + badges
-
-	var meta []string
-	if st.ServerVersion != "" {
-		meta = append(meta, th.Dim.Render(st.ServerVersion))
-	}
-	meta = append(meta, readyBadge(st, th))
-	if st.ProbeLatency > 0 {
-		meta = append(meta, th.Dim.Render(fmt.Sprintf("⏱ %dms", st.ProbeLatency.Milliseconds())))
-	}
-	if st.NodeCount > 0 {
-		lbl := fmt.Sprintf("%d nodes", st.NodeCount)
-		if st.NodeReady != st.NodeCount {
-			lbl = fmt.Sprintf("%d/%d nodes", st.NodeReady, st.NodeCount)
-		}
-		meta = append(meta, th.Dim.Render(lbl))
-	}
-	if st.PodsTotal >= 0 {
-		meta = append(meta, th.Dim.Render(fmt.Sprintf("%d pods", st.PodsTotal)))
-	}
-	right := strings.Join(meta, th.Dim.Render(" · "))
-	pad := width - lipgloss.Width(left) - lipgloss.Width(right) - 1
-	title := left
-	if pad >= 1 {
-		title = left + strings.Repeat(" ", pad) + right
-	}
-	lines := []string{title}
+	lines := []string{m.fleetRow(e.St, spine, badges, width)}
 
 	for _, a := range e.Alerts {
 		glyph, style := "·", th.Dim
@@ -428,47 +400,21 @@ func (m Model) renderFleetCard(e fleetEntry, width int) []string {
 		}
 		lines = append(lines, spine+"   "+style.Render(glyph)+" "+truncate(a.Text, width-7))
 	}
-
-	// Meters only where they mean something — an unreachable cluster
-	// already said everything its card has to say.
-	if st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded {
-		if st.MetricsAvailable && st.AllocCPUMilli > 0 {
-			cells := (width - 34) / 4
-			if cells < 4 {
-				cells = 4
-			}
-			if cells > 20 {
-				cells = 20
-			}
-			cp := pct(st.UsageCPUMilli, st.AllocCPUMilli)
-			mp := pct(st.UsageMemBytes, st.AllocMemBytes)
-			meter := spine + "   " +
-				th.Dim.Render("cpu ") + bar(cp, cells, th) + fmt.Sprintf(" %3d%%", cp) + "   " +
-				th.Dim.Render("mem ") + bar(mp, cells, th) + fmt.Sprintf(" %3d%%", mp)
-			if width >= 80 {
-				meter += " " + th.Dim.Render(sparkline(m.trendVals(st.Context), 6))
-			}
-			lines = append(lines, meter)
-		} else {
-			lines = append(lines, spine+"   "+th.Dim.Render("metrics unavailable"))
-		}
-	}
 	return lines
 }
 
-// renderFleetCompactRow is one healthy (or starting) cluster in a
-// single line. Cells drop from the right as the terminal narrows.
+// renderFleetCompactRow is one healthy or starting cluster in a
+// single line; offline clusters swap the stat cells for the reason.
 func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 	th := m.Theme
-
-	name := st.RawName
-	if name == "" {
-		name = st.Context
-	}
 
 	// Offline rows: name plus the reason, nothing else pretends to be
 	// known.
 	if st.Reach == model.ReachUnreachable || st.Reach == model.ReachAuthFailed {
+		name := st.RawName
+		if name == "" {
+			name = st.Context
+		}
 		nameW := width / 3
 		if nameW > 24 {
 			nameW = 24
@@ -483,6 +429,21 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 			"  " + th.Dim.Render(msg)
 	}
 
+	return m.fleetRow(st, th.StatusDim.Render("▏"), "", width)
+}
+
+// fleetRow is the shared one-line cluster layout: name, version,
+// probe latency, nodes, cpu/mem %, trend, pods. Cells drop from the
+// right as the terminal narrows.
+func (m Model) fleetRow(st model.ClusterState, spine, badges string, width int) string {
+	th := m.Theme
+
+	name := st.RawName
+	if name == "" {
+		name = st.Context
+	}
+	badgesW := lipgloss.Width(badges)
+
 	type cell struct {
 		s string
 		w int
@@ -495,6 +456,9 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 		add(th.Dim.Render(v), 8)
 	} else if st.Reach == model.ReachConnecting || st.Reach == model.ReachUnknown {
 		add(th.Dim.Render(st.Reach.String()+"…"), 12)
+	}
+	if st.ProbeLatency > 0 && width >= 75 {
+		addRight(th.Dim.Render(fmt.Sprintf("%dms", st.ProbeLatency.Milliseconds())), 6)
 	}
 	switch {
 	case st.NodeCount > 0 && width >= 110:
@@ -525,7 +489,7 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 	for _, c := range cells {
 		rightW += c.w + 2
 	}
-	nameW := width - 5 - rightW
+	nameW := width - 5 - badgesW - rightW
 	for nameW < 8 && len(cells) > 0 {
 		last := cells[len(cells)-1]
 		cells = cells[:len(cells)-1]
@@ -535,9 +499,9 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 		nameW = 1
 	}
 
-	spine := th.StatusDim.Render("▏")
 	glyph := th.styleForReach(st.Reach).Render(st.Reach.Glyph())
-	row := spine + " " + glyph + " " + padCol(truncate(name, nameW), nameW, th.Base)
+	row := spine + " " + glyph + " " +
+		padCellANSI(truncate(name, nameW)+badges, nameW+badgesW)
 	for _, c := range cells {
 		row += "  " + c.s
 	}
