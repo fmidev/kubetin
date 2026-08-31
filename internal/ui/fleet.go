@@ -72,6 +72,9 @@ func fleetOrderOf(g fleetGroups) []string {
 	for _, e := range g.Starting {
 		out = append(out, e.St.Context)
 	}
+	for _, e := range g.Offline {
+		out = append(out, e.St.Context)
+	}
 	return out
 }
 
@@ -284,6 +287,18 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 				lines: []string{m.renderFleetCompactRow(e.St, width)}})
 		}
 	}
+	if len(g.Offline) > 0 {
+		if len(g.Healthy) > 0 || len(g.Starting) > 0 {
+			blocks = append(blocks, blank)
+		}
+		blocks = append(blocks, fleetBlock{lines: []string{
+			m.fleetSectionHeader("OFFLINE", m.Theme.Dim, len(g.Offline), width),
+		}})
+		for _, e := range g.Offline {
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context,
+				lines: []string{m.renderFleetCompactRow(e.St, width)}})
+		}
+	}
 	return blocks
 }
 
@@ -310,6 +325,10 @@ func (m Model) renderFleetPulse(g fleetGroups, width int) string {
 		left += sep + th.StatusBad.Render(fmt.Sprintf("%d need action", p.NeedAction))
 	} else {
 		left += sep + th.StatusOK.Render("all clear ✓")
+	}
+
+	if p.Offline > 0 {
+		left += sep + th.Dim.Render(fmt.Sprintf("%d offline", p.Offline))
 	}
 
 	var parts []string
@@ -445,6 +464,23 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 	name := st.RawName
 	if name == "" {
 		name = st.Context
+	}
+
+	// Offline rows: name plus the reason, nothing else pretends to be
+	// known.
+	if st.Reach == model.ReachUnreachable || st.Reach == model.ReachAuthFailed {
+		nameW := width / 3
+		if nameW > 24 {
+			nameW = 24
+		}
+		if nameW < 8 {
+			nameW = 8
+		}
+		spine := th.StatusDim.Render("▏")
+		glyph := th.styleForReach(st.Reach).Render(st.Reach.Glyph())
+		msg := truncate(withErr(st.Reach.String(), st.LastError), width-nameW-7)
+		return spine + " " + glyph + " " + padCol(truncate(name, nameW), nameW, th.Base) +
+			"  " + th.Dim.Render(msg)
 	}
 
 	type cell struct {

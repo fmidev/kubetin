@@ -47,12 +47,12 @@ func clusterAlerts(st model.ClusterState) []clusterAlert {
 	}
 
 	switch st.Reach {
-	case model.ReachUnreachable:
-		add(sevCrit, withErr("unreachable", st.LastError))
-		return out
-	case model.ReachAuthFailed:
-		add(sevCrit, withErr("auth failed", st.LastError))
-		return out
+	case model.ReachUnreachable, model.ReachAuthFailed:
+		// Not alerts: being unreachable is a reachability tier, and in
+		// a fleet with test / laptop / VPN-only clusters a routine
+		// one. These group into OFFLINE, rendered last, so NEEDS
+		// ATTENTION holds only clusters that actually want work.
+		return nil
 	case model.ReachConnecting, model.ReachUnknown:
 		return nil
 	}
@@ -187,6 +187,7 @@ type fleetGroups struct {
 	Attention []fleetEntry // any warn/crit alert; worst first
 	Healthy   []fleetEntry // alphabetical
 	Starting  []fleetEntry // Connecting/Unknown; alphabetical
+	Offline   []fleetEntry // Unreachable/AuthFailed; auth first, then alphabetical
 }
 
 func groupFleet(snap []model.ClusterState) fleetGroups {
@@ -194,6 +195,8 @@ func groupFleet(snap []model.ClusterState) fleetGroups {
 	for _, st := range snap {
 		e := fleetEntry{St: st, Alerts: clusterAlerts(st)}
 		switch {
+		case st.Reach == model.ReachUnreachable || st.Reach == model.ReachAuthFailed:
+			g.Offline = append(g.Offline, e)
 		case st.Reach == model.ReachConnecting || st.Reach == model.ReachUnknown:
 			g.Starting = append(g.Starting, e)
 		case worstSeverity(e.Alerts) >= sevWarn:
@@ -218,6 +221,16 @@ func groupFleet(snap []model.ClusterState) fleetGroups {
 	}
 	byName(g.Healthy)
 	byName(g.Starting)
+	// Auth failures lead the offline tail: an expired token is the one
+	// offline state a keypress (re-login) can fix.
+	sort.Slice(g.Offline, func(i, j int) bool {
+		ai := g.Offline[i].St.Reach == model.ReachAuthFailed
+		aj := g.Offline[j].St.Reach == model.ReachAuthFailed
+		if ai != aj {
+			return ai
+		}
+		return g.Offline[i].St.Context < g.Offline[j].St.Context
+	})
 	return g
 }
 
@@ -230,17 +243,18 @@ type fleetPulse struct {
 	NodesBad   int // NotReady
 	Pods       int
 	PodsBad    int // Pending + Failed + Unknown
-	// AllPodsKnown is false when any cluster's total is a -1
-	// sentinel; the pulse then renders "N+ pods" instead of claiming
-	// a fleet total it doesn't have.
+	// AllPodsKnown is false when any reachable cluster's total is a
+	// -1 sentinel; the pulse then renders "N+ pods" instead of
+	// claiming a fleet total it doesn't have.
 	AllPodsKnown bool
 	CPUPct       int
 	MemPct       int
 	HasMetrics   bool
+	Offline      int
 }
 
 func derivePulse(g fleetGroups) fleetPulse {
-	p := fleetPulse{AllPodsKnown: true, NeedAction: len(g.Attention)}
+	p := fleetPulse{AllPodsKnown: true, NeedAction: len(g.Attention), Offline: len(g.Offline)}
 	var usageCPU, allocCPU, usageMem, allocMem int64
 	each := func(entries []fleetEntry) {
 		for _, e := range entries {
@@ -271,9 +285,12 @@ func derivePulse(g fleetGroups) fleetPulse {
 			}
 		}
 	}
+	// Only reachable clusters contribute to the fleet totals — an
+	// offline cluster's carried-forward counts are claims we can't
+	// verify, and a starting one has nothing yet.
 	each(g.Attention)
 	each(g.Healthy)
-	each(g.Starting)
+	p.Clusters += len(g.Starting) + len(g.Offline)
 	p.CPUPct = pct(usageCPU, allocCPU)
 	p.MemPct = pct(usageMem, allocMem)
 	return p

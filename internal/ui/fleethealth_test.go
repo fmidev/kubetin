@@ -45,13 +45,13 @@ func TestClusterAlertsRules(t *testing.T) {
 		{"unknown-sentinels-never-alert", func(st *model.ClusterState) {
 			*st = unknownState()
 		}, sevInfo, ""},
-		{"unreachable", func(st *model.ClusterState) {
+		{"unreachable-is-offline-not-alert", func(st *model.ClusterState) {
 			st.Reach = model.ReachUnreachable
 			st.LastError = "dial tcp: i/o timeout"
-		}, sevCrit, "unreachable: dial tcp"},
-		{"auth-failed", func(st *model.ClusterState) {
+		}, sevInfo, ""},
+		{"auth-failed-is-offline-not-alert", func(st *model.ClusterState) {
 			st.Reach = model.ReachAuthFailed
-		}, sevCrit, "auth failed"},
+		}, sevInfo, ""},
 		{"connecting-silent", func(st *model.ClusterState) {
 			st.Reach = model.ReachConnecting
 		}, sevInfo, ""},
@@ -171,8 +171,10 @@ func TestGroupFleetOrdering(t *testing.T) {
 	fine.Context = "fine"
 
 	starting := model.ClusterState{Context: "starting", Reach: model.ReachConnecting}
+	vpnOff := model.ClusterState{Context: "vpn-off", Reach: model.ReachUnreachable, LastError: "dial tcp: i/o timeout"}
+	expired := model.ClusterState{Context: "expired", Reach: model.ReachAuthFailed}
 
-	g := groupFleet([]model.ClusterState{mild, fine, bad, starting})
+	g := groupFleet([]model.ClusterState{mild, vpnOff, fine, bad, expired, starting})
 	if len(g.Attention) != 2 || g.Attention[0].St.Context != "bad" || g.Attention[1].St.Context != "mild" {
 		t.Errorf("attention order wrong: %+v", g.Attention)
 	}
@@ -181,6 +183,13 @@ func TestGroupFleetOrdering(t *testing.T) {
 	}
 	if len(g.Starting) != 1 || g.Starting[0].St.Context != "starting" {
 		t.Errorf("starting wrong: %+v", g.Starting)
+	}
+	if len(g.Offline) != 2 || g.Offline[0].St.Context != "expired" || g.Offline[1].St.Context != "vpn-off" {
+		t.Errorf("offline wrong (auth failures first): %+v", g.Offline)
+	}
+	order := fleetOrderOf(g)
+	if order[len(order)-1] != "vpn-off" || order[len(order)-2] != "expired" {
+		t.Errorf("offline clusters must order last: %v", order)
 	}
 }
 
@@ -196,10 +205,21 @@ func TestDerivePulse(t *testing.T) {
 	b.PodsTotal = -1 // unknown total
 	b.PodsFailed = 1
 
-	g := groupFleet([]model.ClusterState{a, b})
+	// Offline with stale carried-forward counts: visible as a count,
+	// excluded from every fleet total.
+	off := healthyState()
+	off.Context = "off"
+	off.Reach = model.ReachUnreachable
+	off.PodsTotal = 500
+	off.NodeCount, off.NodeReady = 9, 9
+
+	g := groupFleet([]model.ClusterState{a, b, off})
 	p := derivePulse(g)
-	if p.Clusters != 2 {
-		t.Errorf("Clusters = %d, want 2", p.Clusters)
+	if p.Clusters != 3 {
+		t.Errorf("Clusters = %d, want 3", p.Clusters)
+	}
+	if p.Offline != 1 {
+		t.Errorf("Offline = %d, want 1", p.Offline)
 	}
 	if p.Nodes != 8 || p.NodesBad != 1 {
 		t.Errorf("nodes = %d (%d bad), want 8 (1 bad)", p.Nodes, p.NodesBad)

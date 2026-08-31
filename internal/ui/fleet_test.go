@@ -248,3 +248,38 @@ func TestFleetPulseHonestWhenAllPodTotalsUnknown(t *testing.T) {
 		t.Errorf("known bad-pod count must not be suppressed, got %q", out)
 	}
 }
+
+func TestFleetOfflineSectionRendersLastAsCompactRows(t *testing.T) {
+	m := fleetTestModel()
+	store := model.NewStore()
+	seedFleetCluster(store, "prod", nil)
+	seedFleetCluster(store, "degraded", func(pf *model.ProbeFields) {
+		pf.Reach = model.ReachDegraded
+		pf.NodeReady = 2
+		pf.NodesNotReadyNames = []string{"n3"}
+	})
+	seedFleetCluster(store, "vpn-off", func(pf *model.ProbeFields) {
+		pf.Reach = model.ReachUnreachable
+		pf.ServerVersion = ""
+		pf.LastError = "dial tcp 10.8.0.1:6443: i/o timeout"
+	})
+	m.Store = store
+
+	out := m.renderFleet(20, 100)
+	iAttention := strings.Index(out, "NEEDS ATTENTION")
+	iHealthy := strings.Index(out, "HEALTHY")
+	iOffline := strings.Index(out, "OFFLINE")
+	if iAttention < 0 || iHealthy < 0 || iOffline < 0 {
+		t.Fatalf("missing sections: attention=%d healthy=%d offline=%d", iAttention, iHealthy, iOffline)
+	}
+	if !(iAttention < iHealthy && iHealthy < iOffline) {
+		t.Errorf("OFFLINE must render last: attention=%d healthy=%d offline=%d",
+			iAttention, iHealthy, iOffline)
+	}
+	if !strings.Contains(out, "unreachable: dial tcp") {
+		t.Errorf("offline row should carry the reason, got:\n%s", out)
+	}
+	if p := derivePulse(m.fleetGroupsFiltered()); p.NeedAction != 1 {
+		t.Errorf("NeedAction = %d, want 1 — offline is not attention", p.NeedAction)
+	}
+}
