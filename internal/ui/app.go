@@ -100,7 +100,7 @@ const (
 	ViewIngresses
 	ViewNodes
 	ViewNamespaces
-	ViewOverview // fleet overview, full-screen cards
+	ViewFleet // fleet dashboard, full-bleed triage view
 )
 
 // ProbeTickMsg fires periodically so the header reflects fresh probe
@@ -247,7 +247,8 @@ type Model struct {
 	permissions         map[string]permState // cached SSAR results, keyed via cluster.PermissionKey
 	permissionsInFlight map[string]struct{}  // dispatched but not yet returned; lets the RBAC overlay render "?" without re-firing
 	rbacOpen            bool
-	overviewScroll      int
+	fleet               fleetState
+	fleetTrends         map[string]*trendRing
 	toast               string // ephemeral one-line status (e.g. "Deleted Pod/foo")
 	toastUntil          time.Time
 
@@ -277,6 +278,7 @@ func New(context string, store *model.Store, contexts []string) Model {
 		endpointSlices:      make(map[types.UID]endpointSliceRow),
 		permissions:         make(map[string]permState),
 		permissionsInFlight: make(map[string]struct{}),
+		fleetTrends:         make(map[string]*trendRing),
 	}
 }
 
@@ -344,6 +346,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.filterFocused {
 			return m.handleFilterKey(msg)
+		}
+		if m.view == ViewFleet {
+			return m.handleFleetKey(msg)
 		}
 		return m.handleKey(msg)
 
@@ -733,6 +738,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ProbeTickMsg:
+		m.sampleFleetTrends()
 		return m, tickCmd()
 	}
 	return m, nil
@@ -744,36 +750,14 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case "j", "down":
-		if m.view == ViewOverview {
-			m.overviewScroll++
-		} else {
-			m.moveCursor(+1)
-		}
+		m.moveCursor(+1)
 	case "k", "up":
-		if m.view == ViewOverview {
-			if m.overviewScroll > 0 {
-				m.overviewScroll--
-			}
-		} else {
-			m.moveCursor(-1)
-		}
+		m.moveCursor(-1)
 	case "g", "home":
-		if m.view == ViewOverview {
-			m.overviewScroll = 0
-		} else {
-			m.cursorToIndex(0)
-		}
+		m.cursorToIndex(0)
 	case "G", "end":
-		if m.view == ViewOverview {
-			max := m.overviewLineCount() - 1
-			if max < 0 {
-				max = 0
-			}
-			m.overviewScroll = max
-		} else {
-			uids := m.visibleUIDs()
-			m.cursorToIndex(len(uids) - 1)
-		}
+		uids := m.visibleUIDs()
+		m.cursorToIndex(len(uids) - 1)
 	case "tab":
 		// Assign cmd before returning. `return m, m.cycleFocus(+1)`
 		// has unspecified l-to-r evaluation per the Go spec — gc
@@ -786,8 +770,11 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cmd := m.cycleFocus(-1)
 		return m, cmd
 	case "f1":
-		m.view = ViewOverview
-		m.cursor = ""
+		// The resource cursor deliberately survives the round trip;
+		// Esc/F1 in the dashboard restores returnView with the row
+		// still selected.
+		m.fleet.returnView = m.view
+		m.view = ViewFleet
 	case "f2":
 		m.debugMode = !m.debugMode
 	case "?":
@@ -1372,6 +1359,9 @@ func (m Model) handleFilterKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "f1", "f2", "tab", "shift+tab":
 		m.filterFocused = false
+		if m.view == ViewFleet {
+			return m.handleFleetKey(k)
+		}
 		return m.handleKey(k)
 	}
 	switch k.Type {
@@ -1541,9 +1531,19 @@ func (m Model) View() string {
 		return "kubetin loading…"
 	}
 
-	header := m.renderHeader()
+	// The fleet dashboard is full-bleed: the selected-cluster header
+	// would repeat what the dashboard itself shows, so it is dropped
+	// and the body takes its rows. Everything else keeps the header.
+	fleetFull := m.view == ViewFleet && !m.dashboard.open
+	header := ""
+	if !fleetFull {
+		header = m.renderHeader()
+	}
 	footer := m.renderFooter()
-	bodyHeight := m.height - lipgloss.Height(header) - lipgloss.Height(footer)
+	bodyHeight := m.height - lipgloss.Height(footer)
+	if !fleetFull {
+		bodyHeight -= lipgloss.Height(header)
+	}
 	if bodyHeight < 1 {
 		bodyHeight = 1
 	}
@@ -1555,10 +1555,8 @@ func (m Model) View() string {
 		// Full width, no sidebar: the dashboard is about one workload,
 		// and the cluster rail would just crowd the panes.
 		body = m.renderDashboard(bodyHeight, m.width)
-	case m.view == ViewOverview:
-		// Overview takes the whole row — it IS the cluster overview,
-		// the sidebar would be redundant.
-		body = m.renderOverview(bodyHeight, m.width)
+	case fleetFull:
+		body = m.renderFleet(bodyHeight, m.width)
 	case m.HideSidebar:
 		// The rail costs 30 columns. Dropping it loses nothing the
 		// header doesn't already carry — cluster name, reach, version,
@@ -1629,7 +1627,24 @@ func (m Model) View() string {
 	footerH := lipgloss.Height(footer)
 	body = clampCanvas(body, m.width, bodyHeight)
 	footer = clampCanvas(footer, m.width, footerH)
+	if fleetFull {
+		// Joining the empty header string would add a phantom blank
+		// row; the full-bleed layout has no header at all.
+		return lipgloss.JoinVertical(lipgloss.Left, body, footer)
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+// chromeHeights returns the header and footer heights View() will use,
+// so key handlers that mirror the body arithmetic (help scrolling)
+// agree with the renderer about how much fits. The fleet dashboard is
+// full-bleed: zero header rows while it owns the view.
+func (m Model) chromeHeights() (headerH, footerH int) {
+	footerH = lipgloss.Height(m.renderFooter())
+	if m.view == ViewFleet && !m.dashboard.open {
+		return 0, footerH
+	}
+	return lipgloss.Height(m.renderHeader()), footerH
 }
 
 // mainPane chooses among the active resource view + debug overlay.
@@ -1714,12 +1729,12 @@ func (m Model) visibleUIDs() []types.UID {
 			out = append(out, r.UID)
 		}
 		return out
-	case ViewOverview:
-		// Overview is full-screen cards, not row-driven; cursor count
-		// here represents clusters with state. Keeps the header from
-		// reading "podCount/podCount" while the overview is shown.
-		out := make([]types.UID, 0, len(m.Contexts))
-		for range m.Contexts {
+	case ViewFleet:
+		// The dashboard's cursor is context-keyed, not UID-keyed; this
+		// only feeds the filter footer's matched count.
+		order := m.fleetOrder()
+		out := make([]types.UID, 0, len(order))
+		for range order {
 			out = append(out, "")
 		}
 		return out
@@ -1930,11 +1945,14 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 }
 
 func (m Model) renderFooter() string {
-	hint := " ?:help  F1:overview  1:pods  2:deploy  3:svc  4:ing  5:nodes  6:ns  e:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
+	hint := " ?:help  F1:fleet  1:pods  2:deploy  3:svc  4:ing  5:nodes  6:ns  e:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
 	if len(m.Contexts) <= 1 {
 		// Nothing to Tab to, and the rail that would have hinted at
 		// other clusters isn't drawn either.
 		hint = strings.Replace(hint, "Tab:cluster  ", "", 1)
+	}
+	if m.view == ViewFleet && !m.dashboard.open {
+		hint = " j/k:cluster  o:open  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
 	}
 	if m.dashboard.open {
 		hint = " Tab:pane  j/k:move  g/G:top/bottom  f:follow  i:open pod  c:container  l:logs  d:describe  Enter:actions  Esc:back "
@@ -1987,6 +2005,8 @@ func (m Model) filterCounts() (matched, total int) {
 		total = len(m.services)
 	case ViewIngresses:
 		total = len(m.ingresses)
+	case ViewFleet:
+		total = len(m.Contexts)
 	default:
 		total = len(m.pods)
 	}

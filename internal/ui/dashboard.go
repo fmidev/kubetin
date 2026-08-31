@@ -218,7 +218,7 @@ func (m *Model) stopDashboardLogs() tea.Cmd {
 
 // dashCanvasSize mirrors View()'s body arithmetic so the key handler
 // and the renderer agree on which layout is active. Same render-and-
-// count approach overviewLineCount uses — the header and footer both
+// count approach — the header and footer both
 // vary in height, and a formula drifts the moment either changes.
 func (m Model) dashCanvasSize() (int, int) {
 	h := m.height - lipgloss.Height(m.renderHeader()) - lipgloss.Height(m.renderFooter())

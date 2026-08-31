@@ -1,10 +1,13 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/fmidev/kubetin/internal/model"
 )
 
 // padCol returns a cell of exactly `width` visible cells: the input
@@ -269,4 +272,94 @@ func clampCanvas(s string, w, h int) string {
 		Width(w).MaxWidth(w).
 		Height(h).MaxHeight(h).
 		Render(s)
+}
+
+func readyBadge(st model.ClusterState, th Theme) string {
+	switch st.Reach {
+	case model.ReachHealthy:
+		return th.StatusOK.Render("✓ Ready")
+	case model.ReachDegraded:
+		return th.StatusWrn.Render("◐ Degraded")
+	case model.ReachUnreachable:
+		return th.StatusBad.Render("✕ Unreachable")
+	case model.ReachAuthFailed:
+		return th.StatusBad.Render("✕ Auth Failed")
+	case model.ReachConnecting:
+		return th.StatusWrn.Render("◐ Connecting")
+	}
+	return th.StatusDim.Render("○ Unknown")
+}
+
+// nodeDots renders one glyph per node coloured by Ready vs NotReady.
+// We don't have per-node identity for non-focused clusters, only the
+// (ready, total) counts — that's enough to render the right palette.
+func nodeDots(st model.ClusterState, th Theme) string {
+	if st.NodeCount <= 0 {
+		return ""
+	}
+	const cap = 12
+	total := st.NodeCount
+	if total > cap {
+		// Big cluster: don't render N dots, just one glyph.
+		if st.NodeReady < total {
+			return th.StatusWrn.Render("●")
+		}
+		return th.StatusOK.Render("●")
+	}
+	ok := st.NodeReady
+	if ok > total {
+		ok = total
+	}
+	bad := total - ok
+	return th.StatusOK.Render(strings.Repeat("●", ok)) +
+		th.StatusBad.Render(strings.Repeat("●", bad))
+}
+
+func overviewBar(label string, used, alloc int64, cells int, th Theme, suffix string) string {
+	p := pct(used, alloc)
+	loadStyle := th.loadStyle(p)
+	emptyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("236"))
+	n := p * cells / 100
+	if n < 0 {
+		n = 0
+	}
+	if n > cells {
+		n = cells
+	}
+	filled := loadStyle.Render(strings.Repeat("▬", n))
+	empty := emptyStyle.Render(strings.Repeat("▬", cells-n))
+	return fmt.Sprintf("%s %s%s %3d%%  %s",
+		th.Dim.Render(label),
+		filled,
+		empty,
+		p,
+		th.Dim.Render(suffix))
+}
+
+// coresStr always returns a 5-char string so the CPU suffix has a
+// stable width across rows (otherwise the MEM bar shifts when one
+// cluster reads "500m" and another "1.4").
+//
+//	   1m → "   1m"
+//	 500m → " 500m"
+//	  1.4 → "  1.4"
+//	200.0 → "200.0"
+func coresStr(milli int64) string {
+	if milli == 0 {
+		return "    0"
+	}
+	if milli < 1000 {
+		return fmt.Sprintf("%4dm", milli)
+	}
+	return fmt.Sprintf("%5.1f", float64(milli)/1000)
+}
+
+// memStrFixed returns the human memory string padded to 7 chars so
+// the MEM suffix has a stable width.
+func memStrFixed(b int64) string {
+	s := formatMem(b)
+	if len(s) >= 7 {
+		return s
+	}
+	return strings.Repeat(" ", 7-len(s)) + s
 }
