@@ -411,3 +411,35 @@ func TestFleetEnterOnOfflineExplainsInsteadOfFetching(t *testing.T) {
 		t.Error("r must not refetch an offline cluster")
 	}
 }
+
+func TestCleanDetailStripsTerminalControls(t *testing.T) {
+	in := "line1\nline2 \x1b[31mred\x1b[0m \x1b]0;evil title\x07 done\ttab"
+	got := cleanDetail(in)
+	for _, bad := range []string{"\x1b", "\x07", "\n", "\t"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("control byte %q survived: %q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "line1 line2") || !strings.Contains(got, "done") {
+		t.Errorf("text content mangled: %q", got)
+	}
+}
+
+func TestLeavingFleetInvalidatesPendingDetail(t *testing.T) {
+	m := fleetTestModel()
+	m.OnFleetDetail = func(ctx string) tea.Msg { return FleetDetailMsg{Context: ctx, At: time.Now()} }
+	m.OnFocusChange = func(string) {}
+	m.fleet.cursorCtx = "bad"
+
+	m, cmd := fleetPress(t, m, key("enter")) // fetch in flight
+	m, _ = fleetPress(t, m, key("o"))        // leave before it lands
+	if m.fleet.expanded != "" || m.fleet.detail.loading {
+		t.Fatalf("leaving must invalidate the expansion; expanded=%q loading=%v",
+			m.fleet.expanded, m.fleet.detail.loading)
+	}
+	res, _ := m.Update(cmd()) // the late result
+	m = res.(Model)
+	if m.fleet.detail.loading || m.fleet.detail.result.Context != "" {
+		t.Errorf("late result must not resurrect state: %+v", m.fleet.detail)
+	}
+}

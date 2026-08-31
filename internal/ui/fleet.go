@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -39,6 +40,12 @@ func (m *Model) enterFleet() {
 func (m *Model) leaveFleet(to View) {
 	m.filterText = m.fleet.savedFilter
 	m.fleet.savedFilter = ""
+	// Invalidate the expansion: a result landing after the user left
+	// is dropped by the receiver, and a kept loading=true would
+	// otherwise revive as a forever-loading panel with both manual
+	// and automatic refresh disabled.
+	m.fleet.expanded = ""
+	m.fleet.detail = fleetDetailState{}
 	m.view = to
 }
 
@@ -205,9 +212,12 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "1", "2", "3", "4", "5", "6":
 		// switchView will set the destination; restore the parked
-		// resource filter before it applies.
+		// resource filter and drop the expansion before it applies,
+		// exactly as leaveFleet does.
 		m.filterText = m.fleet.savedFilter
 		m.fleet.savedFilter = ""
+		m.fleet.expanded = ""
+		m.fleet.detail = fleetDetailState{}
 		return m.handleKey(k)
 	}
 	return m.handleKey(k)
@@ -327,8 +337,11 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 			m.fleetSectionHeader("STARTING", m.Theme.Dim, len(g.Starting), width),
 		}})
 		for _, e := range g.Starting {
-			blocks = append(blocks, fleetBlock{ctx: e.St.Context,
-				lines: []string{m.renderFleetCompactRow(e.St, width)}})
+			lines := []string{m.renderFleetCompactRow(e.St, width)}
+			if e.St.Context == m.fleet.expanded {
+				lines = append(lines, m.renderFleetDetail(m.Theme.StatusDim.Render("▏"), width)...)
+			}
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: lines})
 		}
 	}
 	if len(g.Offline) > 0 {
@@ -656,11 +669,21 @@ func (m Model) renderFleetDetail(spine string, width int) []string {
 	return lines
 }
 
-// cleanDetail flattens whitespace and control characters out of
-// cluster-sourced strings so one multi-line event message can't
-// inject rows into the layout.
+// cleanDetail strips terminal control characters (ESC/CSI/OSC, BEL,
+// the whole C0/C1 range) out of cluster-sourced strings and flattens
+// whitespace, so an event message can neither inject layout rows nor
+// smuggle escape sequences to the terminal. strings.Fields alone only
+// handles whitespace — ESC is not whitespace.
 func cleanDetail(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
 }
 
 // fleetOffline reports whether ctx is currently classified offline —

@@ -12,12 +12,15 @@ import (
 )
 
 // Bounded row caps for a fleet-detail fetch — the panel is a triage
-// summary under one cluster's card, not a table view.
+// summary under one cluster's card, not a table view. Lists paginate
+// up to fleetDetailPageCap pages before the worst rows are selected,
+// so a disaster cluster's later pages can't hide its worst pods.
 const (
 	fleetDetailPodCap      = 15
 	fleetDetailDeployCap   = 10
 	fleetDetailEventCap    = 10
 	fleetDetailEventWindow = time.Hour
+	fleetDetailPageCap     = 4 // × Limit 500 = 2000 items per list
 )
 
 // FleetPodIssue is one non-green pod in a fleet-detail fetch.
@@ -97,37 +100,24 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		list, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
-			FieldSelector:   "status.phase!=Running,status.phase!=Succeeded",
-			Limit:           500,
-			ResourceVersion: "0",
-		})
-		if err != nil {
-			fail(err)
-			return
+		var pods []FleetPodIssue
+		opts := metav1.ListOptions{
+			FieldSelector: "status.phase!=Running,status.phase!=Succeeded",
+			Limit:         500,
 		}
-		pods := make([]FleetPodIssue, 0, len(list.Items))
-		for _, p := range list.Items {
-			issue := FleetPodIssue{
-				Namespace: p.Namespace,
-				Name:      p.Name,
-				Phase:     string(p.Status.Phase),
+		for page := 0; page < fleetDetailPageCap; page++ {
+			list, err := cs.CoreV1().Pods(ns).List(ctx, opts)
+			if err != nil {
+				fail(err)
+				return
 			}
-			for _, cst := range p.Status.ContainerStatuses {
-				issue.Restarts += cst.RestartCount
-				if issue.Reason == "" {
-					switch {
-					case cst.State.Waiting != nil:
-						issue.Reason = cst.State.Waiting.Reason
-					case cst.State.Terminated != nil:
-						issue.Reason = cst.State.Terminated.Reason
-					}
-				}
+			for _, p := range list.Items {
+				pods = append(pods, podIssueOf(p))
 			}
-			if issue.Reason == "" && p.Status.Reason != "" {
-				issue.Reason = p.Status.Reason
+			if list.Continue == "" {
+				break
 			}
-			pods = append(pods, issue)
+			opts.Continue = list.Continue
 		}
 		sort.Slice(pods, func(i, j int) bool {
 			pi, pj := podPhaseRank(pods[i].Phase), podPhaseRank(pods[j].Phase)
@@ -148,24 +138,31 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 	}()
 	go func() {
 		defer wg.Done()
-		list, err := cs.AppsV1().Deployments(ns).List(ctx, listAllOpts())
-		if err != nil {
-			fail(err)
-			return
-		}
 		var deps []FleetDeployIssue
-		for _, d := range list.Items {
-			desired := int32(1)
-			if d.Spec.Replicas != nil {
-				desired = *d.Spec.Replicas
+		opts := metav1.ListOptions{Limit: 500}
+		for page := 0; page < fleetDetailPageCap; page++ {
+			list, err := cs.AppsV1().Deployments(ns).List(ctx, opts)
+			if err != nil {
+				fail(err)
+				return
 			}
-			if desired == 0 || d.Status.ReadyReplicas >= desired {
-				continue
+			for _, d := range list.Items {
+				desired := int32(1)
+				if d.Spec.Replicas != nil {
+					desired = *d.Spec.Replicas
+				}
+				if desired == 0 || d.Status.ReadyReplicas >= desired {
+					continue
+				}
+				deps = append(deps, FleetDeployIssue{
+					Namespace: d.Namespace, Name: d.Name,
+					Ready: d.Status.ReadyReplicas, Desired: desired,
+				})
 			}
-			deps = append(deps, FleetDeployIssue{
-				Namespace: d.Namespace, Name: d.Name,
-				Ready: d.Status.ReadyReplicas, Desired: desired,
-			})
+			if list.Continue == "" {
+				break
+			}
+			opts.Continue = list.Continue
 		}
 		sort.Slice(deps, func(i, j int) bool {
 			ri := float64(deps[i].Ready) / float64(deps[i].Desired)
@@ -184,19 +181,24 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 	}()
 	go func() {
 		defer wg.Done()
-		list, err := cs.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
-			FieldSelector:   "type=Warning",
-			Limit:           500,
-			ResourceVersion: "0",
-		})
-		if err != nil {
-			fail(err)
-			return
-		}
 		type groupKey struct{ reason, message string }
 		groups := make(map[groupKey]*FleetEventGroup)
 		cutoff := time.Now().Add(-fleetDetailEventWindow)
-		for _, e := range list.Items {
+		var items []corev1.Event
+		opts := metav1.ListOptions{FieldSelector: "type=Warning", Limit: 500}
+		for page := 0; page < fleetDetailPageCap; page++ {
+			list, err := cs.CoreV1().Events(ns).List(ctx, opts)
+			if err != nil {
+				fail(err)
+				return
+			}
+			items = append(items, list.Items...)
+			if list.Continue == "" {
+				break
+			}
+			opts.Continue = list.Continue
+		}
+		for _, e := range items {
 			last := e.LastTimestamp.Time
 			if last.IsZero() {
 				last = e.EventTime.Time
@@ -241,6 +243,44 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 	}()
 	wg.Wait()
 	return out
+}
+
+// podIssueOf projects one non-green pod into a detail row. Init
+// containers count too: a pod stuck in Init:CrashLoopBackOff often
+// has no regular statuses beyond PodInitializing, which would hide
+// the actual reason and restart count.
+func podIssueOf(p corev1.Pod) FleetPodIssue {
+	issue := FleetPodIssue{
+		Namespace: p.Namespace,
+		Name:      p.Name,
+		Phase:     string(p.Status.Phase),
+	}
+	for _, cst := range p.Status.ContainerStatuses {
+		issue.Restarts += cst.RestartCount
+		if issue.Reason == "" {
+			switch {
+			case cst.State.Waiting != nil:
+				issue.Reason = cst.State.Waiting.Reason
+			case cst.State.Terminated != nil:
+				issue.Reason = cst.State.Terminated.Reason
+			}
+		}
+	}
+	for _, cst := range p.Status.InitContainerStatuses {
+		issue.Restarts += cst.RestartCount
+		switch {
+		case cst.State.Waiting != nil && cst.State.Waiting.Reason != "" &&
+			cst.State.Waiting.Reason != "PodInitializing":
+			issue.Reason = "Init:" + cst.State.Waiting.Reason
+		case cst.State.Terminated != nil && cst.State.Terminated.ExitCode != 0 &&
+			cst.State.Terminated.Reason != "":
+			issue.Reason = "Init:" + cst.State.Terminated.Reason
+		}
+	}
+	if issue.Reason == "" && p.Status.Reason != "" {
+		issue.Reason = p.Status.Reason
+	}
+	return issue
 }
 
 // podPhaseRank orders detail rows worst-first: dead pods, then limbo,
