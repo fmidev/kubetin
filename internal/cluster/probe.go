@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +22,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/klog/v2"
 
 	"github.com/fmidev/kubetin/internal/kubeconfig"
 	"github.com/fmidev/kubetin/internal/model"
@@ -227,7 +230,8 @@ func New(d *kubeconfig.Discovered, store *model.Store, interval time.Duration) *
 // first render has every cluster represented.
 func (s *Supervisor) Run(ctx context.Context) {
 	for _, name := range s.contexts {
-		pf := model.ProbeFields{Reach: model.ReachUnknown}
+		pf := model.NewProbeFields()
+		pf.Reach = model.ReachUnknown
 		if src, ok := s.refs[name]; ok {
 			pf.RawName = src.RawName
 			pf.File = src.File
@@ -263,11 +267,20 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	// in the store. Eliminates the lost-update race where a probe
 	// snapshotted prev, then took 10s of API calls, then committed
 	// over a metrics write that landed in between.
-	pf := model.ProbeFields{LastProbe: time.Now()}
+	pf := model.NewProbeFields()
+	pf.LastProbe = time.Now()
+
+	// prev is stable for the whole round — nothing commits before we
+	// do. Rounds abandoned before measuring the health signals carry
+	// them forward instead of flapping the fleet dashboard to
+	// "unknown" on every transient failure; reach hysteresis would
+	// keep the badge steady through the same blip.
+	prev, _ := s.store.Get(ctxName)
 
 	restCfg, err := s.RestConfigFor(ctxName)
 	if err != nil {
 		pf.LastError = "kubeconfig: " + err.Error()
+		carryHealth(&pf, prev)
 		s.commit(ctxName, pf, model.ReachAuthFailed)
 		return
 	}
@@ -278,6 +291,7 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		pf.LastError = "client: " + err.Error()
+		carryHealth(&pf, prev)
 		s.commit(ctxName, pf, model.ReachUnreachable)
 		return
 	}
@@ -288,6 +302,7 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	cancelVersion()
 	if err != nil {
 		pf.LastError = trimError(err)
+		carryHealth(&pf, prev)
 		s.commit(ctxName, pf, classify(err))
 		return
 	}
@@ -319,11 +334,16 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 			// the sidebar bars are drawn from, and paint Degraded — the
 			// false alarm a relayed link raises every time it stalls.
 			// Carry the last known detail forward and leave reach be.
-			prev, _ := s.store.Get(ctxName)
 			pf.NodeCount = prev.NodeCount
 			pf.NodeReady = prev.NodeReady
 			pf.AllocCPUMilli = prev.AllocCPUMilli
 			pf.AllocMemBytes = prev.AllocMemBytes
+			pf.NodesNotReadyNames = prev.NodesNotReadyNames
+			pf.NodesMemPressure = prev.NodesMemPressure
+			pf.NodesDiskPressure = prev.NodesDiskPressure
+			pf.NodesPIDPressure = prev.NodesPIDPressure
+			pf.NodesCordoned = prev.NodesCordoned
+			pf.NodesPressureNames = prev.NodesPressureNames
 			if prev.ServerVersion == "" {
 				// No round has ever completed, so there is no detail to
 				// carry: -1 is the model's "unknown", which the UI
@@ -345,6 +365,14 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 			pf.NodeReady = res.ReadyCount
 			pf.AllocCPUMilli = res.AllocCPUMilli
 			pf.AllocMemBytes = res.AllocMemBytes
+			if nodeErr == nil {
+				pf.NodesNotReadyNames = res.NotReadyNames
+				pf.NodesMemPressure = res.MemPressure
+				pf.NodesDiskPressure = res.DiskPressure
+				pf.NodesPIDPressure = res.PIDPressure
+				pf.NodesCordoned = res.Cordoned
+				pf.NodesPressureNames = res.PressureNames
+			}
 			if res.Reach == model.ReachDegraded && nodeErr == nil {
 				pf.LastError = fmt.Sprintf("nodes %d/%d ready", res.ReadyCount, res.Count)
 			}
@@ -357,13 +385,48 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 		pf.NodeCount = -1
 	}
 
+	// Fleet-health workload signals. Run regardless of node-level
+	// degradation — a degraded cluster is exactly where these matter —
+	// but only after /version proved the API answers at all.
+	wh := s.probeWorkloadHealth(parent, scopedNS, clientset)
+	switch wh.pods.outcome {
+	case signalOK:
+		pf.PodsPending = wh.pods.pending
+		pf.PodsFailed = wh.pods.failed
+		pf.PodsUnknownPhase = wh.pods.unknown
+	case signalTimeout:
+		pf.PodsPending = prev.PodsPending
+		pf.PodsFailed = prev.PodsFailed
+		pf.PodsUnknownPhase = prev.PodsUnknownPhase
+	}
+	switch wh.deploys.outcome {
+	case signalOK:
+		pf.DeploysTotal = wh.deploys.total
+		pf.DeploysDegraded = wh.deploys.degraded
+		pf.DeploysZeroReady = wh.deploys.zeroReady
+		pf.DegradedDeployNames = wh.deploys.names
+	case signalTimeout:
+		pf.DeploysTotal = prev.DeploysTotal
+		pf.DeploysDegraded = prev.DeploysDegraded
+		pf.DeploysZeroReady = prev.DeploysZeroReady
+		pf.DegradedDeployNames = prev.DegradedDeployNames
+	}
+	switch wh.events.outcome {
+	case signalOK:
+		pf.WarnEvents15m = wh.events.warn15m
+	case signalTimeout:
+		pf.WarnEvents15m = prev.WarnEvents15m
+	}
+
 	// Probe pod LIST. For cluster-scoped: confirms pods are visible
 	// alongside nodes (the rke2-tj case where nodes worked but pods
-	// 403'd). For namespace-scoped: this IS the liveness check.
+	// 403'd). For namespace-scoped: this IS the liveness check. Runs
+	// for Degraded too now that it also carries the pod total, but a
+	// denial only ever demotes from Healthy.
 	finalReach := res.Reach
-	if finalReach == model.ReachHealthy {
+	if finalReach == model.ReachHealthy || finalReach == model.ReachDegraded {
 		podCtx, cancelPods := context.WithTimeout(parent, ProbeTimeout)
-		perr := s.probePodAccess(podCtx, scopedNS, clientset)
+		total, perr := s.probePodSummary(podCtx, scopedNS, clientset)
 		cancelPods()
 		switch {
 		case isTimeout(perr):
@@ -379,25 +442,34 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 			// lingers one round when the pod check also times out. It
 			// clears on the next conclusive round, and the alternative
 			// clears real findings, which is worse.
-			prev, _ := s.store.Get(ctxName)
 			if prev.Reach == model.ReachDegraded {
 				finalReach = model.ReachDegraded
 			}
 			if pf.LastError == "" {
 				pf.LastError = "pod access check timed out"
 			}
+			pf.PodsTotal = prev.PodsTotal
 		case perr != nil:
 			finalReach = model.ReachDegraded
 			if pf.LastError == "" {
 				pf.LastError = trimError(perr)
 			}
+		default:
+			pf.PodsTotal = total
 		}
 	}
 	s.commit(ctxName, pf, finalReach)
 }
 
-// probePodAccess does a single LIST pods?limit=1 to confirm pod-list
-// access. ns is the scope this round resolved — the kubeconfig
+// probePodSummary does a single LIST pods?limit=1 that doubles as the
+// pod-access liveness check and a best-effort total pod count. The
+// call deliberately omits ResourceVersion "0": served from etcd with
+// pagination the response carries remainingItemCount, while the watch
+// cache sets neither it nor honours Limit. remainingItemCount is
+// documented best-effort, so the total is -1 whenever the server
+// withholds it.
+//
+// ns is the scope this round resolved — the kubeconfig
 // context's default namespace when one is set, since namespace-
 // restricted users (typical OpenShift) always 403 on the cluster-wide
 // ("") form. The scope decision matches what the watcher loop will
@@ -413,24 +485,40 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 //
 // RBAC failures surface as "rbac: list pods denied"; transient list
 // failures as the raw error.
-func (s *Supervisor) probePodAccess(ctx context.Context, ns string, clientset *kubernetes.Clientset) error {
-	type result struct{ err error }
+func (s *Supervisor) probePodSummary(ctx context.Context, ns string, clientset *kubernetes.Clientset) (int, error) {
+	type result struct {
+		total int
+		err   error
+	}
 	ch := make(chan result, 1)
 	go func() {
-		_, err := clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{Limit: 1, ResourceVersion: "0"})
-		ch <- result{err: err}
+		list, err := clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{Limit: 1})
+		if err != nil {
+			ch <- result{total: -1, err: err}
+			return
+		}
+		total := len(list.Items)
+		switch {
+		case list.Continue == "" && list.RemainingItemCount == nil:
+			// Nothing beyond this page: the count is exact.
+		case list.RemainingItemCount != nil:
+			total += int(*list.RemainingItemCount)
+		default:
+			total = -1
+		}
+		ch <- result{total: total}
 	}()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return -1, ctx.Err()
 	case r := <-ch:
 		if r.err == nil {
-			return nil
+			return r.total, nil
 		}
 		if apierrors.IsForbidden(r.err) || apierrors.IsUnauthorized(r.err) {
-			return fmt.Errorf("rbac: list pods denied")
+			return -1, fmt.Errorf("rbac: list pods denied")
 		}
-		return r.err
+		return -1, r.err
 	}
 }
 
@@ -443,7 +531,17 @@ type nodeProbeResult struct {
 	ReadyCount    int
 	AllocCPUMilli int64
 	AllocMemBytes int64
+	NotReadyNames []string
+	MemPressure   int
+	DiskPressure  int
+	PIDPressure   int
+	Cordoned      int
+	PressureNames []string
 }
+
+// healthNameCap bounds the node/deployment name samples carried in the
+// health fields — enough to name culprits in an alert line, not a dump.
+const healthNameCap = 3
 
 // probeNodes lists nodes and classifies the result. On success it
 // also sums Allocatable CPU + memory across nodes so the sidebar can
@@ -462,6 +560,7 @@ func (s *Supervisor) probeNodes(ctx context.Context, clientset *kubernetes.Clien
 		}
 		var cpu, mem int64
 		var ready int
+		var health nodeProbeResult
 		for _, n := range nodes.Items {
 			if c, ok := n.Status.Allocatable[corev1.ResourceCPU]; ok {
 				cpu += c.MilliValue()
@@ -469,11 +568,35 @@ func (s *Supervisor) probeNodes(ctx context.Context, clientset *kubernetes.Clien
 			if m, ok := n.Status.Allocatable[corev1.ResourceMemory]; ok {
 				mem += m.Value()
 			}
+			var nodeReady, pressured bool
 			for _, cond := range n.Status.Conditions {
-				if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
-					ready++
-					break
+				if cond.Status != corev1.ConditionTrue {
+					continue
 				}
+				switch cond.Type {
+				case corev1.NodeReady:
+					nodeReady = true
+				case corev1.NodeMemoryPressure:
+					health.MemPressure++
+					pressured = true
+				case corev1.NodeDiskPressure:
+					health.DiskPressure++
+					pressured = true
+				case corev1.NodePIDPressure:
+					health.PIDPressure++
+					pressured = true
+				}
+			}
+			if nodeReady {
+				ready++
+			} else if len(health.NotReadyNames) < healthNameCap {
+				health.NotReadyNames = append(health.NotReadyNames, n.Name)
+			}
+			if pressured && len(health.PressureNames) < healthNameCap {
+				health.PressureNames = append(health.PressureNames, n.Name)
+			}
+			if n.Spec.Unschedulable {
+				health.Cordoned++
 			}
 		}
 		// Reach: all nodes ready → Healthy; some NotReady → Degraded.
@@ -483,13 +606,12 @@ func (s *Supervisor) probeNodes(ctx context.Context, clientset *kubernetes.Clien
 		if len(nodes.Items) == 0 || ready < len(nodes.Items) {
 			reach = model.ReachDegraded
 		}
-		ch <- result{res: nodeProbeResult{
-			Reach:         reach,
-			Count:         len(nodes.Items),
-			ReadyCount:    ready,
-			AllocCPUMilli: cpu,
-			AllocMemBytes: mem,
-		}}
+		health.Reach = reach
+		health.Count = len(nodes.Items)
+		health.ReadyCount = ready
+		health.AllocCPUMilli = cpu
+		health.AllocMemBytes = mem
+		ch <- result{res: health}
 	}()
 	select {
 	case <-ctx.Done():
@@ -502,6 +624,237 @@ func (s *Supervisor) probeNodes(ctx context.Context, clientset *kubernetes.Clien
 			return nodeProbeResult{Reach: model.ReachDegraded, Count: -1}, r.err
 		}
 		return r.res, nil
+	}
+}
+
+// signalOutcome classifies one optional health-list call. These calls
+// never touch reach or LastError — they are fleet-dashboard signals,
+// not liveness checks.
+type signalOutcome uint8
+
+const (
+	signalUnknown signalOutcome = iota // denied or errored: the -1 sentinel stands
+	signalOK
+	signalTimeout // abandoned call: carry the previous values forward
+)
+
+type workloadHealth struct {
+	pods    podPhaseSignal
+	deploys deploySignal
+	events  eventSignal
+}
+
+type podPhaseSignal struct {
+	outcome                  signalOutcome
+	pending, failed, unknown int
+}
+
+type deploySignal struct {
+	outcome                    signalOutcome
+	total, degraded, zeroReady int
+	names                      []string
+}
+
+type eventSignal struct {
+	outcome signalOutcome
+	warn15m int
+}
+
+// warnEventWindow is how far back a Warning event still counts toward
+// the fleet "warning events" signal.
+const warnEventWindow = 15 * time.Minute
+
+// probeWorkloadHealth gathers the fleet-dashboard workload signals —
+// non-green pods, degraded deployments, recent warning events — with
+// one field-selected list each, run concurrently so the round grows by
+// at most one ProbeTimeout of wall clock.
+func (s *Supervisor) probeWorkloadHealth(parent context.Context, ns string, cs *kubernetes.Clientset) workloadHealth {
+	var wh workloadHealth
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); wh.pods = probeNonGreenPods(parent, ns, cs) }()
+	go func() { defer wg.Done(); wh.deploys = probeDeployHealth(parent, ns, cs) }()
+	go func() { defer wg.Done(); wh.events = probeWarnEvents(parent, ns, cs) }()
+	wg.Wait()
+	return wh
+}
+
+// carryHealth copies every fleet-health field forward from the last
+// committed state, for rounds abandoned before any of them could be
+// measured.
+func carryHealth(pf *model.ProbeFields, prev model.ClusterState) {
+	pf.NodesNotReadyNames = prev.NodesNotReadyNames
+	pf.NodesMemPressure = prev.NodesMemPressure
+	pf.NodesDiskPressure = prev.NodesDiskPressure
+	pf.NodesPIDPressure = prev.NodesPIDPressure
+	pf.NodesCordoned = prev.NodesCordoned
+	pf.NodesPressureNames = prev.NodesPressureNames
+	pf.PodsTotal = prev.PodsTotal
+	pf.PodsPending = prev.PodsPending
+	pf.PodsFailed = prev.PodsFailed
+	pf.PodsUnknownPhase = prev.PodsUnknownPhase
+	pf.DeploysTotal = prev.DeploysTotal
+	pf.DeploysDegraded = prev.DeploysDegraded
+	pf.DeploysZeroReady = prev.DeploysZeroReady
+	pf.DegradedDeployNames = prev.DegradedDeployNames
+	pf.WarnEvents15m = prev.WarnEvents15m
+}
+
+// healthErrOutcome maps a health-list error to its outcome: abandoned
+// calls carry forward, denials leave the "unknown" sentinel quietly,
+// anything else leaves it with a breadcrumb.
+func healthErrOutcome(what string, err error) signalOutcome {
+	if isTimeout(err) {
+		return signalTimeout
+	}
+	if !apierrors.IsForbidden(err) && !apierrors.IsUnauthorized(err) {
+		klog.Warningf("health probe: %s list failed: %v", what, err)
+	}
+	return signalUnknown
+}
+
+// probeNonGreenPods counts pods stuck outside Running/Succeeded. The
+// field selector keeps the response proportional to how broken the
+// cluster is rather than how big. Blind spot: a crash-looping pod
+// usually reports Phase=Running and is invisible here — deployment
+// readiness and warning events cover that side.
+func probeNonGreenPods(parent context.Context, ns string, cs *kubernetes.Clientset) podPhaseSignal {
+	ctx, cancel := context.WithTimeout(parent, ProbeTimeout)
+	defer cancel()
+	type result struct {
+		list *corev1.PodList
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		list, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+			FieldSelector:   "status.phase!=Running,status.phase!=Succeeded",
+			Limit:           500,
+			ResourceVersion: "0",
+		})
+		ch <- result{list: list, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return podPhaseSignal{outcome: signalTimeout}
+	case r := <-ch:
+		if r.err != nil {
+			return podPhaseSignal{outcome: healthErrOutcome("pods", r.err)}
+		}
+		sig := podPhaseSignal{outcome: signalOK}
+		for _, p := range r.list.Items {
+			switch p.Status.Phase {
+			case corev1.PodPending:
+				sig.pending++
+			case corev1.PodFailed:
+				sig.failed++
+			default:
+				sig.unknown++
+			}
+		}
+		return sig
+	}
+}
+
+func probeDeployHealth(parent context.Context, ns string, cs *kubernetes.Clientset) deploySignal {
+	ctx, cancel := context.WithTimeout(parent, ProbeTimeout)
+	defer cancel()
+	type result struct {
+		list *appsv1.DeploymentList
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		list, err := cs.AppsV1().Deployments(ns).List(ctx, listAllOpts())
+		ch <- result{list: list, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return deploySignal{outcome: signalTimeout}
+	case r := <-ch:
+		if r.err != nil {
+			return deploySignal{outcome: healthErrOutcome("deployments", r.err)}
+		}
+		sig := deploySignal{outcome: signalOK, total: len(r.list.Items)}
+		type degraded struct {
+			label string
+			ratio float64
+		}
+		var worst []degraded
+		for _, d := range r.list.Items {
+			desired := int32(1)
+			if d.Spec.Replicas != nil {
+				desired = *d.Spec.Replicas
+			}
+			if desired == 0 || d.Status.ReadyReplicas >= desired {
+				continue
+			}
+			sig.degraded++
+			// Full-outage signal keyed on Ready, not Available:
+			// readiness is what gates endpoints, and with
+			// minReadySeconds a healthy rollout sits at
+			// available=0 while its ready pods already serve.
+			if d.Status.ReadyReplicas == 0 {
+				sig.zeroReady++
+			}
+			worst = append(worst, degraded{
+				label: fmt.Sprintf("%s/%s %d/%d", d.Namespace, d.Name, d.Status.ReadyReplicas, desired),
+				ratio: float64(d.Status.ReadyReplicas) / float64(desired),
+			})
+		}
+		sort.Slice(worst, func(i, j int) bool {
+			if worst[i].ratio != worst[j].ratio {
+				return worst[i].ratio < worst[j].ratio
+			}
+			return worst[i].label < worst[j].label
+		})
+		for i := 0; i < len(worst) && i < healthNameCap; i++ {
+			sig.names = append(sig.names, worst[i].label)
+		}
+		return sig
+	}
+}
+
+func probeWarnEvents(parent context.Context, ns string, cs *kubernetes.Clientset) eventSignal {
+	ctx, cancel := context.WithTimeout(parent, ProbeTimeout)
+	defer cancel()
+	type result struct {
+		list *corev1.EventList
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		list, err := cs.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
+			FieldSelector:   "type=Warning",
+			Limit:           500,
+			ResourceVersion: "0",
+		})
+		ch <- result{list: list, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return eventSignal{outcome: signalTimeout}
+	case r := <-ch:
+		if r.err != nil {
+			return eventSignal{outcome: healthErrOutcome("events", r.err)}
+		}
+		sig := eventSignal{outcome: signalOK}
+		cutoff := time.Now().Add(-warnEventWindow)
+		for _, e := range r.list.Items {
+			// Freshness chain matches the event watcher: batch events
+			// carry eventTime, aggregated ones lastTimestamp.
+			last := e.LastTimestamp.Time
+			if last.IsZero() {
+				last = e.EventTime.Time
+			}
+			if last.IsZero() {
+				last = e.CreationTimestamp.Time
+			}
+			if last.After(cutoff) {
+				sig.warn15m++
+			}
+		}
+		return sig
 	}
 }
 
