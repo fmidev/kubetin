@@ -62,6 +62,9 @@ type ContainerInfo struct {
 	Reason string
 	// ExitCode is only meaningful when the container terminated.
 	ExitCode int32
+	// MemLimitBytes is the container's effective memory limit; 0
+	// means no limit set.
+	MemLimitBytes int64
 }
 
 // PodCondition projects one entry of pod.Status.Conditions. Reason and
@@ -123,6 +126,12 @@ type PodEvent struct {
 	QOSClass       string
 	ServiceAccount string
 	StartedAt      time.Time // pod.Status.StartTime; zero before scheduling
+
+	// MemLimitBytes is the pod's memory ceiling: the sum of container
+	// limits, but only when every long-running container has one — a
+	// partial sum understates the ceiling and fakes >100% usage. 0
+	// means "no complete limit set".
+	MemLimitBytes int64
 
 	// Labels back the Deployment dashboard's owned-pod lookup, which
 	// matches on the deployment's selector rather than the name-prefix
@@ -220,7 +229,8 @@ func (w *PodWatcher) emit(kind PodEventKind, obj any) {
 	// readiness/state for entries we actually have. The slice may be
 	// shorter than Containers; consumers treat missing entries as
 	// "not yet known".
-	info := projectContainerInfo(pod.Status.ContainerStatuses)
+	limits := effectiveMemLimits(pod)
+	info := projectContainerInfo(pod.Status.ContainerStatuses, limits)
 	states := make([]ContainerState, 0, len(info))
 	for _, ci := range info {
 		states = append(states, ci.State)
@@ -242,12 +252,13 @@ func (w *PodWatcher) emit(kind PodEventKind, obj any) {
 		Containers:        containers,
 		ContainerStates:   states,
 		ContainerInfo:     info,
-		InitContainerInfo: projectContainerInfo(pod.Status.InitContainerStatuses),
+		InitContainerInfo: projectContainerInfo(pod.Status.InitContainerStatuses, limits),
 		PodIP:             pod.Status.PodIP,
 		HostIP:            pod.Status.HostIP,
 		QOSClass:          string(pod.Status.QOSClass),
 		ServiceAccount:    pod.Spec.ServiceAccountName,
 		StartedAt:         started,
+		MemLimitBytes:     podMemLimit(pod, limits),
 		Labels:            copyLabels(pod.Labels),
 		Conditions:        projectPodConditions(pod.Status.Conditions),
 	}
@@ -260,18 +271,19 @@ func (w *PodWatcher) emit(kind PodEventKind, obj any) {
 
 // projectContainerInfo builds the rich per-container projection from
 // a status slice. Used for both regular and init containers.
-func projectContainerInfo(statuses []corev1.ContainerStatus) []ContainerInfo {
+func projectContainerInfo(statuses []corev1.ContainerStatus, memLimits map[string]int64) []ContainerInfo {
 	if len(statuses) == 0 {
 		return nil
 	}
 	out := make([]ContainerInfo, 0, len(statuses))
 	for _, cs := range statuses {
 		ci := ContainerInfo{
-			Name:     cs.Name,
-			Image:    cs.Image,
-			Ready:    cs.Ready,
-			State:    projectContainerState(cs),
-			Restarts: cs.RestartCount,
+			Name:          cs.Name,
+			Image:         cs.Image,
+			Ready:         cs.Ready,
+			State:         projectContainerState(cs),
+			Restarts:      cs.RestartCount,
+			MemLimitBytes: memLimits[cs.Name],
 		}
 		switch {
 		case cs.State.Waiting != nil:
@@ -283,6 +295,69 @@ func projectContainerInfo(statuses []corev1.ContainerStatus) []ContainerInfo {
 		out = append(out, ci)
 	}
 	return out
+}
+
+// effectiveMemLimits maps container name → memory limit for every
+// container that has one, preferring the status-reported limit over
+// the spec — after an in-place resize (k8s ≥1.27) only the status
+// carries the limit actually enforced.
+func effectiveMemLimits(pod *corev1.Pod) map[string]int64 {
+	out := make(map[string]int64)
+	fromSpec := func(cs []corev1.Container) {
+		for _, c := range cs {
+			if q, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+				out[c.Name] = q.Value()
+			}
+		}
+	}
+	fromSpec(pod.Spec.Containers)
+	fromSpec(pod.Spec.InitContainers)
+	fromStatus := func(sts []corev1.ContainerStatus) {
+		for _, cs := range sts {
+			if cs.Resources == nil {
+				continue
+			}
+			// A non-nil status is authoritative even when it omits
+			// memory: mid-resize the spec already carries a desired
+			// limit that isn't enforced yet.
+			if q, ok := cs.Resources.Limits[corev1.ResourceMemory]; ok {
+				out[cs.Name] = q.Value()
+			} else {
+				delete(out, cs.Name)
+			}
+		}
+	}
+	fromStatus(pod.Status.ContainerStatuses)
+	fromStatus(pod.Status.InitContainerStatuses)
+	return out
+}
+
+// podMemLimit sums limits over the containers that run for the pod's
+// lifetime: spec.containers plus restartable (sidecar) init
+// containers. Non-restartable init containers are excluded — they've
+// terminated by the time usage is measured. Zero means "no limit": if
+// any counted container omits one, a partial sum would understate the
+// ceiling and render a misleading >100%.
+func podMemLimit(pod *corev1.Pod, limits map[string]int64) int64 {
+	var total int64
+	for _, c := range pod.Spec.Containers {
+		v, ok := limits[c.Name]
+		if !ok {
+			return 0
+		}
+		total += v
+	}
+	for _, c := range pod.Spec.InitContainers {
+		if c.RestartPolicy == nil || *c.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			continue
+		}
+		v, ok := limits[c.Name]
+		if !ok {
+			return 0
+		}
+		total += v
+	}
+	return total
 }
 
 // projectPodConditions keeps the conditions verbatim. We don't filter

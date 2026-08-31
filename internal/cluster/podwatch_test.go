@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // ContainerInfo is the single source of truth the coarse
@@ -39,9 +40,16 @@ func TestProjectContainerInfo(t *testing.T) {
 		},
 	}
 
-	got := projectContainerInfo(statuses)
+	got := projectContainerInfo(statuses, map[string]int64{"api": 512 << 20})
 	if len(got) != 3 {
 		t.Fatalf("len = %d, want 3", len(got))
+	}
+
+	if got[0].MemLimitBytes != 512<<20 {
+		t.Errorf("mem limit = %d, want joined by name (512Mi)", got[0].MemLimitBytes)
+	}
+	if got[1].MemLimitBytes != 0 {
+		t.Errorf("mem limit = %d, want 0 for a container not in the map", got[1].MemLimitBytes)
 	}
 
 	if got[0].State != ContainerReady || got[0].Reason != "" {
@@ -75,7 +83,7 @@ func TestProjectContainerInfo(t *testing.T) {
 // slice — consumers length-check to decide whether kubelet has
 // reported yet, and the pod table's dot column renders "—" on nil.
 func TestProjectContainerInfoEmpty(t *testing.T) {
-	if got := projectContainerInfo(nil); got != nil {
+	if got := projectContainerInfo(nil, nil); got != nil {
 		t.Errorf("projectContainerInfo(nil) = %v, want nil", got)
 	}
 }
@@ -123,5 +131,133 @@ func TestCopyLabelsDetaches(t *testing.T) {
 	}
 	if copyLabels(map[string]string{}) != nil {
 		t.Error("copyLabels(empty) should be nil, not an empty map")
+	}
+}
+
+// The pod-level limit is all-or-nothing: a partial sum understates
+// the ceiling and fakes >100% usage, so any counted container
+// without a limit collapses the total to 0 ("no limit"). Plain init
+// containers don't count (terminated before usage is measured);
+// sidecar (Always-restart) init containers do. The status-reported
+// limit wins over spec — after an in-place resize only status
+// carries the enforced value.
+func TestPodMemLimit(t *testing.T) {
+	lim := func(s string) corev1.ResourceList {
+		return corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(s)}
+	}
+	always := corev1.ContainerRestartPolicyAlways
+
+	cases := []struct {
+		name string
+		pod  corev1.Pod
+		want int64
+	}{
+		{
+			name: "all containers limited",
+			pod: corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				{Name: "envoy", Resources: corev1.ResourceRequirements{Limits: lim("512Mi")}},
+			}}},
+			want: 768 << 20,
+		},
+		{
+			name: "one container unlimited",
+			pod: corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				{Name: "envoy"},
+			}}},
+			want: 0,
+		},
+		{
+			name: "no limits at all",
+			pod: corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "api"},
+			}}},
+			want: 0,
+		},
+		{
+			name: "plain init container excluded",
+			pod: corev1.Pod{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				},
+				InitContainers: []corev1.Container{
+					{Name: "migrate", Resources: corev1.ResourceRequirements{Limits: lim("1Gi")}},
+				},
+			}},
+			want: 256 << 20,
+		},
+		{
+			name: "sidecar init container included",
+			pod: corev1.Pod{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				},
+				InitContainers: []corev1.Container{
+					{Name: "proxy", RestartPolicy: &always,
+						Resources: corev1.ResourceRequirements{Limits: lim("128Mi")}},
+				},
+			}},
+			want: 384 << 20,
+		},
+		{
+			name: "sidecar without limit collapses to zero",
+			pod: corev1.Pod{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				},
+				InitContainers: []corev1.Container{
+					{Name: "proxy", RestartPolicy: &always},
+				},
+			}},
+			want: 0,
+		},
+		{
+			name: "status resources override spec",
+			pod: corev1.Pod{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{
+					{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				}},
+				Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+					{Name: "api", Resources: &corev1.ResourceRequirements{Limits: lim("512Mi")}},
+				}},
+			},
+			want: 512 << 20,
+		},
+		{
+			name: "status without memory entry drops the spec limit",
+			pod: corev1.Pod{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{
+					{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				}},
+				Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+					{Name: "api", Resources: &corev1.ResourceRequirements{Limits: corev1.ResourceList{
+						corev1.ResourceCPU: resource.MustParse("500m"),
+					}}},
+				}},
+			},
+			want: 0,
+		},
+		{
+			name: "nil status resources fall back to spec",
+			pod: corev1.Pod{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{
+					{Name: "api", Resources: corev1.ResourceRequirements{Limits: lim("256Mi")}},
+				}},
+				Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+					{Name: "api"},
+				}},
+			},
+			want: 256 << 20,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := podMemLimit(&tc.pod, effectiveMemLimits(&tc.pod))
+			if got != tc.want {
+				t.Errorf("podMemLimit = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

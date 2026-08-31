@@ -40,11 +40,13 @@ type podRow struct {
 	StartedAt         time.Time
 	Labels            map[string]string
 	Conditions        []cluster.PodCondition
+	MemLimitBytes     int64 // 0 = no complete limit set
 
 	// Filled by MetricsSnapshotMsg. Zero values mean "no reading yet".
-	CPUMilli   int64
-	MemBytes   int64
-	HasMetrics bool
+	CPUMilli          int64
+	MemBytes          int64
+	ContainerMemBytes map[string]int64 // container name → usage, replaced wholesale each snapshot
+	HasMetrics        bool
 
 	// Filled by NetworkSnapshotMsg. Per-pod rates, sampled from
 	// cAdvisor on the kubelet that hosts the pod. Zeroed (and
@@ -68,6 +70,7 @@ const (
 	SortAge
 	SortCPU
 	SortMem
+	SortMemPct
 	SortNetRX
 	SortNetTX
 	SortNode
@@ -95,6 +98,8 @@ func (k SortKey) label() string {
 		return "cpu"
 	case SortMem:
 		return "mem"
+	case SortMemPct:
+		return "mem%"
 	case SortNetRX:
 		return "net-rx"
 	case SortNetTX:
@@ -142,6 +147,7 @@ func applyPodEvent(m map[types.UID]podRow, ev cluster.PodEvent) {
 		r.StartedAt = ev.StartedAt
 		r.Labels = ev.Labels
 		r.Conditions = ev.Conditions
+		r.MemLimitBytes = ev.MemLimitBytes
 		m[ev.UID] = r
 	}
 }
@@ -176,6 +182,38 @@ func formatMem(b int64) string {
 		return fmt.Sprintf("%dKi", b/Ki)
 	}
 	return fmt.Sprintf("%dB", b)
+}
+
+// podMemPct is the pod's memory usage as a percent of its limit,
+// deliberately unclamped — pct() caps at 100 and would hide the
+// OOM-imminent case of usage over limit. false when there's no
+// reading yet or no complete limit set.
+func podMemPct(r podRow) (int, bool) {
+	if !r.HasMetrics || r.MemLimitBytes <= 0 {
+		return 0, false
+	}
+	return int(r.MemBytes * 100 / r.MemLimitBytes), true
+}
+
+// memPctSortValue orders no-limit/no-metrics pods below 0% so a
+// descending sort puts the worst offenders on top and unknowns last.
+func memPctSortValue(r podRow) int {
+	p, ok := podMemPct(r)
+	if !ok {
+		return -1
+	}
+	return p
+}
+
+func containerMemByName(cms []cluster.ContainerMetric) map[string]int64 {
+	if len(cms) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(cms))
+	for _, c := range cms {
+		out[c.Name] = c.MemBytes
+	}
+	return out
 }
 
 // podContainerDots draws one square dot per container with a single
@@ -335,6 +373,10 @@ func lessBy(a, b podRow, k SortKey) bool {
 	case SortMem:
 		if a.MemBytes != b.MemBytes {
 			return a.MemBytes < b.MemBytes
+		}
+	case SortMemPct:
+		if ap, bp := memPctSortValue(a), memPctSortValue(b); ap != bp {
+			return ap < bp
 		}
 	case SortNetRX:
 		if a.NetRXBps != b.NetRXBps {

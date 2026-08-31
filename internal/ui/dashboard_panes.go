@@ -63,9 +63,14 @@ func (m Model) renderDashPodStatus(r podRow, w, h int) string {
 		line1 = append(line1, dashField("qos", r.QOSClass, th.Base, th))
 	}
 
+	memField := dashField("mem", formatMem(r.MemBytes), th.Base, th)
+	if p, ok := podMemPct(r); ok {
+		memField = dashField("mem", formatMem(r.MemBytes)+" / "+formatMem(r.MemLimitBytes), th.Base, th) +
+			" " + bar(p, 10, th) + " " + th.loadStyle(p).Render(fmt.Sprintf("%d%%", p))
+	}
 	line2 := []string{
 		dashField("cpu", formatCPU(r.CPUMilli), th.Base, th),
-		dashField("mem", formatMem(r.MemBytes), th.Base, th),
+		memField,
 	}
 	if r.HasNetwork {
 		line2 = append(line2,
@@ -166,7 +171,8 @@ var dashContainerColumns = []column{
 	{min: 12, max: 22, prio: 0}, // NAME
 	{min: 10, max: 16, prio: 1}, // STATE
 	{min: 3, max: 4, prio: 2},   // RESTARTS
-	{min: 14, max: 46, prio: 3}, // IMAGE
+	{min: 9, max: 13, prio: 3},  // MEM
+	{min: 14, max: 46, prio: 4}, // IMAGE
 }
 
 // renderDashContainers lists init containers (prefixed) then regular
@@ -187,7 +193,8 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 			padCol(name, cw[0], th.Base),
 			padCol(state, cw[1], style),
 			padColRight(fmt.Sprintf("%d", ci.Restarts), cw[2], restartStyle(ci.Restarts, th)),
-			padCol(shortImage(ci.Image), cw[3], th.Dim),
+			padCellANSIRight(containerMemCell(ci, r, th), cw[3]),
+			padCol(shortImage(ci.Image), cw[4], th.Dim),
 		))
 		if detail := containerDetail(ci); detail != "" {
 			lines = append(lines, " "+th.Dim.Render("  └ ")+
@@ -218,6 +225,24 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 	}
 
 	return dashPaneBody(lines, w, h, scroll)
+}
+
+// containerMemCell renders "usage/limit" with the usage coloured by
+// its share of the limit. Mixed styles — ANSI-aware padding only.
+func containerMemCell(ci cluster.ContainerInfo, r podRow, th Theme) string {
+	usage, hasUsage := r.ContainerMemBytes[ci.Name]
+	hasUsage = hasUsage && r.HasMetrics
+	switch {
+	case !hasUsage && ci.MemLimitBytes <= 0:
+		return th.Dim.Render("—")
+	case !hasUsage:
+		return th.Dim.Render("—/" + formatMem(ci.MemLimitBytes))
+	case ci.MemLimitBytes <= 0:
+		return th.Base.Render(formatMem(usage)) + th.Dim.Render("/—")
+	}
+	p := int(usage * 100 / ci.MemLimitBytes)
+	return th.loadStyle(p).Render(formatMem(usage)) +
+		th.Dim.Render("/"+formatMem(ci.MemLimitBytes))
 }
 
 // containerStateLabel maps the coarse state onto a word plus its

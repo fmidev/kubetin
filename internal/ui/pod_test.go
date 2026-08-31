@@ -27,7 +27,7 @@ func makePods() map[types.UID]podRow {
 // across repeated calls regardless of map iteration order. We run
 // it many times to make accidental shuffles surface.
 func TestSortedRows_Stable(t *testing.T) {
-	keys := []SortKey{SortNamespace, SortName, SortStatus, SortRestarts, SortCPU, SortMem, SortAge, SortNode}
+	keys := []SortKey{SortNamespace, SortName, SortStatus, SortRestarts, SortCPU, SortMem, SortMemPct, SortAge, SortNode}
 	for _, k := range keys {
 		var prev []podRow
 		for i := 0; i < 50; i++ {
@@ -108,18 +108,26 @@ func TestApplyPodEvent_PreservesMetricsAcrossUpdate(t *testing.T) {
 	// The metrics + network receivers merge into the existing row.
 	r := m["p1"]
 	r.CPUMilli, r.MemBytes, r.HasMetrics = 142, 384<<20, true
+	r.ContainerMemBytes = map[string]int64{"api": 100 << 20}
 	r.NetRXBps, r.NetTXBps, r.HasNetwork = 1200, 840, true
 	m["p1"] = r
 
 	applyPodEvent(m, cluster.PodEvent{
 		Kind: cluster.PodUpdated, UID: "p1", Namespace: "default", Name: "api",
 		Phase: corev1.PodRunning, NodeName: "node-1", Restarts: 1,
+		MemLimitBytes: 512 << 20,
 	})
 
 	got := m["p1"]
 	if !got.HasMetrics || got.CPUMilli != 142 || got.MemBytes != 384<<20 {
 		t.Errorf("metrics lost across informer UPDATE: cpu=%d mem=%d has=%v",
 			got.CPUMilli, got.MemBytes, got.HasMetrics)
+	}
+	if got.ContainerMemBytes["api"] != 100<<20 {
+		t.Errorf("per-container usage lost across informer UPDATE: %v", got.ContainerMemBytes)
+	}
+	if got.MemLimitBytes != 512<<20 {
+		t.Errorf("MemLimitBytes = %d, want 512Mi — informer fields must still update", got.MemLimitBytes)
 	}
 	if !got.HasNetwork || got.NetRXBps != 1200 || got.NetTXBps != 840 {
 		t.Errorf("network rates lost across informer UPDATE: rx=%d tx=%d has=%v",
@@ -136,15 +144,17 @@ func TestApplyPodEvent_PreservesMetricsAcrossUpdate(t *testing.T) {
 // worse than showing "—" until the next scrape.
 func TestApplyPodEvent_NewUIDStartsClean(t *testing.T) {
 	m := map[types.UID]podRow{
-		"old": {UID: "old", Name: "api", CPUMilli: 999, HasMetrics: true},
+		"old": {UID: "old", Name: "api", CPUMilli: 999, HasMetrics: true,
+			ContainerMemBytes: map[string]int64{"api": 100 << 20}},
 	}
 	applyPodEvent(m, cluster.PodEvent{
 		Kind: cluster.PodAdded, UID: "new", Namespace: "default", Name: "api",
 		Phase: corev1.PodRunning,
 	})
 
-	if got := m["new"]; got.HasMetrics || got.CPUMilli != 0 {
-		t.Errorf("new UID inherited metrics: cpu=%d has=%v", got.CPUMilli, got.HasMetrics)
+	if got := m["new"]; got.HasMetrics || got.CPUMilli != 0 || got.ContainerMemBytes != nil {
+		t.Errorf("new UID inherited metrics: cpu=%d has=%v containers=%v",
+			got.CPUMilli, got.HasMetrics, got.ContainerMemBytes)
 	}
 }
 
@@ -155,5 +165,40 @@ func TestApplyPodEvent_DeleteRemoves(t *testing.T) {
 	applyPodEvent(m, cluster.PodEvent{Kind: cluster.PodDeleted, UID: "p1"})
 	if _, ok := m["p1"]; ok {
 		t.Error("deleted pod still present in the map")
+	}
+}
+
+// podMemPct is deliberately unclamped: >100% is the OOM-imminent
+// signal the column exists for.
+func TestPodMemPct(t *testing.T) {
+	cases := []struct {
+		name   string
+		row    podRow
+		want   int
+		wantOK bool
+	}{
+		{"no metrics", podRow{MemLimitBytes: 1 << 30}, 0, false},
+		{"no limit", podRow{MemBytes: 384 << 20, HasMetrics: true}, 0, false},
+		{"under limit", podRow{MemBytes: 384 << 20, MemLimitBytes: 1 << 30, HasMetrics: true}, 37, true},
+		{"over limit", podRow{MemBytes: 3 << 29, MemLimitBytes: 1 << 30, HasMetrics: true}, 150, true},
+	}
+	for _, tc := range cases {
+		if p, ok := podMemPct(tc.row); p != tc.want || ok != tc.wantOK {
+			t.Errorf("%s: podMemPct = (%d, %v), want (%d, %v)", tc.name, p, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+// Pods without a limit sort below 0% so descending — the "worst
+// offenders" direction — puts them last.
+func TestLessBy_MemPctUnknownsSortLow(t *testing.T) {
+	unknown := podRow{UID: "u", Name: "nolimit"}
+	limited := podRow{UID: "l", Name: "limited",
+		MemBytes: 100 << 20, MemLimitBytes: 200 << 20, HasMetrics: true}
+	if !lessBy(unknown, limited, SortMemPct) {
+		t.Error("pod without a limit should compare less than a 50% pod")
+	}
+	if lessBy(limited, unknown, SortMemPct) {
+		t.Error("50% pod should not compare less than a pod without a limit")
 	}
 }

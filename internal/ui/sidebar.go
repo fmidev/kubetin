@@ -210,11 +210,16 @@ func pct(used, alloc int64) int {
 	return p
 }
 
-// barWithPct renders "NN% █████" with a btop-style solid bar:
-// filled cells in the load colour, empty cells in dim gray. Same
-// glyph (█) in both — the difference is colour, not character.
+// barWithPct renders "NN% █████".
 func barWithPct(p int, th Theme) string {
-	const cells = 5
+	return fmt.Sprintf("%2d%% ", p) + bar(p, 5, th)
+}
+
+// bar renders a `cells`-wide btop-style solid bar: filled cells in
+// the load colour, empty cells in dim gray. Same glyph (▬) in both —
+// the difference is colour, not character. Fill is clamped; the
+// caller's number stays honest for >100%.
+func bar(p, cells int, th Theme) string {
 	n := p * cells / 100
 	if n < 0 {
 		n = 0
@@ -223,20 +228,12 @@ func barWithPct(p int, th Theme) string {
 		n = cells
 	}
 
-	loadStyle := th.StatusOK
-	switch {
-	case p >= 80:
-		loadStyle = th.StatusBad
-	case p >= 60:
-		loadStyle = th.StatusWrn
-	}
 	emptyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("236"))
 
 	// ▬ (BLACK RECTANGLE) is vertically centred in the cell — gives
 	// the btop "thin centered bar" look instead of sitting at the
 	// row's bottom edge like ▄.
-	filled := loadStyle.Render(strings.Repeat("▬", n))
+	filled := th.loadStyle(p).Render(strings.Repeat("▬", n))
 	empty := emptyStyle.Render(strings.Repeat("▬", cells-n))
-
-	return fmt.Sprintf("%2d%% ", p) + filled + empty
+	return filled + empty
 }
