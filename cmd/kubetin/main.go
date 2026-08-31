@@ -217,10 +217,10 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	}
 
 	// Wire the fleet dashboard's on-demand cluster drill-down.
-	m.OnFleetDetail = func(ctxName string) tea.Msg {
+	m.OnFleetDetail = func(ctxName string) cluster.FleetDetailResult {
 		fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		defer cancel()
-		return ui.FleetDetailMsg(sup.FleetDetail(fetchCtx, ctxName))
+		return sup.FleetDetail(fetchCtx, ctxName)
 	}
 
 	// Wire SSAR so the UI can hide actions the user can't perform.

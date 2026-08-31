@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -158,9 +159,9 @@ func TestFleetEscClearsFilterBeforeLeaving(t *testing.T) {
 func TestFleetEnterExpandsAndFetches(t *testing.T) {
 	m := fleetTestModel()
 	var asked string
-	m.OnFleetDetail = func(ctx string) tea.Msg {
+	m.OnFleetDetail = func(ctx string) cluster.FleetDetailResult {
 		asked = ctx
-		return FleetDetailMsg{Context: ctx, At: time.Now()}
+		return cluster.FleetDetailResult{Context: ctx, At: time.Now()}
 	}
 	m.fleet.cursorCtx = "bad"
 
@@ -194,7 +195,7 @@ func TestFleetDetailGuardDropsStaleResults(t *testing.T) {
 	m.fleet.expanded = "bad"
 
 	// A result for a cluster the user is no longer expanding.
-	res, _ := m.Update(FleetDetailMsg{Context: "fine", At: time.Now()})
+	res, _ := m.Update(FleetDetailMsg{Seq: m.fleet.detailSeq, Result: cluster.FleetDetailResult{Context: "fine", At: time.Now()}})
 	m = res.(Model)
 	if m.fleet.detail.result.Context != "" {
 		t.Errorf("mismatched result must be dropped, got %q", m.fleet.detail.result.Context)
@@ -202,7 +203,7 @@ func TestFleetDetailGuardDropsStaleResults(t *testing.T) {
 
 	// Same cluster, but the user already left the dashboard.
 	m.view = ViewPods
-	res, _ = m.Update(FleetDetailMsg{Context: "bad", At: time.Now()})
+	res, _ = m.Update(FleetDetailMsg{Seq: m.fleet.detailSeq, Result: cluster.FleetDetailResult{Context: "bad", At: time.Now()}})
 	m = res.(Model)
 	if m.fleet.detail.result.Context != "" {
 		t.Errorf("result after leaving the view must be dropped, got %q", m.fleet.detail.result.Context)
@@ -211,7 +212,7 @@ func TestFleetDetailGuardDropsStaleResults(t *testing.T) {
 
 func TestFleetExpandDoesNotShowAnotherClustersRows(t *testing.T) {
 	m := fleetTestModel()
-	m.OnFleetDetail = func(ctx string) tea.Msg { return FleetDetailMsg{Context: ctx} }
+	m.OnFleetDetail = func(ctx string) cluster.FleetDetailResult { return cluster.FleetDetailResult{Context: ctx} }
 	m.fleet.expanded = "fine"
 	m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult{
 		Context: "fine",
@@ -385,7 +386,7 @@ func TestFleetEnterOnOfflineExplainsInsteadOfFetching(t *testing.T) {
 	})
 	m.Store = store
 	fetched := false
-	m.OnFleetDetail = func(string) tea.Msg { fetched = true; return nil }
+	m.OnFleetDetail = func(string) cluster.FleetDetailResult { fetched = true; return cluster.FleetDetailResult{} }
 	m.fleet.cursorCtx = "vpn-off"
 
 	m, cmd := fleetPress(t, m, key("enter"))
@@ -427,7 +428,9 @@ func TestCleanDetailStripsTerminalControls(t *testing.T) {
 
 func TestLeavingFleetInvalidatesPendingDetail(t *testing.T) {
 	m := fleetTestModel()
-	m.OnFleetDetail = func(ctx string) tea.Msg { return FleetDetailMsg{Context: ctx, At: time.Now()} }
+	m.OnFleetDetail = func(ctx string) cluster.FleetDetailResult {
+		return cluster.FleetDetailResult{Context: ctx, At: time.Now()}
+	}
 	m.OnFocusChange = func(string) {}
 	m.fleet.cursorCtx = "bad"
 
@@ -441,5 +444,73 @@ func TestLeavingFleetInvalidatesPendingDetail(t *testing.T) {
 	m = res.(Model)
 	if m.fleet.detail.loading || m.fleet.detail.result.Context != "" {
 		t.Errorf("late result must not resurrect state: %+v", m.fleet.detail)
+	}
+}
+
+func TestFleetOverlappingFetchesNewestWins(t *testing.T) {
+	m := fleetTestModel()
+	calls := 0
+	m.OnFleetDetail = func(ctx string) cluster.FleetDetailResult {
+		calls++
+		return cluster.FleetDetailResult{Context: ctx, Err: fmt.Sprintf("fetch-%d", calls), At: time.Now()}
+	}
+	m.fleet.cursorCtx = "bad"
+
+	m, cmd1 := fleetPress(t, m, key("enter")) // fetch 1 in flight
+	m, _ = fleetPress(t, m, key("enter"))     // collapse
+	m, cmd2 := fleetPress(t, m, key("enter")) // fetch 2 in flight
+
+	msg1, msg2 := cmd1(), cmd2()
+	res, _ := m.Update(msg2) // newer lands first
+	m = res.(Model)
+	res, _ = m.Update(msg1) // older must be dropped
+	m = res.(Model)
+	if got := m.fleet.detail.result.Err; got != "fetch-2" {
+		t.Errorf("detail holds %q, want the newer fetch-2 — stale generations must not win", got)
+	}
+	if m.fleet.detail.loading {
+		t.Error("loading must clear once the newest result lands")
+	}
+}
+
+func TestFleetExpandOfflineClearsForeignDetail(t *testing.T) {
+	m := fleetTestModel()
+	store := m.Store
+	seedFleetCluster(store, "vpn-off", func(pf *model.ProbeFields) {
+		pf.Reach = model.ReachUnreachable
+		pf.LastError = "dial tcp: i/o timeout"
+	})
+	m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult{
+		Context: "fine",
+		Pods:    []cluster.FleetPodIssue{{Namespace: "x", Name: "y", Phase: "Pending"}},
+		At:      time.Now(),
+	}}
+	m.fleet.cursorCtx = "vpn-off"
+
+	m, _ = fleetPress(t, m, key("enter"))
+	if got := m.fleet.detail.result.Context; got != "" {
+		t.Errorf("expanding offline must clear another cluster's rows, still holds %q", got)
+	}
+}
+
+func TestFleetOfflinePromotionTriggersFetchOnTick(t *testing.T) {
+	m := fleetTestModel()
+	store := m.Store
+	seedFleetCluster(store, "vpn-off", func(pf *model.ProbeFields) {
+		pf.Reach = model.ReachUnreachable
+	})
+	m.OnFleetDetail = func(ctx string) cluster.FleetDetailResult {
+		return cluster.FleetDetailResult{Context: ctx, At: time.Now()}
+	}
+	m.fleet.cursorCtx = "vpn-off"
+	m, _ = fleetPress(t, m, key("enter")) // offline: no fetch, zero timestamp
+
+	// VPN comes back: the probe promotes the cluster while expanded.
+	seedFleetCluster(store, "vpn-off", nil)
+
+	res, _ := m.Update(ProbeTickMsg(time.Now()))
+	m = res.(Model)
+	if !m.fleet.detail.loading {
+		t.Error("promotion while expanded must dispatch the fetch on the next tick")
 	}
 }

@@ -61,9 +61,14 @@ func (f *fleetDetailSrv) handler() http.HandlerFunc {
 					`"metadata":{"continue":"page2"},"items":[`+strings.Join(items, ",")+`]}`)
 				return
 			}
-			// Page two carries the worst pod of all.
+			// Page two carries the worst pod of all: multi-container,
+			// one cleanly Completed, one OOMKilled — the failure must
+			// win the reason slot.
 			io.WriteString(w, `{"kind":"PodList","apiVersion":"v1","metadata":{},"items":[`+
-				pod("failed-9", "Failed", "OOMKilled", 9)+`]}`)
+				`{"metadata":{"name":"failed-9","namespace":"a"},"status":{"phase":"Failed",`+
+				`"containerStatuses":[`+
+				`{"name":"sidecar","restartCount":0,"state":{"terminated":{"reason":"Completed","exitCode":0}}},`+
+				`{"name":"main","restartCount":9,"state":{"terminated":{"reason":"OOMKilled","exitCode":137}}}]}}]}`)
 		case "/apis/apps/v1/deployments":
 			io.WriteString(w, `{"kind":"DeploymentList","apiVersion":"apps/v1","metadata":{},"items":[`+
 				`{"metadata":{"name":"d-part","namespace":"a"},"spec":{"replicas":4},"status":{"readyReplicas":2,"availableReplicas":2}},`+
@@ -101,6 +106,9 @@ func TestFleetDetailCollectsOrdersAndPaginates(t *testing.T) {
 	}
 	if res.Pods[0].Name != "failed-9" || res.Pods[0].Restarts != 9 {
 		t.Errorf("worst pod first = %+v, want failed-9 from page two — pagination must run before the cap", res.Pods[0])
+	}
+	if res.Pods[0].Reason != "OOMKilled" {
+		t.Errorf("pods[0].Reason = %q, want OOMKilled — a Completed sidecar must not mask it", res.Pods[0].Reason)
 	}
 	if res.Pods[1].Name != "failed-1" {
 		t.Errorf("pods[1] = %+v, want failed-1", res.Pods[1])

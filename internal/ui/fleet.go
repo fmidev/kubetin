@@ -25,6 +25,10 @@ type fleetState struct {
 	// vs cluster names) and must not leak into each other.
 	savedFilter string
 	detail      fleetDetailState
+	// detailSeq tags each dispatched fetch; only the newest may land.
+	// The context alone can't tell two overlapping fetches for the
+	// same cluster apart, and the older one must not win.
+	detailSeq int
 }
 
 // enterFleet/leaveFleet are the only transitions in and out of the
@@ -56,9 +60,13 @@ type fleetDetailState struct {
 
 // FleetDetailMsg carries an on-demand cluster drill-down back to the
 // dashboard. The receiver guards on the cluster it requested
-// (m.fleet.expanded), not on WatchedContext — the dashboard shows all
-// clusters.
-type FleetDetailMsg cluster.FleetDetailResult
+// (m.fleet.expanded) — not WatchedContext, the dashboard shows all
+// clusters — and on the fetch generation, so an older overlapping
+// fetch can't overwrite a newer one.
+type FleetDetailMsg struct {
+	Seq    int
+	Result cluster.FleetDetailResult
+}
 
 // fleetGroupsFiltered derives the triage groups from the store with
 // the name filter applied — the single source both the renderer and
@@ -169,6 +177,12 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.fleet.expanded = ctx
+		// A different cluster's cached rows must never render under
+		// this card — cleared here, before the offline early return,
+		// which never reaches fetchFleetDetail's own clearing.
+		if m.fleet.detail.result.Context != ctx {
+			m.fleet.detail = fleetDetailState{}
+		}
 		if m.fleetOffline(ctx) {
 			// Nothing to fetch from a cluster we can't reach; the
 			// panel renders the offline reason instead. Fetching
@@ -608,8 +622,10 @@ func (m *Model) fetchFleetDetail(ctx string) tea.Cmd {
 		prev = cluster.FleetDetailResult{}
 	}
 	m.fleet.detail = fleetDetailState{loading: true, result: prev}
+	m.fleet.detailSeq++
+	seq := m.fleet.detailSeq
 	cb := m.OnFleetDetail
-	return func() tea.Msg { return cb(ctx) }
+	return func() tea.Msg { return FleetDetailMsg{Seq: seq, Result: cb(ctx)} }
 }
 
 // renderFleetDetail renders the fetched drill-down under an expanded

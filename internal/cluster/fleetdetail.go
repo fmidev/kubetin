@@ -261,7 +261,10 @@ func podIssueOf(p corev1.Pod) FleetPodIssue {
 			switch {
 			case cst.State.Waiting != nil:
 				issue.Reason = cst.State.Waiting.Reason
-			case cst.State.Terminated != nil:
+			case cst.State.Terminated != nil && cst.State.Terminated.ExitCode != 0:
+				// Exit-code gated: a cleanly Completed container in a
+				// multi-container Failed pod must not claim the reason
+				// slot from the one that actually died.
 				issue.Reason = cst.State.Terminated.Reason
 			}
 		}

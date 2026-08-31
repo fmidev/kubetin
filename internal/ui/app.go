@@ -141,8 +141,9 @@ type Model struct {
 	OnDescribe func(req DescribeRequestMsg, focusedCtx string) tea.Msg
 
 	// OnFleetDetail runs the fleet dashboard's on-demand cluster
-	// drill-down off-thread and returns a FleetDetailMsg.
-	OnFleetDetail func(ctxName string) tea.Msg
+	// drill-down off-thread; the UI wraps the result in a
+	// generation-tagged FleetDetailMsg.
+	OnFleetDetail func(ctxName string) cluster.FleetDetailResult
 
 	// OnCanI runs a SelfSubjectAccessReview off-thread.
 	OnCanI func(ctxName, verb, group, resource, namespace string) tea.Msg
@@ -746,18 +747,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// WatchedContext — the dashboard shows all clusters. A result
 		// for a card the user already collapsed or moved past is
 		// stale and must not attach to another cluster's card.
-		if m.view != ViewFleet || msg.Context != m.fleet.expanded {
+		if m.view != ViewFleet || msg.Result.Context != m.fleet.expanded ||
+			msg.Seq != m.fleet.detailSeq {
 			return m, nil
 		}
-		m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult(msg)}
+		m.fleet.detail = fleetDetailState{result: msg.Result}
 		return m, nil
 
 	case ProbeTickMsg:
 		m.sampleFleetTrends()
+		// A zero timestamp is immediately due: an offline expansion
+		// has no result, and when the probe later promotes that
+		// cluster the panel would otherwise say "fetching" forever.
 		if m.view == ViewFleet && m.fleet.expanded != "" && !m.fleet.detail.loading &&
 			!m.fleetOffline(m.fleet.expanded) &&
-			!m.fleet.detail.result.At.IsZero() &&
-			time.Since(m.fleet.detail.result.At) > 30*time.Second {
+			(m.fleet.detail.result.At.IsZero() ||
+				time.Since(m.fleet.detail.result.At) > 30*time.Second) {
 			cmd := m.fetchFleetDetail(m.fleet.expanded)
 			return m, tea.Batch(tickCmd(), cmd)
 		}
