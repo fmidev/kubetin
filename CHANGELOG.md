@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.9.0](https://github.com/fmidev/kubetin/compare/v1.8.1...v1.9.0) (2026-09-01)
+
+
+### Features
+
+* on-demand cluster detail in the fleet dashboard ([#73](https://github.com/fmidev/kubetin/issues/73)) ([3fa04d0](https://github.com/fmidev/kubetin/commit/3fa04d0d28a1c83449aade2707fb734644ed65c4))
+* **probe:** collect fleet-wide health signals ([#71](https://github.com/fmidev/kubetin/issues/71)) ([4d8a2e6](https://github.com/fmidev/kubetin/commit/4d8a2e63c260524a140d767d69db7a682559e123))
+* show pod memory limits and % of limit used ([#70](https://github.com/fmidev/kubetin/issues/70)) ([b04ff1d](https://github.com/fmidev/kubetin/commit/b04ff1dbfdfa5a191a9537c6b1188b150b98e118))
+* **ui:** adaptive-triage fleet dashboard + sidebar alert badges ([#72](https://github.com/fmidev/kubetin/issues/72)) ([3e9d13b](https://github.com/fmidev/kubetin/commit/3e9d13b067f1d673300cdf3e3794502ce97d8abb))
+
+
+### Bug Fixes
+
+* fit the Namespace table to the pane ([#69](https://github.com/fmidev/kubetin/issues/69)) ([be98021](https://github.com/fmidev/kubetin/commit/be98021a267131408c0c0c3ceb7bd224fdf9a0db))
+* probe deadlines per call, and stop demoting on timeouts ([#67](https://github.com/fmidev/kubetin/issues/67)) ([5e72b5e](https://github.com/fmidev/kubetin/commit/5e72b5eef1370cdbd0e7195948d745c5f5d40e25))
+* **ui:** assign dashboard log cmds before returning the mutated model ([#75](https://github.com/fmidev/kubetin/issues/75)) ([da31dc5](https://github.com/fmidev/kubetin/commit/da31dc5af77d61ae71ef74ee04ed44317eee4f21))
+
 ## [1.8.1](https://github.com/fmidev/kubetin/compare/v1.8.0...v1.8.1) (2026-08-30)
 
 
