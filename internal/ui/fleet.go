@@ -3,10 +3,13 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	corev1 "k8s.io/api/core/v1"
 
+	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
 )
 
@@ -21,6 +24,11 @@ type fleetState struct {
 	// view owns m.filterText — the two filter different things (rows
 	// vs cluster names) and must not leak into each other.
 	savedFilter string
+	detail      fleetDetailState
+	// detailSeq tags each dispatched fetch; only the newest may land.
+	// The context alone can't tell two overlapping fetches for the
+	// same cluster apart, and the older one must not win.
+	detailSeq int
 }
 
 // enterFleet/leaveFleet are the only transitions in and out of the
@@ -36,7 +44,28 @@ func (m *Model) enterFleet() {
 func (m *Model) leaveFleet(to View) {
 	m.filterText = m.fleet.savedFilter
 	m.fleet.savedFilter = ""
+	// Invalidate the expansion: a result landing after the user left
+	// is dropped by the receiver, and a kept loading=true would
+	// otherwise revive as a forever-loading panel with both manual
+	// and automatic refresh disabled.
+	m.fleet.expanded = ""
+	m.fleet.detail = fleetDetailState{}
 	m.view = to
+}
+
+type fleetDetailState struct {
+	loading bool
+	result  cluster.FleetDetailResult
+}
+
+// FleetDetailMsg carries an on-demand cluster drill-down back to the
+// dashboard. The receiver guards on the cluster it requested
+// (m.fleet.expanded) — not WatchedContext, the dashboard shows all
+// clusters — and on the fetch generation, so an older overlapping
+// fetch can't overwrite a newer one.
+type FleetDetailMsg struct {
+	Seq    int
+	Result cluster.FleetDetailResult
 }
 
 // fleetGroupsFiltered derives the triage groups from the store with
@@ -139,8 +168,46 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
-		// Detail expansion arrives in a follow-up; swallowed so the
-		// action menu can't open on the empty resource cursor.
+		ctx := m.fleetCursor()
+		if ctx == "" {
+			return m, nil
+		}
+		if m.fleet.expanded == ctx {
+			m.fleet.expanded = ""
+			return m, nil
+		}
+		m.fleet.expanded = ctx
+		// A different cluster's cached rows must never render under
+		// this card — cleared here, before the offline early return,
+		// which never reaches fetchFleetDetail's own clearing.
+		if m.fleet.detail.result.Context != ctx {
+			m.fleet.detail = fleetDetailState{}
+		}
+		if m.fleetOffline(ctx) {
+			// Nothing to fetch from a cluster we can't reach; the
+			// panel renders the offline reason instead. Fetching
+			// anyway risks a 10s hang at best and, if the cluster
+			// half-answers, a false "all clean". This is also the one
+			// re-expansion path that skips fetchFleetDetail, so it
+			// must do fetchFleetDetail's bookkeeping itself: reset
+			// the detail state (a dangling loading=true would block
+			// every future refresh) and advance the generation so a
+			// pre-collapse in-flight result can't land here.
+			m.fleet.detail = fleetDetailState{}
+			m.fleet.detailSeq++
+			return m, nil
+		}
+		// Assigned before the return: fetchFleetDetail mutates m
+		// (loading, detailSeq), and the Go spec doesn't order the
+		// non-call m operand against the call — same gotcha as
+		// cycleFocus.
+		cmd := m.fetchFleetDetail(ctx)
+		return m, cmd
+	case "r":
+		if m.fleet.expanded != "" && !m.fleet.detail.loading && !m.fleetOffline(m.fleet.expanded) {
+			cmd := m.fetchFleetDetail(m.fleet.expanded)
+			return m, cmd
+		}
 		return m, nil
 	case "o":
 		ctx := m.fleetCursor()
@@ -157,6 +224,10 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterFocused = true
 		return m, nil
 	case "esc":
+		if m.fleet.expanded != "" {
+			m.fleet.expanded = ""
+			return m, nil
+		}
 		if m.filterText != "" {
 			m.filterText = ""
 			return m, nil
@@ -168,9 +239,12 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "1", "2", "3", "4", "5", "6":
 		// switchView will set the destination; restore the parked
-		// resource filter before it applies.
+		// resource filter and drop the expansion before it applies,
+		// exactly as leaveFleet does.
 		m.filterText = m.fleet.savedFilter
 		m.fleet.savedFilter = ""
+		m.fleet.expanded = ""
+		m.fleet.detail = fleetDetailState{}
 		return m.handleKey(k)
 	}
 	return m.handleKey(k)
@@ -262,7 +336,11 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 			m.fleetSectionHeader("NEEDS ATTENTION", m.Theme.StatusBad, len(g.Attention), width),
 		}})
 		for _, e := range g.Attention {
-			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: m.renderFleetCard(e, width)})
+			lines := m.renderFleetCard(e, width)
+			if e.St.Context == m.fleet.expanded {
+				lines = append(lines, m.renderFleetDetail(m.cardSpine(e), width)...)
+			}
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: lines})
 		}
 		blocks = append(blocks, blank)
 	}
@@ -271,8 +349,11 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 			m.fleetSectionHeader("HEALTHY", m.Theme.StatusOK, len(g.Healthy), width),
 		}})
 		for _, e := range g.Healthy {
-			blocks = append(blocks, fleetBlock{ctx: e.St.Context,
-				lines: []string{m.renderFleetCompactRow(e.St, width)}})
+			lines := []string{m.renderFleetCompactRow(e.St, width)}
+			if e.St.Context == m.fleet.expanded {
+				lines = append(lines, m.renderFleetDetail(m.Theme.StatusDim.Render("▏"), width)...)
+			}
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: lines})
 		}
 	}
 	if len(g.Starting) > 0 {
@@ -283,8 +364,11 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 			m.fleetSectionHeader("STARTING", m.Theme.Dim, len(g.Starting), width),
 		}})
 		for _, e := range g.Starting {
-			blocks = append(blocks, fleetBlock{ctx: e.St.Context,
-				lines: []string{m.renderFleetCompactRow(e.St, width)}})
+			lines := []string{m.renderFleetCompactRow(e.St, width)}
+			if e.St.Context == m.fleet.expanded {
+				lines = append(lines, m.renderFleetDetail(m.Theme.StatusDim.Render("▏"), width)...)
+			}
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: lines})
 		}
 	}
 	if len(g.Offline) > 0 {
@@ -295,8 +379,11 @@ func (m Model) fleetBlocks(g fleetGroups, width int) []fleetBlock {
 			m.fleetSectionHeader("OFFLINE", m.Theme.Dim, len(g.Offline), width),
 		}})
 		for _, e := range g.Offline {
-			blocks = append(blocks, fleetBlock{ctx: e.St.Context,
-				lines: []string{m.renderFleetCompactRow(e.St, width)}})
+			lines := []string{m.renderFleetCompactRow(e.St, width)}
+			if e.St.Context == m.fleet.expanded {
+				lines = append(lines, m.renderFleetOfflineDetail(e.St, width)...)
+			}
+			blocks = append(blocks, fleetBlock{ctx: e.St.Context, lines: lines})
 		}
 	}
 	return blocks
@@ -534,4 +621,125 @@ func (m Model) sampleFleetTrends() {
 		}
 		r.push(pct(st.UsageMemBytes, st.AllocMemBytes), st.MetricsAt)
 	}
+}
+
+// fetchFleetDetail dispatches the on-demand drill-down for ctx. The
+// previous result stays visible through a same-cluster refresh, but a
+// different cluster's rows must never show under this card.
+func (m *Model) fetchFleetDetail(ctx string) tea.Cmd {
+	if m.OnFleetDetail == nil {
+		return nil
+	}
+	prev := m.fleet.detail.result
+	if prev.Context != ctx {
+		prev = cluster.FleetDetailResult{}
+	}
+	m.fleet.detail = fleetDetailState{loading: true, result: prev}
+	m.fleet.detailSeq++
+	seq := m.fleet.detailSeq
+	cb := m.OnFleetDetail
+	return func() tea.Msg { return FleetDetailMsg{Seq: seq, Result: cb(ctx)} }
+}
+
+// renderFleetDetail renders the fetched drill-down under an expanded
+// cluster. Everything here is cluster-produced text: it goes through
+// cleanDetail + the plain truncate pipeline, never raw ANSI.
+func (m Model) renderFleetDetail(spine string, width int) []string {
+	th := m.Theme
+	d := m.fleet.detail
+	pad := spine + "     "
+	if d.result.At.IsZero() {
+		return []string{pad + th.Dim.Render("… fetching details")}
+	}
+	r := d.result
+	var lines []string
+	if r.Err != "" {
+		lines = append(lines, pad+th.StatusBad.Render("✗ ")+
+			truncate("detail fetch: "+cleanDetail(r.Err), width-10))
+	}
+	half := width / 2
+	if half < 20 {
+		half = 20
+	}
+	for _, p := range r.Pods {
+		s := pad + th.Dim.Render("pod ") + truncate(p.Namespace+"/"+p.Name, half) +
+			" " + th.styleForPhase(corev1.PodPhase(p.Phase)).Render(p.Phase)
+		if p.Reason != "" {
+			s += " " + th.StatusWrn.Render(truncate(cleanDetail(p.Reason), 24))
+		}
+		if p.Restarts > 0 {
+			s += " " + restartStyle(p.Restarts, th).Render(fmt.Sprintf("↻%d", p.Restarts))
+		}
+		lines = append(lines, s)
+	}
+	for _, dep := range r.Deploys {
+		lines = append(lines, pad+th.Dim.Render("dep ")+
+			truncate(dep.Namespace+"/"+dep.Name, half)+" "+
+			readyStyle(int(dep.Ready), int(dep.Desired), th).Render(
+				fmt.Sprintf("%d/%d", dep.Ready, dep.Desired)))
+	}
+	for _, ev := range r.Events {
+		head := pad + th.Dim.Render("evt ") +
+			th.StatusWrn.Render(truncate(cleanDetail(ev.Reason), 24)) +
+			th.Dim.Render(fmt.Sprintf(" ×%d %s ", ev.Count, formatAge(ev.LastSeen)))
+		if avail := width - lipgloss.Width(head) - 1; avail > 4 {
+			head += truncate(cleanDetail(ev.Message), avail)
+		}
+		lines = append(lines, head)
+	}
+	if r.Err == "" && len(r.Pods)+len(r.Deploys)+len(r.Events) == 0 {
+		lines = append(lines, pad+th.Dim.Render("no problem detail — pods, deployments and events look clean"))
+	}
+	status := fmt.Sprintf("fetched %s ago · r to refresh · Enter to collapse", formatAge(r.At))
+	if d.loading {
+		status = "… refreshing"
+	}
+	lines = append(lines, pad+th.Dim.Render(status))
+	return lines
+}
+
+// cleanDetail strips terminal control characters (ESC/CSI/OSC, BEL,
+// the whole C0/C1 range) out of cluster-sourced strings and flattens
+// whitespace, so an event message can neither inject layout rows nor
+// smuggle escape sequences to the terminal. strings.Fields alone only
+// handles whitespace — ESC is not whitespace.
+func cleanDetail(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// fleetOffline reports whether ctx is currently classified offline —
+// the states whose detail cannot be fetched, only explained.
+func (m Model) fleetOffline(ctx string) bool {
+	st, ok := m.Store.Get(ctx)
+	return ok && (st.Reach == model.ReachUnreachable || st.Reach == model.ReachAuthFailed)
+}
+
+// renderFleetOfflineDetail is the expanded panel for an offline
+// cluster: the full reason and the probe age — everything kubetin
+// actually knows, and no claim about anything it cannot.
+func (m Model) renderFleetOfflineDetail(st model.ClusterState, width int) []string {
+	th := m.Theme
+	pad := th.StatusDim.Render("▏") + "     "
+	label := "unreachable"
+	if st.Reach == model.ReachAuthFailed {
+		label = "auth failed — a re-login may fix this"
+	}
+	lines := []string{pad + th.StatusBad.Render("✕ ") + th.Dim.Render(label+" — details can't be fetched")}
+	if st.LastError != "" {
+		lines = append(lines, pad+truncate(cleanDetail(st.LastError), width-8))
+	}
+	status := "never probed successfully"
+	if !st.LastProbe.IsZero() {
+		status = fmt.Sprintf("last probe attempt %s ago", formatAge(st.LastProbe))
+	}
+	lines = append(lines, pad+th.Dim.Render(status+" · Enter to collapse"))
+	return lines
 }
