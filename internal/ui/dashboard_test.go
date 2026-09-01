@@ -413,6 +413,10 @@ func TestShortImage(t *testing.T) {
 		"nginx:1.25":                   "nginx:1.25",
 		"library/nginx:1.25":           "library/nginx:1.25",
 		"docker.io/library/nginx:1.25": "library/nginx:1.25",
+		"ghcr.io/fmidev/api@sha256:" + strings.Repeat("ab", 32):     "fmidev/api@sha256:abababababab…",
+		"nginx@sha256:" + strings.Repeat("cd", 32):                  "nginx@sha256:cdcdcdcdcdcd…",
+		"ghcr.io/fmidev/api:1.2@sha256:" + strings.Repeat("ef", 32): "fmidev/api:1.2@sha256:efefefefefef…",
+		"fmidev/api@sha256:short":                                   "fmidev/api@sha256:short",
 	}
 	for in, want := range cases {
 		if got := shortImage(in); got != want {

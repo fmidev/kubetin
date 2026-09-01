@@ -168,11 +168,11 @@ func restartStyle(n int32, th Theme) lipgloss.Style {
 // but is the first to go when the pane narrows — the state and restart
 // count are what you scan for.
 var dashContainerColumns = []column{
-	{min: 12, max: 22, prio: 0}, // NAME
-	{min: 10, max: 16, prio: 1}, // STATE
-	{min: 3, max: 4, prio: 2},   // RESTARTS
-	{min: 9, max: 13, prio: 3},  // MEM
-	{min: 14, max: 46, prio: 4}, // IMAGE
+	{min: 12, max: 22, prio: 0},  // NAME
+	{min: 10, max: 16, prio: 1},  // STATE
+	{min: 3, max: 4, prio: 2},    // RESTARTS
+	{min: 9, max: 13, prio: 3},   // MEM
+	{min: 14, max: 100, prio: 4}, // IMAGE
 }
 
 // renderDashContainers lists init containers (prefixed) then regular
@@ -194,7 +194,7 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 			padCol(state, cw[1], style),
 			padColRight(fmt.Sprintf("%d", ci.Restarts), cw[2], restartStyle(ci.Restarts, th)),
 			padCellANSIRight(containerMemCell(ci, r, th), cw[3]),
-			padCol(shortImage(ci.Image), cw[4], th.Dim),
+			padCol(truncateHead(shortImage(ci.Image), cw[4]), cw[4], th.Dim),
 		))
 		if detail := containerDetail(ci); detail != "" {
 			lines = append(lines, " "+th.Dim.Render("  └ ")+
@@ -284,9 +284,17 @@ func containerDetail(ci cluster.ContainerInfo) string {
 
 // shortImage drops the registry host so the tag stays visible when the
 // column is tight — "ghcr.io/fmidev/api:1.2" → "fmidev/api:1.2".
+// Digest pins keep the conventional leading 12 hex chars — a full
+// 64-hex sha256 would push the repo name out of any column, and the
+// head is the part people compare against kubectl output.
 func shortImage(img string) string {
 	if i := strings.IndexByte(img, '/'); i >= 0 && strings.ContainsAny(img[:i], ".:") {
-		return img[i+1:]
+		img = img[i+1:]
+	}
+	if at := strings.LastIndexByte(img, '@'); at >= 0 {
+		if h := strings.LastIndexByte(img, ':'); h > at && len(img)-h-1 > 12 {
+			img = img[:h+13] + "…"
+		}
 	}
 	return img
 }

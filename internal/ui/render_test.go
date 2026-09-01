@@ -296,6 +296,34 @@ func TestTruncateLeavesFittingContentAlone(t *testing.T) {
 	}
 }
 
+// truncateHead keeps the tail — the image tag at the end of a ref is
+// the part worth preserving, so the cut and the "…" land at the front.
+func TestTruncateHeadKeepsTail(t *testing.T) {
+	cases := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"fmidev/smartmet-server-backend:25.3.14-2", 20, "…r-backend:25.3.14-2"},
+		{"fmidev/api:1.2", 20, "fmidev/api:1.2"},
+		{"fmidev/api:1.2", 14, "fmidev/api:1.2"},
+		{"abcdef", 3, "…ef"},
+		{"anything", 0, ""},
+	}
+	for _, tc := range cases {
+		if got := truncateHead(tc.in, tc.n); got != tc.want {
+			t.Errorf("truncateHead(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+		}
+	}
+	for _, in := range []string{strings.Repeat("世界", 40), strings.Repeat("🔥", 30), "pod-" + strings.Repeat("日本語", 20)} {
+		for _, n := range []int{1, 2, 10, 21} {
+			if w := lipgloss.Width(truncateHead(in, n)); w > n {
+				t.Errorf("truncateHead(_, %d) = %d cells", n, w)
+			}
+		}
+	}
+}
+
 // padCol is the primitive every table cell goes through, so a
 // rune-counting truncate made whole tables overflow their pane — 39
 // cells when asked for 20.
