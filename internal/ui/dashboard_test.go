@@ -404,6 +404,29 @@ func TestDashboardSkipsLogsWhenDenied(t *testing.T) {
 	}
 }
 
+// The header row stays pinned while the rows scroll under it.
+func TestDashContainersHeaderPinned(t *testing.T) {
+	m := Model{Theme: DefaultTheme()}
+	var infos []cluster.ContainerInfo
+	for i := 0; i < 8; i++ {
+		infos = append(infos, cluster.ContainerInfo{
+			Name: fmt.Sprintf("c%d", i), Image: "img:1", Ready: true,
+			State: cluster.ContainerReady,
+		})
+	}
+	r := podRow{ContainerInfo: infos}
+	out := strings.Split(m.renderDashContainers(r, 60, 4, 3), "\n")
+	if !strings.Contains(out[0], "NAME") || !strings.Contains(out[0], "IMAGE") {
+		t.Errorf("scrolled pane lost its header: %q", out[0])
+	}
+	if len(out) != 4 {
+		t.Errorf("pane is %d lines, want 4", len(out))
+	}
+	if !strings.Contains(out[1], "c3") {
+		t.Errorf("scroll 3 should start the body at c3: %q", out[1])
+	}
+}
+
 // A short NAME and STATE must not soak up pane width as blank padding
 // while the image sits truncated: the content columns clamp to their
 // widest actual cell and IMAGE absorbs the rest.

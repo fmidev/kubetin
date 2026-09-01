@@ -223,9 +223,9 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 			))
 		}
 		if len(lines) == 0 {
-			lines = []string{" " + th.Dim.Render("no containers reported")}
+			return dashPaneBody([]string{" " + th.Dim.Render("no containers reported")}, w, h, 0)
 		}
-		return dashPaneBody(lines, w, h, 0)
+		return dashPaneBody(append([]string{dashContainerHeader(cw, th)}, lines...), w, h, 0)
 	}
 
 	// fitColumns grows every column toward its max round-robin, so
@@ -263,7 +263,26 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 				th.StatusBad.Render(truncate(rw.detail, w-5)))
 		}
 	}
-	return dashPaneBody(lines, w, h, scroll)
+
+	// The header is pinned: scrolling moves the rows under it, not
+	// the labels off-screen. Natural-height mode returns everything —
+	// the stacked layout windows the pane itself.
+	header := dashContainerHeader(cw, th)
+	if h <= 0 {
+		return header + "\n" + strings.Join(lines, "\n")
+	}
+	body, _ := scrollWindow(strings.Join(lines, "\n"), scroll, h-1)
+	return clampCanvas(header+"\n"+body, w, h)
+}
+
+func dashContainerHeader(cw []int, th Theme) string {
+	return " " + joinCells(
+		padCol("NAME", cw[0], th.Header),
+		padCol("STATE", cw[1], th.Header),
+		padColRight("↺", cw[2], th.Header),
+		padColRight("MEM", cw[3], th.Header),
+		padCol("IMAGE", cw[4], th.Header),
+	)
 }
 
 // containerMemCell renders "usage/limit" with the usage coloured by
