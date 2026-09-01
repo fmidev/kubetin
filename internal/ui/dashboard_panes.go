@@ -180,50 +180,89 @@ var dashContainerColumns = []column{
 // container that is failing.
 func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 	th := m.Theme
-	cw := fitColumns(dashContainerColumns, w-1)
 
-	var lines []string
-	emit := func(ci cluster.ContainerInfo, init bool) {
+	type ctrRow struct {
+		name, state, restarts, mem, image, detail string
+		stateStyle, restartsStyle                 lipgloss.Style
+	}
+	var rows []ctrRow
+	add := func(ci cluster.ContainerInfo, init bool) {
 		name := ci.Name
 		if init {
 			name = "init:" + name
 		}
 		state, style := containerStateLabel(ci, th)
-		lines = append(lines, " "+joinCells(
-			padCol(name, cw[0], th.Base),
-			padCol(state, cw[1], style),
-			padColRight(fmt.Sprintf("%d", ci.Restarts), cw[2], restartStyle(ci.Restarts, th)),
-			padCellANSIRight(containerMemCell(ci, r, th), cw[3]),
-			padCol(truncateHead(shortImage(ci.Image), cw[4]), cw[4], th.Dim),
-		))
-		if detail := containerDetail(ci); detail != "" {
-			lines = append(lines, " "+th.Dim.Render("  └ ")+
-				th.StatusBad.Render(truncate(detail, w-5)))
-		}
+		rows = append(rows, ctrRow{
+			name:          name,
+			state:         state,
+			restarts:      fmt.Sprintf("%d", ci.Restarts),
+			mem:           containerMemCell(ci, r, th),
+			image:         shortImage(ci.Image),
+			detail:        containerDetail(ci),
+			stateStyle:    style,
+			restartsStyle: restartStyle(ci.Restarts, th),
+		})
 	}
-
 	for _, ci := range r.InitContainerInfo {
-		emit(ci, true)
+		add(ci, true)
 	}
 	for _, ci := range r.ContainerInfo {
-		emit(ci, false)
+		add(ci, false)
 	}
 
 	// Before kubelet reports any status the pod still has spec
 	// container names — show those rather than an empty pane, so a
 	// freshly-scheduled pod doesn't look broken.
-	if len(lines) == 0 {
+	if len(rows) == 0 {
+		cw := fitColumns(dashContainerColumns, w-1)
+		var lines []string
 		for _, name := range r.Containers {
 			lines = append(lines, " "+joinCells(
 				padCol(name, cw[0], th.Base),
 				padCol("pending", cw[1], th.Dim),
 			))
 		}
-	}
-	if len(lines) == 0 {
-		return dashPaneBody([]string{" " + th.Dim.Render("no containers reported")}, w, h, 0)
+		if len(lines) == 0 {
+			lines = []string{" " + th.Dim.Render("no containers reported")}
+		}
+		return dashPaneBody(lines, w, h, 0)
 	}
 
+	// fitColumns grows every column toward its max round-robin, so
+	// NAME and STATE would spend the pane's spare width on blank
+	// padding whenever their content is short, while IMAGE — the one
+	// column that routinely overflows — stays starved. Clamp each
+	// max to the widest actual cell first; the width those columns
+	// don't need flows to IMAGE.
+	var nameW, stateW, restartsW, memW int
+	for _, rw := range rows {
+		nameW = max(nameW, lipgloss.Width(rw.name))
+		stateW = max(stateW, lipgloss.Width(rw.state))
+		restartsW = max(restartsW, lipgloss.Width(rw.restarts))
+		memW = max(memW, lipgloss.Width(rw.mem))
+	}
+	cols := append([]column(nil), dashContainerColumns...)
+	for i, want := range []int{nameW, stateW, restartsW, memW} {
+		if want = max(want, cols[i].min); want < cols[i].max {
+			cols[i].max = want
+		}
+	}
+	cw := fitColumns(cols, w-1)
+
+	var lines []string
+	for _, rw := range rows {
+		lines = append(lines, " "+joinCells(
+			padCol(rw.name, cw[0], th.Base),
+			padCol(rw.state, cw[1], rw.stateStyle),
+			padColRight(rw.restarts, cw[2], rw.restartsStyle),
+			padCellANSIRight(rw.mem, cw[3]),
+			padCol(truncateHead(rw.image, cw[4]), cw[4], th.Dim),
+		))
+		if rw.detail != "" {
+			lines = append(lines, " "+th.Dim.Render("  └ ")+
+				th.StatusBad.Render(truncate(rw.detail, w-5)))
+		}
+	}
 	return dashPaneBody(lines, w, h, scroll)
 }
 

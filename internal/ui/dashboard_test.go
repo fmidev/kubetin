@@ -404,6 +404,21 @@ func TestDashboardSkipsLogsWhenDenied(t *testing.T) {
 	}
 }
 
+// A short NAME and STATE must not soak up pane width as blank padding
+// while the image sits truncated: the content columns clamp to their
+// widest actual cell and IMAGE absorbs the rest.
+func TestDashContainersGiveSpareWidthToImage(t *testing.T) {
+	m := Model{Theme: DefaultTheme()}
+	r := podRow{ContainerInfo: []cluster.ContainerInfo{{
+		Name: "smartmetserver", Image: "ghcr.io/fmidev/smartmetserver:26.08.01",
+		Ready: true, State: cluster.ContainerReady,
+	}}}
+	out := m.renderDashContainers(r, 80, 4, 0)
+	if !strings.Contains(out, "fmidev/smartmetserver:26.08.01") {
+		t.Errorf("image truncated despite spare width:\n%s", out)
+	}
+}
+
 // shortImage should drop a registry host but leave a bare repo alone —
 // "nginx:1.2" has no host to strip.
 func TestShortImage(t *testing.T) {
