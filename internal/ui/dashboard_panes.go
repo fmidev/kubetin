@@ -210,57 +210,56 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 		add(ci, false)
 	}
 
-	// Before kubelet reports any status the pod still has spec
-	// container names — show those rather than an empty pane, so a
-	// freshly-scheduled pod doesn't look broken.
+	var cw []int
+	var lines []string
 	if len(rows) == 0 {
-		cw := fitColumns(dashContainerColumns, w-1)
-		var lines []string
+		// Before kubelet reports any status the pod still has spec
+		// container names — show those rather than an empty pane, so
+		// a freshly-scheduled pod doesn't look broken.
+		if len(r.Containers) == 0 {
+			return dashPaneBody([]string{" " + th.Dim.Render("no containers reported")}, w, h, 0)
+		}
+		cw = fitColumns(dashContainerColumns, w-1)
 		for _, name := range r.Containers {
 			lines = append(lines, " "+joinCells(
 				padCol(name, cw[0], th.Base),
 				padCol("pending", cw[1], th.Dim),
 			))
 		}
-		if len(lines) == 0 {
-			return dashPaneBody([]string{" " + th.Dim.Render("no containers reported")}, w, h, 0)
+	} else {
+		// fitColumns grows every column toward its max round-robin,
+		// so NAME and STATE would spend the pane's spare width on
+		// blank padding whenever their content is short, while IMAGE
+		// — the one column that routinely overflows — stays starved.
+		// Clamp each max to the widest actual cell first; the width
+		// those columns don't need flows to IMAGE.
+		var nameW, stateW, restartsW, memW int
+		for _, rw := range rows {
+			nameW = max(nameW, lipgloss.Width(rw.name))
+			stateW = max(stateW, lipgloss.Width(rw.state))
+			restartsW = max(restartsW, lipgloss.Width(rw.restarts))
+			memW = max(memW, lipgloss.Width(rw.mem))
 		}
-		return dashPaneBody(append([]string{dashContainerHeader(cw, th)}, lines...), w, h, 0)
-	}
-
-	// fitColumns grows every column toward its max round-robin, so
-	// NAME and STATE would spend the pane's spare width on blank
-	// padding whenever their content is short, while IMAGE — the one
-	// column that routinely overflows — stays starved. Clamp each
-	// max to the widest actual cell first; the width those columns
-	// don't need flows to IMAGE.
-	var nameW, stateW, restartsW, memW int
-	for _, rw := range rows {
-		nameW = max(nameW, lipgloss.Width(rw.name))
-		stateW = max(stateW, lipgloss.Width(rw.state))
-		restartsW = max(restartsW, lipgloss.Width(rw.restarts))
-		memW = max(memW, lipgloss.Width(rw.mem))
-	}
-	cols := append([]column(nil), dashContainerColumns...)
-	for i, want := range []int{nameW, stateW, restartsW, memW} {
-		if want = max(want, cols[i].min); want < cols[i].max {
-			cols[i].max = want
+		cols := append([]column(nil), dashContainerColumns...)
+		for i, want := range []int{nameW, stateW, restartsW, memW} {
+			if want = max(want, cols[i].min); want < cols[i].max {
+				cols[i].max = want
+			}
 		}
-	}
-	cw := fitColumns(cols, w-1)
+		cw = fitColumns(cols, w-1)
 
-	var lines []string
-	for _, rw := range rows {
-		lines = append(lines, " "+joinCells(
-			padCol(rw.name, cw[0], th.Base),
-			padCol(rw.state, cw[1], rw.stateStyle),
-			padColRight(rw.restarts, cw[2], rw.restartsStyle),
-			padCellANSIRight(rw.mem, cw[3]),
-			padCol(truncateHead(rw.image, cw[4]), cw[4], th.Dim),
-		))
-		if rw.detail != "" {
-			lines = append(lines, " "+th.Dim.Render("  └ ")+
-				th.StatusBad.Render(truncate(rw.detail, w-5)))
+		for _, rw := range rows {
+			lines = append(lines, " "+joinCells(
+				padCol(rw.name, cw[0], th.Base),
+				padCol(rw.state, cw[1], rw.stateStyle),
+				padColRight(rw.restarts, cw[2], rw.restartsStyle),
+				padCellANSIRight(rw.mem, cw[3]),
+				padCol(truncateHead(rw.image, cw[4]), cw[4], th.Dim),
+			))
+			if rw.detail != "" {
+				lines = append(lines, " "+th.Dim.Render("  └ ")+
+					th.StatusBad.Render(truncate(rw.detail, w-5)))
+			}
 		}
 	}
 

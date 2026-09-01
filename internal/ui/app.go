@@ -2226,7 +2226,14 @@ func truncateHead(s string, n int) string {
 	if w <= n {
 		return s
 	}
-	return runewidth.TruncateLeft(s, w-n+1, "…")
+	// "…" is East-Asian-ambiguous — two cells under a CJK locale — so
+	// measure it rather than assuming one.
+	const ell = "…"
+	ew := runewidth.StringWidth(ell)
+	if ew > n {
+		return runewidth.TruncateLeft(s, w-n, "")
+	}
+	return runewidth.TruncateLeft(s, w-n+ew, ell)
 }
 
 // styleForReach delegates the cluster reach colour to the theme.

@@ -657,14 +657,6 @@ func stackedInnerWidth(w int) int {
 	return inner
 }
 
-// sizeStackedPane windows already-rendered natural content down to a
-// pane's height. Equivalent to asking the pane renderer for that
-// height directly, without paying to build the content again.
-func sizeStackedPane(natural string, w, h, scroll int) string {
-	body, _ := scrollWindow(natural, scroll, h)
-	return clampCanvas(body, w, h)
-}
-
 // stackedPaneTop is the body row each stacked pane's box starts on,
 // used to scroll the canvas far enough to reveal it.
 func (m Model) stackedPaneTop(p dashboardPane, statusH, mainH, eventsH int) int {
@@ -710,14 +702,12 @@ func (m Model) stackedLayout(sub dashSubject, w, h int) stackedGeom {
 	g.status, g.main, g.events, g.logs = resolveStackedHeights(
 		sub.statusHeight(), lineCount(naturalMain), dashEventLineCount(eventRows), h)
 
-	// The owned-pod list windows around its cursor rather than a
-	// scroll offset, so that one can't be reproduced by trimming the
-	// natural render — but its expensive part (resolving and sorting
-	// the pods) already happened in dashSubjectNow.
-	sizedMain := sizeStackedPane(naturalMain, inner, g.main, m.dashboard.scroll[dashPaneMain])
-	if sub.isDeploy() {
-		sizedMain = m.renderDashMain(sub, inner, g.main)
-	}
+	// Rendered again at the resolved height rather than trimmed from
+	// naturalMain: the containers pane pins its header above the
+	// scroll window and the owned-pod list windows around its cursor,
+	// neither of which trimming can reproduce. Both renders are cheap
+	// — the pane the one-pass discipline exists for is events.
+	sizedMain := m.renderDashMain(sub, inner, g.main)
 
 	g.body = strings.Join([]string{
 		dashStackedBox(m.dashTitle(t),
