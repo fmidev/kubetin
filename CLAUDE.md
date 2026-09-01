@@ -9,7 +9,7 @@ cmd/kubetin/        main, watch coordinator, log forwarder, trust prompt, versio
 internal/cluster/   supervisor, probe, watchers (pod/node/deploy/event), focusedmetrics, networkpoll, logstream, describe, mutate (Scale/Rollout), auth (CanI/Delete)
 internal/kubeconfig/  per-file discovery + content-hash trust list
 internal/model/     Store with field-owning Apply methods (ProbeFields / MetricsFields)
-internal/ui/        bubbletea Model/Update/View, modals, sort, filter, sidebar, header, fleet overview, log viewer
+internal/ui/        bubbletea Model/Update/View, modals, sort, filter, sidebar, header, fleet dashboard (fleet.go/fleethealth.go), log viewer
 ```
 
 ## Build / run
@@ -59,6 +59,8 @@ Without this, a stale event from a cluster the user just Tabbed away from lands 
 
 Log streams use a session ID instead of context (multiple streams to the same context are valid). `startLogs` increments `m.logs.session`, every emitted log message is tagged with it, the receiver drops mismatches.
 
+An identity guard alone is NOT enough when the *same* key can have overlapping requests. The fleet detail panel learned this the hard way (#73 review): collapse + re-expand dispatches a second fetch for the same cluster, and the older in-flight result would pass a context-only guard and overwrite the newer one. `FleetDetailMsg{Seq, Result}` carries a generation from `m.fleet.detailSeq`; the receiver requires the newest. Corollary: every path that abandons a request must advance the generation and clear its loading flag — including early returns that skip the normal dispatch helper (the offline-expand path shipped that bug).
+
 `PermissionResultMsg` is correct by a different shape: its cache key already encodes `ctxName`, so cross-cluster results land in different buckets.
 
 ## Per-cluster Store mutation
@@ -103,7 +105,7 @@ Process startup runs `silenceStderr()` (cmd/kubetin/stderr_unix.go): `dup(2)` sa
 - **Stale `bin/kubetin`** — `go build ./...` does not update `bin/kubetin`. Always build with `-o bin/kubetin`.
 - **Sidebar separator** — `strings.Repeat("│\n", h)` produces `h+1` rows; the trailing `\n` becomes a phantom blank row that JoinVertical treats as content. The `clampCanvas` body wrap covers this now but be aware.
 - **Sort arrow color** — `Theme.Title.Render("▲")` then concat onto a `Theme.Header.Render(label)` is the pattern for mixed-style headers. Pass through `padCellANSI`, never `padCol`.
-- **`return m, m.cycleFocus(+1)`** — Go spec doesn't guarantee left-to-right evaluation of non-call operands. Assign `cmd := m.cycleFocus(+1); return m, cmd` for any pattern where the method mutates `m`.
+- **`return m, m.cycleFocus(+1)`** — Go spec doesn't guarantee left-to-right evaluation of non-call operands. Assign `cmd := m.cycleFocus(+1); return m, cmd` for any pattern where the method mutates `m`. This keeps recurring — it was reintroduced with `fetchFleetDetail` (#73) and found pre-existing on the dashboard log cmds (#75). Before pushing, grep `return m, m\.` and check the method's receiver.
 - **Raw log bytes** — pods colour their output (smartmetserver does), and
   nothing stops one emitting a cursor move or an OSC title set. `applyLogLines`
   runs every line through `sanitizeLogLine` (text + `CSI … m` only); both
@@ -111,6 +113,12 @@ Process startup runs `silenceStderr()` (cmd/kubetin/stderr_unix.go): `dup(2)` sa
   colour the line left open. Feeding a coloured line to `truncate` counted the
   escape bytes as visible cells, dropped the closing `ESC[39m`, and the colour
   bled over the whole UI — surviving Esc out of the viewer.
+- **Control characters hide beyond `CSI … m`** — `strings.Fields` / whitespace
+  handling does NOT strip ESC, BEL, OSC or the rest of C0/C1, so "flattened"
+  cluster text (event messages, container reasons) could still smuggle a
+  terminal title-set or cursor move to the screen. Any cluster-sourced string
+  that skips the log pipeline must go through a control stripper first
+  (`cleanDetail` in fleet.go: `unicode.IsControl` → space, then flatten).
 - **Footer height varies** — `lipgloss.Height(footer)` returns 2 when filter is focused or has content, 1 otherwise. `bodyHeight` math depends on this.
 
 ## What NOT to do
