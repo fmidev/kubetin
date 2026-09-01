@@ -197,10 +197,16 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.fleet.detailSeq++
 			return m, nil
 		}
-		return m, m.fetchFleetDetail(ctx)
+		// Assigned before the return: fetchFleetDetail mutates m
+		// (loading, detailSeq), and the Go spec doesn't order the
+		// non-call m operand against the call — same gotcha as
+		// cycleFocus.
+		cmd := m.fetchFleetDetail(ctx)
+		return m, cmd
 	case "r":
 		if m.fleet.expanded != "" && !m.fleet.detail.loading && !m.fleetOffline(m.fleet.expanded) {
-			return m, m.fetchFleetDetail(m.fleet.expanded)
+			cmd := m.fetchFleetDetail(m.fleet.expanded)
+			return m, cmd
 		}
 		return m, nil
 	case "o":
