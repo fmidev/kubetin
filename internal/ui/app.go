@@ -2214,6 +2214,28 @@ func truncate(s string, n int) string {
 	return runewidth.Truncate(s, n, "…")
 }
 
+// truncateHead fits s into n cells by cutting from the front, with
+// "…" in the leading cell when truncation occurred. For values whose
+// tail is the informative part — image refs, where the pinned tag
+// sits at the end.
+func truncateHead(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	w := runewidth.StringWidth(s)
+	if w <= n {
+		return s
+	}
+	// "…" is East-Asian-ambiguous — two cells under a CJK locale — so
+	// measure it rather than assuming one.
+	const ell = "…"
+	ew := runewidth.StringWidth(ell)
+	if ew > n {
+		return runewidth.TruncateLeft(s, w-n, "")
+	}
+	return runewidth.TruncateLeft(s, w-n+ew, ell)
+}
+
 // styleForReach delegates the cluster reach colour to the theme.
 func (t Theme) styleForReach(r model.Reach) lipgloss.Style {
 	switch r {
