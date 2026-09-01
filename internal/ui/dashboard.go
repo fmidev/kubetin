@@ -102,7 +102,11 @@ func (m Model) openDashboard(ref cluster.DescribeRef, uid types.UID) (tea.Model,
 	m.dashboard.scroll = [dashPaneCount]int{}
 	m.dashboard.podCursor = 0
 	m.prepareLogTarget(t)
-	return m, m.startDashboardLogs()
+	// Assigned before the return: startDashboardLogs mutates m and the
+	// Go spec doesn't order the non-call m operand against the call —
+	// the cycleFocus gotcha.
+	cmd := m.startDashboardLogs()
+	return m, cmd
 }
 
 // prepareLogTarget picks which pod the log pane streams. A Deployment
@@ -192,7 +196,8 @@ func (m *Model) startDashboardLogs() tea.Cmd {
 // closeDashboard tears down the whole stack and stops the stream.
 func (m Model) closeDashboard() (tea.Model, tea.Cmd) {
 	m.dashboard = dashboardState{}
-	return m, m.stopDashboardLogs()
+	cmd := m.stopDashboardLogs()
+	return m, cmd
 }
 
 // popDashboard returns to the previous target, or closes when this was
@@ -205,7 +210,8 @@ func (m Model) popDashboard() (tea.Model, tea.Cmd) {
 	m.dashboard.scroll = [dashPaneCount]int{}
 	t, _ := m.dashboard.target()
 	m.prepareLogTarget(t)
-	return m, m.startDashboardLogs()
+	cmd := m.startDashboardLogs()
+	return m, cmd
 }
 
 func (m *Model) stopDashboardLogs() tea.Cmd {
