@@ -221,6 +221,8 @@ type Model struct {
 	// idle". When OK=false the UI hides the network panels entirely.
 	clusterNetRX, clusterNetTX int64
 	clusterNetOK               bool
+	netHistory                 netRing
+	restartBaseline            map[types.UID]int32 // first-seen restart count per pod, see noteRestartBaseline
 
 	namespace       string // empty = all namespaces
 	nsPickerOpen    bool
@@ -284,6 +286,7 @@ func New(context string, store *model.Store, contexts []string) Model {
 		permissions:         make(map[string]permState),
 		permissionsInFlight: make(map[string]struct{}),
 		fleetTrends:         make(map[string]*trendRing),
+		restartBaseline:     make(map[types.UID]int32),
 	}
 }
 
@@ -366,6 +369,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
+		noteRestartBaseline(m.restartBaseline, msg.UID, msg.Restarts, msg.Kind == cluster.PodDeleted)
 		applyPodEvent(m.pods, cluster.PodEvent(msg))
 		m.syncedPods = true
 		// Guard cursor wipe to ViewPods only — non-pod views park the
@@ -664,6 +668,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clusterNetRX = msg.Cluster.RXBytesPerSec
 		m.clusterNetTX = msg.Cluster.TXBytesPerSec
 		m.clusterNetOK = true
+		m.netHistory.push(msg.Cluster.RXBytesPerSec, msg.Cluster.TXBytesPerSec, msg.At)
 		return m, nil
 
 	case MetricsSnapshotMsg:
@@ -730,6 +735,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncedServices, m.syncedIngresses = false, false
 		m.syncStartedAt = time.Now()
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
+		m.netHistory = netRing{}
+		m.restartBaseline = make(map[types.UID]int32)
 		// A scoped object on the previous cluster doesn't exist on the
 		// new one — close the lens rather than leave it filtered down
 		// to zero matches with no obvious way to recover. The

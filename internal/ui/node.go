@@ -28,6 +28,9 @@ type nodeRow struct {
 	CreatedAt   time.Time
 	Updated     time.Time
 
+	AllocCPUMilli int64
+	AllocMemBytes int64
+
 	CPUMilli   int64
 	MemBytes   int64
 	HasMetrics bool
@@ -53,6 +56,9 @@ func applyNodeEvent(m map[types.UID]nodeRow, ev cluster.NodeEvent) {
 			Schedulable: ev.Schedulable,
 			CreatedAt:   ev.CreatedAt,
 			Updated:     time.Now(),
+
+			AllocCPUMilli: ev.AllocCPUMilli,
+			AllocMemBytes: ev.AllocMemBytes,
 		}
 	}
 }
