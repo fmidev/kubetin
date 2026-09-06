@@ -265,7 +265,7 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 
 	// The header is pinned: scrolling moves the rows under it, not
 	// the labels off-screen. Natural-height mode returns everything —
-	// the stacked layout windows the pane itself.
+	// callers use it to measure the pane before rendering at height.
 	header := dashContainerHeader(cw, th)
 	if h <= 0 {
 		return header + "\n" + strings.Join(lines, "\n")
