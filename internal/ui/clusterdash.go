@@ -162,7 +162,7 @@ func (m Model) clusterStats() clusterStats {
 			pending = append(pending, pendingPod{p, reason})
 		}
 	}
-	s.restartsDelta = restartDelta(m.pods, m.restartBaseline)
+	s.restartsDelta = restartDelta(m.pods, m.restartBaseline, m.namespace)
 	sort.Slice(s.topCPU, func(i, j int) bool {
 		if s.topCPU[i].CPUMilli != s.topCPU[j].CPUMilli {
 			return s.topCPU[i].CPUMilli > s.topCPU[j].CPUMilli

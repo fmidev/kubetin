@@ -112,6 +112,13 @@ func (p *FocusedMetricsPoller) tick(parent context.Context, mc *metricsclientset
 	// namespace-restricted users on the same RBAC rules as core/pods.
 	pmList, perr := mc.MetricsV1beta1().PodMetricses(scopedNS).List(pollCtx, metav1.ListOptions{})
 	if perr != nil {
+		if parent.Err() != nil {
+			// Cancelled by a focus switch, not a cluster failure. A
+			// late OK=false here could land after the replacement
+			// poller's first success for the same context and mark
+			// its metrics unavailable.
+			return
+		}
 		snap.OK = false
 		snap.Error = perr.Error()
 		p.send(snap)
@@ -151,6 +158,9 @@ func (p *FocusedMetricsPoller) tick(parent context.Context, mc *metricsclientset
 	}
 	nmList, nerr := mc.MetricsV1beta1().NodeMetricses().List(pollCtx, metav1.ListOptions{})
 	if nerr != nil {
+		if parent.Err() != nil {
+			return
+		}
 		// Mirror the pod-list error path above: surface the failure
 		// instead of returning a half-empty snapshot with OK=true,
 		// which the UI would interpret as "node metrics are healthy

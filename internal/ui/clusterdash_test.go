@@ -84,6 +84,10 @@ func TestClusterStatsRespectNamespaceScope(t *testing.T) {
 	if s.podsTotal != 4 || s.pending != 0 || s.deploysTotal != 2 || s.warnEvents != 1 {
 		t.Errorf("scoped: pods %d pend %d deploys %d warn %d", s.podsTotal, s.pending, s.deploysTotal, s.warnEvents)
 	}
+	m.namespace = "default"
+	if d := m.clusterStats().restartsDelta; d != 0 {
+		t.Errorf("restart delta in default should ignore prod's +3, got %d", d)
+	}
 	for _, u := range s.unhealthy {
 		if strings.HasPrefix(u.text, "default/") {
 			t.Errorf("out-of-scope workload listed: %s", u.text)

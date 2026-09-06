@@ -38,7 +38,7 @@ func TestRestartDeltaCountsOnlySinceFirstSeen(t *testing.T) {
 	pods["a"] = podRow{UID: "a", Restarts: 7}
 	noteRestartBaseline(base, "b", 0, false)
 	pods["b"] = podRow{UID: "b", Restarts: 0}
-	if d := restartDelta(pods, base); d != 0 {
+	if d := restartDelta(pods, base, ""); d != 0 {
 		t.Fatalf("fresh baseline delta = %d, want 0", d)
 	}
 
@@ -47,13 +47,13 @@ func TestRestartDeltaCountsOnlySinceFirstSeen(t *testing.T) {
 	pods["a"] = podRow{UID: "a", Restarts: 9}
 	noteRestartBaseline(base, "b", 1, false)
 	pods["b"] = podRow{UID: "b", Restarts: 1}
-	if d := restartDelta(pods, base); d != 3 {
+	if d := restartDelta(pods, base, ""); d != 3 {
 		t.Errorf("delta = %d, want 3", d)
 	}
 
 	// A count that went down clamps to zero for that pod.
 	pods["a"] = podRow{UID: "a", Restarts: 2}
-	if d := restartDelta(pods, base); d != 1 {
+	if d := restartDelta(pods, base, ""); d != 1 {
 		t.Errorf("delta after reset = %d, want 1", d)
 	}
 
@@ -65,7 +65,18 @@ func TestRestartDeltaCountsOnlySinceFirstSeen(t *testing.T) {
 	}
 	noteRestartBaseline(base, "b", 5, false)
 	pods["b"] = podRow{UID: "b", Restarts: 5}
-	if d := restartDelta(pods, base); d != 0 {
+	if d := restartDelta(pods, base, ""); d != 0 {
 		t.Errorf("delta after re-add = %d, want 0", d)
+	}
+
+	// Namespace scope: only in-scope pods contribute.
+	pods["a"] = podRow{UID: "a", Namespace: "prod", Restarts: 9}
+	pods["c"] = podRow{UID: "c", Namespace: "dev", Restarts: 4}
+	noteRestartBaseline(base, "c", 1, false)
+	if d := restartDelta(pods, base, "prod"); d != 2 {
+		t.Errorf("scoped delta = %d, want 2", d)
+	}
+	if d := restartDelta(pods, base, "dev"); d != 3 {
+		t.Errorf("scoped delta = %d, want 3", d)
 	}
 }

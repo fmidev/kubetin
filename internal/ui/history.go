@@ -64,12 +64,15 @@ func noteRestartBaseline(baseline map[types.UID]int32, uid types.UID, restarts i
 }
 
 // restartDelta sums restarts accumulated by the currently cached pods
-// since each was first seen. Pods that vanished take their count with
-// them; a pod's count going down (container status reset) clamps to 0
-// rather than subtracting from the others.
-func restartDelta(pods map[types.UID]podRow, baseline map[types.UID]int32) int32 {
+// in namespace ("" = all) since each was first seen. Pods that vanished
+// take their count with them; a pod's count going down (container
+// status reset) clamps to 0 rather than subtracting from the others.
+func restartDelta(pods map[types.UID]podRow, baseline map[types.UID]int32, namespace string) int32 {
 	var total int32
 	for uid, p := range pods {
+		if namespace != "" && p.Namespace != namespace {
+			continue
+		}
 		if d := p.Restarts - baseline[uid]; d > 0 {
 			total += d
 		}
