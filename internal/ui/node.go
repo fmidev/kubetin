@@ -41,6 +41,9 @@ func applyNodeEvent(m map[types.UID]nodeRow, ev cluster.NodeEvent) {
 	case cluster.NodeDeleted:
 		delete(m, ev.UID)
 	default:
+		// Usage fields belong to MetricsSnapshotMsg; carry them over so
+		// a node status patch doesn't blank cpu/mem until the next poll.
+		prev := m[ev.UID]
 		m[ev.UID] = nodeRow{
 			UID:         ev.UID,
 			Name:        ev.Name,
@@ -59,6 +62,10 @@ func applyNodeEvent(m map[types.UID]nodeRow, ev cluster.NodeEvent) {
 
 			AllocCPUMilli: ev.AllocCPUMilli,
 			AllocMemBytes: ev.AllocMemBytes,
+
+			CPUMilli:   prev.CPUMilli,
+			MemBytes:   prev.MemBytes,
+			HasMetrics: prev.HasMetrics,
 		}
 	}
 }

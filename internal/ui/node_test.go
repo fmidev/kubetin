@@ -88,3 +88,16 @@ func TestContainerDotsEmpty(t *testing.T) {
 		t.Errorf("containerDots(empty) = %q, want %q", got, want)
 	}
 }
+
+func TestApplyNodeEventKeepsMetrics(t *testing.T) {
+	m := map[types.UID]nodeRow{}
+	applyNodeEvent(m, cluster.NodeEvent{Kind: cluster.NodeAdded, UID: "n1", Name: "n1", Ready: true})
+	r := m["n1"]
+	r.CPUMilli, r.MemBytes, r.HasMetrics = 500, 1<<30, true
+	m["n1"] = r
+	applyNodeEvent(m, cluster.NodeEvent{Kind: cluster.NodeUpdated, UID: "n1", Name: "n1", Ready: false})
+	got := m["n1"]
+	if got.Ready || got.CPUMilli != 500 || got.MemBytes != 1<<30 || !got.HasMetrics {
+		t.Errorf("update lost metrics or status: %+v", got)
+	}
+}
