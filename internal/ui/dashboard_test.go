@@ -404,6 +404,95 @@ func TestDashboardSkipsLogsWhenDenied(t *testing.T) {
 	}
 }
 
+// The pending fallback (spec names, no kubelet status yet) must obey
+// the scroll offset like the real rows do — a hard-coded zero left
+// containers past the pane height unreachable.
+func TestDashContainersPendingScrolls(t *testing.T) {
+	m := Model{Theme: DefaultTheme()}
+	r := podRow{}
+	for i := 0; i < 8; i++ {
+		r.Containers = append(r.Containers, fmt.Sprintf("ctr-%d", i))
+	}
+	out := strings.Split(m.renderDashContainers(r, 60, 4, 3), "\n")
+	if !strings.Contains(out[0], "NAME") {
+		t.Errorf("scrolled pending pane lost its header: %q", out[0])
+	}
+	if !strings.Contains(out[1], "ctr-3") {
+		t.Errorf("scroll 3 should start the body at ctr-3: %q", out[1])
+	}
+}
+
+// The stacked layout must preserve the pinned header too: it used to
+// window the pane's natural render, so any scroll offset removed the
+// header line first.
+func TestDashStackedContainersKeepHeaderWhenScrolled(t *testing.T) {
+	m := openedDash(t, 70, 40, func(m *Model) {
+		r := m.pods["dash-uid"]
+		r.InitContainerInfo = nil
+		r.ContainerInfo = nil
+		for i := 0; i < 12; i++ {
+			r.ContainerInfo = append(r.ContainerInfo, cluster.ContainerInfo{
+				Name: fmt.Sprintf("ctr-%02d", i), Image: "img:1",
+				Ready: true, State: cluster.ContainerReady,
+			})
+		}
+		m.pods["dash-uid"] = r
+	})
+	m.dashboard.scroll[dashPaneMain] = 3
+	sub, ok := m.dashSubjectNow()
+	if !ok {
+		t.Fatal("dashboard subject missing")
+	}
+	body := m.stackedBody(sub, 70, 40)
+	if !strings.Contains(body, "IMAGE") {
+		t.Error("scrolling the stacked containers pane removed the header")
+	}
+	if !strings.Contains(body, "ctr-03") {
+		t.Error("scroll 3 should bring ctr-03 into the pane")
+	}
+	if strings.Contains(body, "ctr-00") {
+		t.Error("scroll 3 should move ctr-00 out of the pane")
+	}
+}
+
+// The header row stays pinned while the rows scroll under it.
+func TestDashContainersHeaderPinned(t *testing.T) {
+	m := Model{Theme: DefaultTheme()}
+	var infos []cluster.ContainerInfo
+	for i := 0; i < 8; i++ {
+		infos = append(infos, cluster.ContainerInfo{
+			Name: fmt.Sprintf("c%d", i), Image: "img:1", Ready: true,
+			State: cluster.ContainerReady,
+		})
+	}
+	r := podRow{ContainerInfo: infos}
+	out := strings.Split(m.renderDashContainers(r, 60, 4, 3), "\n")
+	if !strings.Contains(out[0], "NAME") || !strings.Contains(out[0], "IMAGE") {
+		t.Errorf("scrolled pane lost its header: %q", out[0])
+	}
+	if len(out) != 4 {
+		t.Errorf("pane is %d lines, want 4", len(out))
+	}
+	if !strings.Contains(out[1], "c3") {
+		t.Errorf("scroll 3 should start the body at c3: %q", out[1])
+	}
+}
+
+// A short NAME and STATE must not soak up pane width as blank padding
+// while the image sits truncated: the content columns clamp to their
+// widest actual cell and IMAGE absorbs the rest.
+func TestDashContainersGiveSpareWidthToImage(t *testing.T) {
+	m := Model{Theme: DefaultTheme()}
+	r := podRow{ContainerInfo: []cluster.ContainerInfo{{
+		Name: "smartmetserver", Image: "ghcr.io/fmidev/smartmetserver:26.08.01",
+		Ready: true, State: cluster.ContainerReady,
+	}}}
+	out := m.renderDashContainers(r, 80, 4, 0)
+	if !strings.Contains(out, "fmidev/smartmetserver:26.08.01") {
+		t.Errorf("image truncated despite spare width:\n%s", out)
+	}
+}
+
 // shortImage should drop a registry host but leave a bare repo alone —
 // "nginx:1.2" has no host to strip.
 func TestShortImage(t *testing.T) {
@@ -413,6 +502,10 @@ func TestShortImage(t *testing.T) {
 		"nginx:1.25":                   "nginx:1.25",
 		"library/nginx:1.25":           "library/nginx:1.25",
 		"docker.io/library/nginx:1.25": "library/nginx:1.25",
+		"ghcr.io/fmidev/api@sha256:" + strings.Repeat("ab", 32):     "fmidev/api@sha256:abababababab…",
+		"nginx@sha256:" + strings.Repeat("cd", 32):                  "nginx@sha256:cdcdcdcdcdcd…",
+		"ghcr.io/fmidev/api:1.2@sha256:" + strings.Repeat("ef", 32): "fmidev/api:1.2@sha256:efefefefefef…",
+		"fmidev/api@sha256:short":                                   "fmidev/api@sha256:short",
 	}
 	for in, want := range cases {
 		if got := shortImage(in); got != want {
@@ -1231,40 +1324,6 @@ func TestStackedGeometryAgreesWithHeightResolver(t *testing.T) {
 			if g.status != sH || g.main != mH || g.events != eH || g.logs != lH {
 				t.Errorf("view=%v %dx%d: render path got (%d,%d,%d,%d), keypress path (%d,%d,%d,%d)",
 					view, w, h, g.status, g.main, g.events, g.logs, sH, mH, eH, lH)
-			}
-		}
-	}
-}
-
-// Windowing pre-rendered content must produce exactly what asking the
-// pane renderer for that height produces — otherwise the single-pass
-// render silently draws something different from the old path.
-func TestSizeStackedPaneMatchesDirectRender(t *testing.T) {
-	// Zero timestamps: this compares two renders of the same rows and
-	// formatAge reads the clock, so a row stamped "now" would flip
-	// 0s -> 1s between them. Ages render "—" and ordering falls to the
-	// Reason tie-breaker, which is all this test needs.
-	m := dashModel(70, 30, func(m *Model) {
-		m.events = map[types.UID]eventRow{}
-		for i := 0; i < 30; i++ {
-			uid := types.UID(fmt.Sprintf("size-e%02d", i))
-			m.events[uid] = eventRow{
-				UID: uid, Namespace: "default", Type: "Warning",
-				Reason: fmt.Sprintf("R%02d", i), Message: "m", Count: 1,
-				InvolvedKind: "Pod", InvolvedName: "dash-pod", InvolvedNs: "default",
-			}
-		}
-	})
-	sub, _ := m.dashSubjectNow()
-	const inner = 68
-
-	for _, scroll := range []int{0, 3, 9} {
-		for _, h := range []int{1, 4, 8} {
-			natural := m.renderDashEventsFor(sub, inner, 0, 0)
-			got := sizeStackedPane(natural, inner, h, scroll)
-			want := m.renderDashEventsFor(sub, inner, h, scroll)
-			if got != want {
-				t.Errorf("scroll=%d h=%d: windowed content differs from a direct render", scroll, h)
 			}
 		}
 	}

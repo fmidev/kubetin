@@ -168,11 +168,11 @@ func restartStyle(n int32, th Theme) lipgloss.Style {
 // but is the first to go when the pane narrows — the state and restart
 // count are what you scan for.
 var dashContainerColumns = []column{
-	{min: 12, max: 22, prio: 0}, // NAME
-	{min: 10, max: 16, prio: 1}, // STATE
-	{min: 3, max: 4, prio: 2},   // RESTARTS
-	{min: 9, max: 13, prio: 3},  // MEM
-	{min: 14, max: 46, prio: 4}, // IMAGE
+	{min: 12, max: 22, prio: 0},  // NAME
+	{min: 10, max: 16, prio: 1},  // STATE
+	{min: 3, max: 4, prio: 2},    // RESTARTS
+	{min: 9, max: 13, prio: 3},   // MEM
+	{min: 14, max: 100, prio: 4}, // IMAGE
 }
 
 // renderDashContainers lists init containers (prefixed) then regular
@@ -180,51 +180,108 @@ var dashContainerColumns = []column{
 // container that is failing.
 func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 	th := m.Theme
-	cw := fitColumns(dashContainerColumns, w-1)
 
-	var lines []string
-	emit := func(ci cluster.ContainerInfo, init bool) {
+	type ctrRow struct {
+		name, state, restarts, mem, image, detail string
+		stateStyle, restartsStyle                 lipgloss.Style
+	}
+	var rows []ctrRow
+	add := func(ci cluster.ContainerInfo, init bool) {
 		name := ci.Name
 		if init {
 			name = "init:" + name
 		}
 		state, style := containerStateLabel(ci, th)
-		lines = append(lines, " "+joinCells(
-			padCol(name, cw[0], th.Base),
-			padCol(state, cw[1], style),
-			padColRight(fmt.Sprintf("%d", ci.Restarts), cw[2], restartStyle(ci.Restarts, th)),
-			padCellANSIRight(containerMemCell(ci, r, th), cw[3]),
-			padCol(shortImage(ci.Image), cw[4], th.Dim),
-		))
-		if detail := containerDetail(ci); detail != "" {
-			lines = append(lines, " "+th.Dim.Render("  └ ")+
-				th.StatusBad.Render(truncate(detail, w-5)))
-		}
+		rows = append(rows, ctrRow{
+			name:          name,
+			state:         state,
+			restarts:      fmt.Sprintf("%d", ci.Restarts),
+			mem:           containerMemCell(ci, r, th),
+			image:         shortImage(ci.Image),
+			detail:        containerDetail(ci),
+			stateStyle:    style,
+			restartsStyle: restartStyle(ci.Restarts, th),
+		})
 	}
-
 	for _, ci := range r.InitContainerInfo {
-		emit(ci, true)
+		add(ci, true)
 	}
 	for _, ci := range r.ContainerInfo {
-		emit(ci, false)
+		add(ci, false)
 	}
 
-	// Before kubelet reports any status the pod still has spec
-	// container names — show those rather than an empty pane, so a
-	// freshly-scheduled pod doesn't look broken.
-	if len(lines) == 0 {
+	var cw []int
+	var lines []string
+	if len(rows) == 0 {
+		// Before kubelet reports any status the pod still has spec
+		// container names — show those rather than an empty pane, so
+		// a freshly-scheduled pod doesn't look broken.
+		if len(r.Containers) == 0 {
+			return dashPaneBody([]string{" " + th.Dim.Render("no containers reported")}, w, h, 0)
+		}
+		cw = fitColumns(dashContainerColumns, w-1)
 		for _, name := range r.Containers {
 			lines = append(lines, " "+joinCells(
 				padCol(name, cw[0], th.Base),
 				padCol("pending", cw[1], th.Dim),
 			))
 		}
-	}
-	if len(lines) == 0 {
-		return dashPaneBody([]string{" " + th.Dim.Render("no containers reported")}, w, h, 0)
+	} else {
+		// fitColumns grows every column toward its max round-robin,
+		// so NAME and STATE would spend the pane's spare width on
+		// blank padding whenever their content is short, while IMAGE
+		// — the one column that routinely overflows — stays starved.
+		// Clamp each max to the widest actual cell first; the width
+		// those columns don't need flows to IMAGE.
+		var nameW, stateW, restartsW, memW int
+		for _, rw := range rows {
+			nameW = max(nameW, lipgloss.Width(rw.name))
+			stateW = max(stateW, lipgloss.Width(rw.state))
+			restartsW = max(restartsW, lipgloss.Width(rw.restarts))
+			memW = max(memW, lipgloss.Width(rw.mem))
+		}
+		cols := append([]column(nil), dashContainerColumns...)
+		for i, want := range []int{nameW, stateW, restartsW, memW} {
+			if want = max(want, cols[i].min); want < cols[i].max {
+				cols[i].max = want
+			}
+		}
+		cw = fitColumns(cols, w-1)
+
+		for _, rw := range rows {
+			lines = append(lines, " "+joinCells(
+				padCol(rw.name, cw[0], th.Base),
+				padCol(rw.state, cw[1], rw.stateStyle),
+				padColRight(rw.restarts, cw[2], rw.restartsStyle),
+				padCellANSIRight(rw.mem, cw[3]),
+				padCol(truncateHead(rw.image, cw[4]), cw[4], th.Dim),
+			))
+			if rw.detail != "" {
+				lines = append(lines, " "+th.Dim.Render("  └ ")+
+					th.StatusBad.Render(truncate(rw.detail, w-5)))
+			}
+		}
 	}
 
-	return dashPaneBody(lines, w, h, scroll)
+	// The header is pinned: scrolling moves the rows under it, not
+	// the labels off-screen. Natural-height mode returns everything —
+	// the stacked layout windows the pane itself.
+	header := dashContainerHeader(cw, th)
+	if h <= 0 {
+		return header + "\n" + strings.Join(lines, "\n")
+	}
+	body, _ := scrollWindow(strings.Join(lines, "\n"), scroll, h-1)
+	return clampCanvas(header+"\n"+body, w, h)
+}
+
+func dashContainerHeader(cw []int, th Theme) string {
+	return " " + joinCells(
+		padCol("NAME", cw[0], th.Header),
+		padCol("STATE", cw[1], th.Header),
+		padColRight("↺", cw[2], th.Header),
+		padColRight("MEM", cw[3], th.Header),
+		padCol("IMAGE", cw[4], th.Header),
+	)
 }
 
 // containerMemCell renders "usage/limit" with the usage coloured by
@@ -284,9 +341,17 @@ func containerDetail(ci cluster.ContainerInfo) string {
 
 // shortImage drops the registry host so the tag stays visible when the
 // column is tight — "ghcr.io/fmidev/api:1.2" → "fmidev/api:1.2".
+// Digest pins keep the conventional leading 12 hex chars — a full
+// 64-hex sha256 would push the repo name out of any column, and the
+// head is the part people compare against kubectl output.
 func shortImage(img string) string {
 	if i := strings.IndexByte(img, '/'); i >= 0 && strings.ContainsAny(img[:i], ".:") {
-		return img[i+1:]
+		img = img[i+1:]
+	}
+	if at := strings.LastIndexByte(img, '@'); at >= 0 {
+		if h := strings.LastIndexByte(img, ':'); h > at && len(img)-h-1 > 12 {
+			img = img[:h+13] + "…"
+		}
 	}
 	return img
 }
