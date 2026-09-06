@@ -223,6 +223,7 @@ type Model struct {
 	clusterNetRX, clusterNetTX int64
 	clusterNetOK               bool
 	netHistory                 netRing
+	focusedMetrics             focusedMetricsState
 	restartBaseline            map[types.UID]int32 // first-seen restart count per pod, see noteRestartBaseline
 
 	namespace       string // empty = all namespaces
@@ -685,6 +686,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
+		m.focusedMetrics = focusedMetricsState{seen: true, ok: msg.OK, at: msg.At}
 		// metrics-server PodMetrics/NodeMetrics resources don't carry
 		// the source object's UID — they have their own metadata. So
 		// match by namespace/name (pods) and name (nodes).
@@ -741,6 +743,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncStartedAt = time.Now()
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
 		m.netHistory = netRing{}
+		m.focusedMetrics = focusedMetricsState{}
 		m.restartBaseline = make(map[types.UID]int32)
 		// A scoped object on the previous cluster doesn't exist on the
 		// new one — close the lens rather than leave it filtered down

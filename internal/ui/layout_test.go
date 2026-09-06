@@ -150,7 +150,13 @@ func TestViewFitsCanvas(t *testing.T) {
 
 		{"cluster/empty-store", 120, 30, ViewCluster, nil},
 		{"cluster/wide", 200, 50, ViewCluster, clusterDashFixture(nil)},
-		{"cluster/wide-min", 100, 24, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/wide-min-with-rail", 130, 25, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/rail-forces-stacked", 100, 24, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/wide-min-no-rail", 100, 25, ViewCluster, singleContext(clusterDashFixture(nil))},
+		{"cluster/namespace-scoped-metrics-failed", 160, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.namespace = "prod"
+			m.focusedMetrics = focusedMetricsState{seen: true, ok: false, at: time.Now()}
+		})},
 		{"cluster/narrow", 80, 24, ViewCluster, clusterDashFixture(nil)},
 		{"cluster/very-narrow", 60, 20, ViewCluster, clusterDashFixture(nil)},
 		{"cluster/tiny", 40, 12, ViewCluster, clusterDashFixture(nil)},
@@ -964,6 +970,7 @@ func clusterDashFixture(extra func(*Model)) func(*Model) {
 			m.netHistory.push(int64(1000*(i+1)), int64(400*(20-i)), now.Add(time.Duration(i-20)*15*time.Second))
 		}
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 20000, 400, true
+		m.focusedMetrics = focusedMetricsState{seen: true, ok: true, at: now}
 
 		pod := func(uid, ns, name, node string, phase corev1.PodPhase, cpu, mem int64, restarts int32) podRow {
 			return podRow{

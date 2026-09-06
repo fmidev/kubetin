@@ -163,6 +163,73 @@ func TestClusterGaugesGateOnFreshness(t *testing.T) {
 	if !strings.Contains(lines[0], "Σ pods 4.5") || strings.Contains(strings.Join(lines, ""), "▬") {
 		t.Errorf("scoped gauge should sum pods without a bar: %q", lines)
 	}
+
+	// A failed focused snapshot clears every pod's HasMetrics; the sum
+	// would read 0 — must say unavailable instead.
+	m.focusedMetrics = focusedMetricsState{seen: true, ok: false, at: time.Now()}
+	lines = m.gaugeLines("CPU", st, 0, 0, nil, 0, 0, cpuOrZero, 60)
+	if !strings.Contains(lines[0], "metrics unavailable") {
+		t.Errorf("scoped gauge after failed snapshot = %q", lines)
+	}
+	m.focusedMetrics = focusedMetricsState{seen: true, ok: true, at: time.Now().Add(-5 * time.Minute)}
+	lines = m.gaugeLines("CPU", st, 0, 0, nil, 0, cpu, cpuOrZero, 60)
+	if !strings.Contains(lines[0], "stale") {
+		t.Errorf("scoped gauge with old snapshot = %q", lines)
+	}
+	m.focusedMetrics = focusedMetricsState{}
+	lines = m.gaugeLines("CPU", st, 0, 0, nil, 0, 0, cpuOrZero, 60)
+	if !strings.Contains(lines[0], "waiting for first metrics sample") {
+		t.Errorf("scoped gauge before any snapshot = %q", lines)
+	}
+}
+
+func TestClusterIdentityStripUsesFocusedMetricsUnderScope(t *testing.T) {
+	m := clusterDashModel(func(m *Model) {
+		m.namespace = "prod"
+		m.Store.ApplyMetrics("alpha", model.MetricsFields{MetricsAvailable: false})
+	})
+	st, _ := m.Store.Get("alpha")
+	if line := m.clusterDashIdentity(st, 120); strings.Contains(line, "unavailable") {
+		t.Errorf("scoped strip should report the focused poller, got %q", line)
+	}
+	m.focusedMetrics = focusedMetricsState{seen: true, ok: false}
+	if line := m.clusterDashIdentity(st, 120); !strings.Contains(line, "metrics unavailable") {
+		t.Errorf("scoped strip after failed pod-metrics poll = %q", line)
+	}
+}
+
+func TestNodesTileNamesWorstPressureCondition(t *testing.T) {
+	m := clusterDashModel(func(m *Model) {
+		pf := model.NewProbeFields()
+		pf.Reach = model.ReachHealthy
+		pf.NodeCount, pf.NodeReady = 3, 3
+		pf.NodesMemPressure, pf.NodesDiskPressure, pf.NodesPIDPressure = 1, 1, 1
+		m.Store.ApplyProbe("alpha", pf)
+	})
+	st, _ := m.Store.Get("alpha")
+	if got := tileByLabel(t, m.clusterTiles(st, m.clusterStats()), "NODES"); got.sub != "1 MemoryPressure" {
+		t.Errorf("one node with three conditions must not read as three nodes: %+v", got)
+	}
+}
+
+func TestStackedDashboardCarriesEveryPane(t *testing.T) {
+	m := clusterDashModel(nil)
+	m.width, m.height = 80, 60
+	out := ansiRE.ReplaceAllString(m.View(), "")
+	for _, want := range []string{"TOP PODS · CPU", "TOP PODS · MEM", "NODES (3)", "WARNINGS · 15m", "UNHEALTHY WORKLOADS"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stacked layout lacks %q:\n%s", want, out)
+		}
+	}
+	netRows := 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.ContainsAny(line, string(sparkGlyphs)) {
+			netRows++
+		}
+	}
+	if netRows < 3 {
+		t.Errorf("expected cpu, mem and net sparklines in the stacked layout, found %d spark rows", netRows)
+	}
 }
 
 func TestClusterDashKeysAndFilterParking(t *testing.T) {

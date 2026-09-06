@@ -38,6 +38,16 @@ func (r netRing) span() time.Duration {
 	return r.at[len(r.at)-1].Sub(r.at[0])
 }
 
+// focusedMetricsState is the outcome of the focused cluster's latest
+// pod-metrics poll. Pod rows only carry HasMetrics, which a failed
+// snapshot clears for every pod — indistinguishable from an idle
+// namespace without this.
+type focusedMetricsState struct {
+	seen bool // at least one snapshot arrived since focus
+	ok   bool
+	at   time.Time
+}
+
 // noteRestartBaseline records a pod's restart count the first time
 // the watcher shows it to us. The informer's initial list arrives as
 // ordinary Added events with no end marker, so "restarts since the

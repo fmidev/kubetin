@@ -20,6 +20,10 @@ import (
 // nodes, recent warnings, unhealthy workloads. Read-only; Tab keeps
 // cycling clusters underneath it and `n` scopes it to a namespace.
 
+// Wide-grid breakpoints, measured on the pane the dashboard is handed
+// (terminal minus the cluster rail and footer), not the terminal: with
+// the rail shown the grid appears from about 130×25, without it from
+// 100×25.
 const (
 	clusterDashWideMinWidth  = 100
 	clusterDashWideMinHeight = 24
@@ -259,14 +263,22 @@ func (m Model) clusterTiles(st model.ClusterState, s clusterStats) []dashTile {
 	default:
 		t := dashTile{label: "NODES", value: fmt.Sprintf("%d", st.NodeCount), sub: "all ready", style: th.StatusOK}
 		notReady := st.NodeCount - st.NodeReady
-		pressure := st.NodesMemPressure + st.NodesDiskPressure + st.NodesPIDPressure
+		// The probe counts nodes per condition, not distinct pressured
+		// nodes, so name the worst condition rather than sum them.
+		pressureN, pressureKind := st.NodesMemPressure, "MemoryPressure"
+		if st.NodesDiskPressure > pressureN {
+			pressureN, pressureKind = st.NodesDiskPressure, "DiskPressure"
+		}
+		if st.NodesPIDPressure > pressureN {
+			pressureN, pressureKind = st.NodesPIDPressure, "PIDPressure"
+		}
 		switch {
 		case notReady > 0:
 			t.value = fmt.Sprintf("%d/%d", st.NodeReady, st.NodeCount)
 			t.sub = fmt.Sprintf("%d not ready", notReady)
 			t.style = th.StatusBad
-		case pressure > 0:
-			t.sub = fmt.Sprintf("%d under pressure", pressure)
+		case pressureN > 0:
+			t.sub = fmt.Sprintf("%d %s", pressureN, pressureKind)
 			t.style = th.StatusWrn
 		case st.NodesCordoned > 0:
 			t.sub = fmt.Sprintf("%d cordoned", st.NodesCordoned)
@@ -375,7 +387,7 @@ func (m Model) clusterDashIdentity(st model.ClusterState, w int) string {
 	}
 	left := th.styleForReach(st.Reach).Render(st.Reach.Glyph()) + " " +
 		th.Title.Render(cleanDetail(display))
-	if v := shortVersion(st.ServerVersion); v != "" {
+	if v := cleanDetail(shortVersion(st.ServerVersion)); v != "" {
 		left += th.Dim.Render(" " + v)
 	}
 	left += th.Dim.Render(" · ns:" + ns)
@@ -387,14 +399,23 @@ func (m Model) clusterDashIdentity(st model.ClusterState, w int) string {
 		left += th.StatusBad.Render(" · " + msg)
 	}
 
+	// Report whichever poller feeds the gauges: the fleet node-metrics
+	// loop cluster-wide, the focused pod-metrics poller under a
+	// namespace scope (where the fleet loop's node list is denied).
+	available, at := st.MetricsAvailable, st.MetricsAt
+	if m.namespace != "" {
+		available, at = m.focusedMetrics.ok, m.focusedMetrics.at
+	}
 	var right []string
 	switch {
-	case !st.MetricsAvailable:
+	case m.namespace != "" && !m.focusedMetrics.seen:
+		right = append(right, th.Dim.Render("metrics pending"))
+	case !available:
 		right = append(right, th.Dim.Render("metrics unavailable"))
-	case time.Since(st.MetricsAt) > clusterDashMetricsStale:
-		right = append(right, th.StatusWrn.Render("metrics "+formatAge(st.MetricsAt)+" ago (stale)"))
+	case time.Since(at) > clusterDashMetricsStale:
+		right = append(right, th.StatusWrn.Render("metrics "+formatAge(at)+" ago (stale)"))
 	default:
-		right = append(right, th.Dim.Render("metrics "+formatAge(st.MetricsAt)+" ago"))
+		right = append(right, th.Dim.Render("metrics "+formatAge(at)+" ago"))
 	}
 	if m.clusterNetOK && len(m.netHistory.at) > 0 {
 		right = append(right, th.Dim.Render("net "+formatAge(m.netHistory.at[len(m.netHistory.at)-1])+" ago"))
@@ -451,8 +472,15 @@ func (m Model) gaugeLines(label string, st model.ClusterState, used, alloc int64
 	scopedSum int64, format func(int64) string, w int) []string {
 	th := m.Theme
 	if m.namespace != "" {
-		if !m.syncedPods {
-			return []string{padCol(label+" syncing", w, th.Dim)}
+		fm := m.focusedMetrics
+		switch {
+		case !m.syncedPods || !fm.seen:
+			return []string{padCol(label+" waiting for first metrics sample", w, th.Dim)}
+		case !fm.ok:
+			return []string{padCol(label+" metrics unavailable", w, th.Dim)}
+		case time.Since(fm.at) > clusterDashMetricsStale:
+			return []string{padCellANSI(th.Dim.Render(label+" ")+th.StatusWrn.Render("stale")+
+				th.Dim.Render(" Σ pods "+format(scopedSum)), w)}
 		}
 		return []string{
 			padCellANSI(th.Dim.Render(label+" ")+th.Header.Render("Σ pods "+format(scopedSum)), w),
@@ -527,7 +555,7 @@ func (m Model) scopedUsage() (cpu, mem int64) {
 
 // ---- list panes ------------------------------------------------------
 
-func (m Model) topPodLines(st model.ClusterState, pods []podRow, w, h int) []string {
+func (m Model) topPodLines(pods []podRow, w, h int) []string {
 	th := m.Theme
 	if h < 1 {
 		return nil
@@ -536,10 +564,12 @@ func (m Model) topPodLines(st model.ClusterState, pods []podRow, w, h int) []str
 		switch {
 		case !m.syncedPods:
 			return []string{padCol("syncing", w, th.Dim)}
-		case !st.MetricsAvailable:
+		case !m.focusedMetrics.seen:
+			return []string{padCol("waiting for first metrics sample", w, th.Dim)}
+		case !m.focusedMetrics.ok:
 			return []string{padCol("metrics unavailable", w, th.Dim)}
 		default:
-			return []string{padCol("waiting for first metrics sample", w, th.Dim)}
+			return []string{padCol("no pod metrics in scope", w, th.Dim)}
 		}
 	}
 	showPct := w >= 40
@@ -764,9 +794,9 @@ func (m Model) renderClusterDashWide(st model.ClusterState, s clusterStats, w, h
 	put(1, 2, m.netLines(rects[1][2].w))
 
 	title(2, 0, "TOP PODS · CPU")
-	put(2, 0, m.topPodLines(st, s.topCPU, rects[2][0].w, midH))
+	put(2, 0, m.topPodLines(s.topCPU, rects[2][0].w, midH))
 	title(2, 1, "TOP PODS · MEM")
-	put(2, 1, m.topPodLines(st, s.topMem, rects[2][1].w, midH))
+	put(2, 1, m.topPodLines(s.topMem, rects[2][1].w, midH))
 	title(2, 2, "NODES")
 	put(2, 2, m.nodeLines(st, s, rects[2][2].w, midH))
 
@@ -812,7 +842,11 @@ func (m Model) renderClusterDashStacked(st model.ClusterState, s clusterStats, w
 	lines = append(lines, m.gaugeLines("CPU", st, st.UsageCPUMilli, st.AllocCPUMilli, cpuHist, span, scopedCPU, cpuOrZero, w)...)
 	lines = append(lines, m.gaugeLines("MEM", st, st.UsageMemBytes, st.AllocMemBytes, memHist, span, scopedMem, memOrZero, w)...)
 	if m.clusterNetOK {
-		lines = append(lines, m.netLines(w)[0])
+		net := m.netLines(w)
+		if w < 60 {
+			net = net[:1]
+		}
+		lines = append(lines, net...)
 	}
 
 	type section struct {
@@ -823,7 +857,8 @@ func (m Model) renderClusterDashStacked(st model.ClusterState, s clusterStats, w
 	sections := []section{
 		{"WARNINGS · 15m", len(s.warnGroups), func(h int) []string { return m.warningLines(s, w, h) }},
 		{"UNHEALTHY WORKLOADS", len(s.unhealthy), func(h int) []string { return m.unhealthyLines(s, w, h) }},
-		{"TOP PODS · CPU", len(s.topCPU), func(h int) []string { return m.topPodLines(st, s.topCPU, w, h) }},
+		{"TOP PODS · CPU", len(s.topCPU), func(h int) []string { return m.topPodLines(s.topCPU, w, h) }},
+		{"TOP PODS · MEM", len(s.topMem), func(h int) []string { return m.topPodLines(s.topMem, w, h) }},
 		{"NODES", len(s.nodes), func(h int) []string { return m.nodeLines(st, s, w, h) }},
 	}
 	for i, sec := range sections {
