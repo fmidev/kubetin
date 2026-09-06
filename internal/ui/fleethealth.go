@@ -306,6 +306,7 @@ func derivePulse(g fleetGroups) fleetPulse {
 type trendRing struct {
 	cpu    []int
 	mem    []int
+	at     []time.Time
 	lastAt time.Time
 }
 
@@ -316,6 +317,16 @@ func (r *trendRing) push(cpu, mem int, at time.Time) {
 	r.lastAt = at
 	r.cpu = appendCapped(r.cpu, cpu, fleetTrendCap)
 	r.mem = appendCapped(r.mem, mem, fleetTrendCap)
+	r.at = appendCapped(r.at, at, fleetTrendCap)
+}
+
+// span is the wall-clock distance between the oldest and newest
+// retained sample; zero until two samples exist.
+func (r *trendRing) span() time.Duration {
+	if r == nil || len(r.at) < 2 {
+		return 0
+	}
+	return r.at[len(r.at)-1].Sub(r.at[0])
 }
 
 func appendCapped[T any](s []T, v T, n int) []T {

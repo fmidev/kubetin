@@ -100,7 +100,8 @@ const (
 	ViewIngresses
 	ViewNodes
 	ViewNamespaces
-	ViewFleet // fleet dashboard, full-bleed triage view
+	ViewFleet   // fleet dashboard, full-bleed triage view
+	ViewCluster // per-cluster dashboard: tiles, gauges, top pods, warnings
 )
 
 // ProbeTickMsg fires periodically so the header reflects fresh probe
@@ -256,6 +257,7 @@ type Model struct {
 	rbacOpen            bool
 	fleet               fleetState
 	fleetTrends         map[string]*trendRing
+	clusterDash         clusterDashState
 	toast               string // ephemeral one-line status (e.g. "Deleted Pod/foo")
 	toastUntil          time.Time
 
@@ -357,6 +359,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.view == ViewFleet {
 			return m.handleFleetKey(msg)
+		}
+		if m.view == ViewCluster {
+			return m.handleClusterDashKey(msg)
 		}
 		return m.handleKey(msg)
 
@@ -808,6 +813,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Esc/F1 in the dashboard restores returnView with the row
 		// still selected.
 		m.enterFleet()
+	case "f3":
+		m.enterClusterDash()
 	case "f2":
 		m.debugMode = !m.debugMode
 	case "?":
@@ -1390,10 +1397,13 @@ func (m Model) handleFilterKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Pre-empt navigation keys: unfocus the filter (preserve text) and
 	// fall through to the normal handler.
 	switch k.String() {
-	case "f1", "f2", "tab", "shift+tab":
+	case "f1", "f2", "f3", "tab", "shift+tab":
 		m.filterFocused = false
 		if m.view == ViewFleet {
 			return m.handleFleetKey(k)
+		}
+		if m.view == ViewCluster {
+			return m.handleClusterDashKey(k)
 		}
 		return m.handleKey(k)
 	}
@@ -1564,17 +1574,19 @@ func (m Model) View() string {
 		return "kubetin loading…"
 	}
 
-	// The fleet dashboard is full-bleed: the selected-cluster header
-	// would repeat what the dashboard itself shows, so it is dropped
-	// and the body takes its rows. Everything else keeps the header.
+	// The dashboards drop the selected-cluster header: it would repeat
+	// what they show themselves, so the body takes its rows. The fleet
+	// one is additionally full-bleed (no rail); the cluster one keeps
+	// the rail so Tab visibly walks the fleet underneath it.
 	fleetFull := m.view == ViewFleet && !m.dashboard.open
+	noHeader := fleetFull || (m.view == ViewCluster && !m.dashboard.open)
 	header := ""
-	if !fleetFull {
+	if !noHeader {
 		header = m.renderHeader()
 	}
 	footer := m.renderFooter()
 	bodyHeight := m.height - lipgloss.Height(footer)
-	if !fleetFull {
+	if !noHeader {
 		bodyHeight -= lipgloss.Height(header)
 	}
 	if bodyHeight < 1 {
@@ -1660,9 +1672,9 @@ func (m Model) View() string {
 	footerH := lipgloss.Height(footer)
 	body = clampCanvas(body, m.width, bodyHeight)
 	footer = clampCanvas(footer, m.width, footerH)
-	if fleetFull {
+	if noHeader {
 		// Joining the empty header string would add a phantom blank
-		// row; the full-bleed layout has no header at all.
+		// row; the header-less layouts have no header at all.
 		return lipgloss.JoinVertical(lipgloss.Left, body, footer)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
@@ -1674,7 +1686,7 @@ func (m Model) View() string {
 // full-bleed: zero header rows while it owns the view.
 func (m Model) chromeHeights() (headerH, footerH int) {
 	footerH = lipgloss.Height(m.renderFooter())
-	if m.view == ViewFleet && !m.dashboard.open {
+	if (m.view == ViewFleet || m.view == ViewCluster) && !m.dashboard.open {
 		return 0, footerH
 	}
 	return lipgloss.Height(m.renderHeader()), footerH
@@ -1696,6 +1708,8 @@ func (m Model) mainPane(height, width int) string {
 		return m.renderServiceTable(height, width)
 	case ViewIngresses:
 		return m.renderIngressTable(height, width)
+	case ViewCluster:
+		return m.renderClusterDash(height, width)
 	}
 	return m.renderTable(height, width)
 }
@@ -1762,6 +1776,8 @@ func (m Model) visibleUIDs() []types.UID {
 			out = append(out, r.UID)
 		}
 		return out
+	case ViewCluster:
+		return nil
 	case ViewFleet:
 		// The dashboard's cursor is context-keyed, not UID-keyed; this
 		// only feeds the filter footer's matched count.
@@ -1982,6 +1998,9 @@ func (m Model) renderFooter() string {
 	if m.view == ViewFleet && !m.dashboard.open {
 		hint = " j/k:cluster  Enter:details  o:open  r:refresh  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
 	}
+	if m.view == ViewCluster && !m.dashboard.open {
+		hint = " Tab:cluster  n:ns  0:all-ns  1-6:tables  F1:fleet  Esc/F3:back  ?:help  q:quit "
+	}
 	if m.dashboard.open {
 		hint = " Tab:pane  j/k:move  g/G:top/bottom  f:follow  i:open pod  c:container  l:logs  d:describe  Enter:actions  Esc:back "
 	}
@@ -2042,6 +2061,8 @@ func (m Model) filterCounts() (matched, total int) {
 		total = len(m.ingresses)
 	case ViewFleet:
 		total = len(m.Contexts)
+	case ViewCluster:
+		total = 0
 	default:
 		total = len(m.pods)
 	}

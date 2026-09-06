@@ -86,6 +86,7 @@ var helpGroups = []helpGroup{
 			{"5", "nodes"},
 			{"6", "namespaces"},
 			{"F1", "fleet dashboard (toggle)"},
+			{"F3", "cluster dashboard (toggle)"},
 		},
 	},
 	{
@@ -130,6 +131,16 @@ var helpGroups = []helpGroup{
 			{"r", "refresh details"},
 			{"o", "open cluster (pods view)"},
 			{"Esc / F1", "back to previous view"},
+		},
+	},
+	{
+		Title: "Cluster dashboard",
+		Bindings: [][2]string{
+			{"Tab / Shift-Tab", "next / previous cluster"},
+			{"n / 0", "scope to a namespace / all"},
+			{"1 – 6", "jump to a resource table"},
+			{"F1", "fleet dashboard"},
+			{"Esc / F3", "back to previous view"},
 		},
 	},
 	{
