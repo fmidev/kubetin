@@ -246,19 +246,22 @@ func TestDerivePulse(t *testing.T) {
 func TestTrendRingDedupesAndCaps(t *testing.T) {
 	r := &trendRing{}
 	t0 := time.Now()
-	r.push(10, t0)
-	r.push(99, t0) // same timestamp: dropped
-	if len(r.vals) != 1 || r.vals[0] != 10 {
-		t.Fatalf("dedupe failed: %v", r.vals)
+	r.push(5, 10, t0)
+	r.push(50, 99, t0) // same timestamp: dropped
+	if len(r.mem) != 1 || r.mem[0] != 10 || len(r.cpu) != 1 || r.cpu[0] != 5 {
+		t.Fatalf("dedupe failed: cpu %v mem %v", r.cpu, r.mem)
 	}
 	for i := 0; i < fleetTrendCap*2; i++ {
-		r.push(i, t0.Add(time.Duration(i+1)*time.Second))
+		r.push(i/2, i, t0.Add(time.Duration(i+1)*time.Second))
 	}
-	if len(r.vals) != fleetTrendCap {
-		t.Errorf("len = %d, want capped at %d", len(r.vals), fleetTrendCap)
+	if len(r.mem) != fleetTrendCap || len(r.cpu) != fleetTrendCap {
+		t.Errorf("len = %d/%d, want capped at %d", len(r.cpu), len(r.mem), fleetTrendCap)
 	}
-	if r.vals[len(r.vals)-1] != fleetTrendCap*2-1 {
-		t.Errorf("ring should keep the newest samples, got tail %d", r.vals[len(r.vals)-1])
+	if r.mem[len(r.mem)-1] != fleetTrendCap*2-1 {
+		t.Errorf("ring should keep the newest samples, got tail %d", r.mem[len(r.mem)-1])
+	}
+	if r.cpu[len(r.cpu)-1] != (fleetTrendCap*2-1)/2 {
+		t.Errorf("cpu series out of step with mem: tail %d", r.cpu[len(r.cpu)-1])
 	}
 }
 

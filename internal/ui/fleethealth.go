@@ -17,7 +17,7 @@ const (
 	fleetMemCritPct     = 90
 	fleetPendingWarn    = 5
 	fleetWarnEventsWarn = 10
-	fleetTrendCap       = 24
+	fleetTrendCap       = 60
 	// fleetMemAlertMaxAge caps how old a metrics sample may be and
 	// still raise the memory alert — four missed 30s poll cycles. A
 	// frozen last sample must not hold a cluster in NEEDS ATTENTION.
@@ -300,23 +300,30 @@ func derivePulse(g fleetGroups) fleetPulse {
 	return p
 }
 
-// trendRing holds the last fleetTrendCap memory-utilisation samples
+// trendRing holds the last fleetTrendCap cpu/mem utilisation samples
 // for one cluster, deduplicated on the metrics timestamp so the 1 Hz
 // UI tick doesn't record the same 30s sample thirty times.
 type trendRing struct {
-	vals   []int
+	cpu    []int
+	mem    []int
 	lastAt time.Time
 }
 
-func (r *trendRing) push(v int, at time.Time) {
+func (r *trendRing) push(cpu, mem int, at time.Time) {
 	if !at.After(r.lastAt) {
 		return
 	}
 	r.lastAt = at
-	r.vals = append(r.vals, v)
-	if len(r.vals) > fleetTrendCap {
-		r.vals = append(r.vals[:0], r.vals[len(r.vals)-fleetTrendCap:]...)
+	r.cpu = appendCapped(r.cpu, cpu, fleetTrendCap)
+	r.mem = appendCapped(r.mem, mem, fleetTrendCap)
+}
+
+func appendCapped[T any](s []T, v T, n int) []T {
+	s = append(s, v)
+	if len(s) > n {
+		s = append(s[:0], s[len(s)-n:]...)
 	}
+	return s
 }
 
 var sparkGlyphs = []rune("▁▂▃▄▅▆▇█")

@@ -28,6 +28,9 @@ type nodeRow struct {
 	CreatedAt   time.Time
 	Updated     time.Time
 
+	AllocCPUMilli int64
+	AllocMemBytes int64
+
 	CPUMilli   int64
 	MemBytes   int64
 	HasMetrics bool
@@ -38,6 +41,9 @@ func applyNodeEvent(m map[types.UID]nodeRow, ev cluster.NodeEvent) {
 	case cluster.NodeDeleted:
 		delete(m, ev.UID)
 	default:
+		// Usage fields belong to MetricsSnapshotMsg; carry them over so
+		// a node status patch doesn't blank cpu/mem until the next poll.
+		prev := m[ev.UID]
 		m[ev.UID] = nodeRow{
 			UID:         ev.UID,
 			Name:        ev.Name,
@@ -53,6 +59,13 @@ func applyNodeEvent(m map[types.UID]nodeRow, ev cluster.NodeEvent) {
 			Schedulable: ev.Schedulable,
 			CreatedAt:   ev.CreatedAt,
 			Updated:     time.Now(),
+
+			AllocCPUMilli: ev.AllocCPUMilli,
+			AllocMemBytes: ev.AllocMemBytes,
+
+			CPUMilli:   prev.CPUMilli,
+			MemBytes:   prev.MemBytes,
+			HasMetrics: prev.HasMetrics,
 		}
 	}
 }

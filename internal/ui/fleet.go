@@ -600,18 +600,18 @@ func (m Model) fleetRow(st model.ClusterState, spine, badges string, width int) 
 
 func (m Model) trendVals(ctx string) []int {
 	if r := m.fleetTrends[ctx]; r != nil {
-		return r.vals
+		return r.mem
 	}
 	return nil
 }
 
-// sampleFleetTrends records one mem% sample per cluster whenever its
-// metrics timestamp advances. Driven by the 1 Hz ProbeTickMsg; the
+// sampleFleetTrends records one cpu%/mem% sample per cluster whenever
+// its metrics timestamp advances. Driven by the 1 Hz ProbeTickMsg; the
 // ring dedupes on MetricsAt so the effective cadence is the metrics
 // poller's, not the tick's.
 func (m Model) sampleFleetTrends() {
 	for _, st := range m.Store.Snapshot() {
-		if !st.MetricsAvailable || st.AllocMemBytes <= 0 {
+		if !st.MetricsAvailable || st.AllocMemBytes <= 0 || st.AllocCPUMilli <= 0 {
 			continue
 		}
 		r := m.fleetTrends[st.Context]
@@ -619,7 +619,7 @@ func (m Model) sampleFleetTrends() {
 			r = &trendRing{}
 			m.fleetTrends[st.Context] = r
 		}
-		r.push(pct(st.UsageMemBytes, st.AllocMemBytes), st.MetricsAt)
+		r.push(pct(st.UsageCPUMilli, st.AllocCPUMilli), pct(st.UsageMemBytes, st.AllocMemBytes), st.MetricsAt)
 	}
 }
 

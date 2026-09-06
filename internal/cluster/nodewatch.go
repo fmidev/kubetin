@@ -52,6 +52,9 @@ type NodeEvent struct {
 	Runtime     string // e.g. "containerd://1.7.13"
 	CreatedAt   time.Time
 	Schedulable bool
+
+	AllocCPUMilli int64 // status.allocatable cpu, millicores
+	AllocMemBytes int64 // status.allocatable memory, bytes
 }
 
 // NodeWatcher mirrors PodWatcher.
@@ -148,6 +151,12 @@ func (w *NodeWatcher) emit(kind NodeEventKind, obj any) {
 		Runtime:     n.Status.NodeInfo.ContainerRuntimeVersion,
 		CreatedAt:   n.CreationTimestamp.Time,
 		Schedulable: !n.Spec.Unschedulable,
+	}
+	if c, ok := n.Status.Allocatable[corev1.ResourceCPU]; ok {
+		ev.AllocCPUMilli = c.MilliValue()
+	}
+	if mem, ok := n.Status.Allocatable[corev1.ResourceMemory]; ok {
+		ev.AllocMemBytes = mem.Value()
 	}
 	select {
 	case w.Out <- ev:
