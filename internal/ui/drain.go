@@ -11,10 +11,7 @@ import (
 	"github.com/fmidev/kubetin/internal/cluster"
 )
 
-// drainConfirmState is the simple y/N modal that gates Drain. We
-// don't ask the user to type the node name (the way the Delete
-// confirm does) because drain is recoverable — uncordon brings the
-// node back. Delete is irreversible; drain is just expensive.
+// drainConfirmState holds the confirmation before drain preflight.
 type drainConfirmState struct {
 	open    bool
 	node    string
@@ -203,10 +200,11 @@ func (m Model) renderDrainConfirm(canvasWidth, canvasHeight int) string {
 		m.Theme.Dim.Render(" "+m.drainConfirm.node)
 	b.WriteString(title + "\n")
 	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", w-2)) + "\n\n")
-	b.WriteString(" This will cordon the node and evict every pod on it\n")
-	b.WriteString(" (except mirror pods, DaemonSet-owned pods, and pods\n")
-	b.WriteString(" that are already Succeeded / Failed). Pods blocked\n")
-	b.WriteString(" by a PodDisruptionBudget are reported individually.\n\n")
+	b.WriteString(" This will cordon the node, then check all candidates.\n")
+	b.WriteString(" No pods are evicted if any candidate uses emptyDir\n")
+	b.WriteString(" or its controller cannot be verified. The node stays\n")
+	b.WriteString(" cordoned if checks fail. Mirror, DaemonSet-owned,\n")
+	b.WriteString(" and completed pods are skipped. PDBs are respected.\n\n")
 	if m.drainConfirm.pending {
 		b.WriteString(m.Theme.StatusWrn.Render(" starting…") + "\n")
 	} else {
@@ -231,7 +229,7 @@ func (m Model) renderDrainProgress(canvasWidth, canvasHeight int) string {
 
 	switch m.drainProgress.phase {
 	case "starting":
-		b.WriteString(" cordoning + listing pods…\n")
+		b.WriteString(" cordoning + checking pods and controllers…\n")
 	case "evicting":
 		fmt.Fprintf(&b, " %d / %d evicted    %s\n",
 			m.drainProgress.done, m.drainProgress.total,

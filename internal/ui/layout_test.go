@@ -233,6 +233,14 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.drainConfirm.open = true
 			m.drainConfirm.node = "node-1"
 		}},
+		{"drain-confirm/narrow", 80, 24, ViewNodes, func(m *Model) {
+			m.drainConfirm.open = true
+			m.drainConfirm.node = "node-1"
+		}},
+		{"drain-confirm/tiny", 60, 20, ViewNodes, func(m *Model) {
+			m.drainConfirm.open = true
+			m.drainConfirm.node = "node-1"
+		}},
 		{"drain-progress", 120, 40, ViewNodes, func(m *Model) {
 			m.drainProgress.open = true
 			m.drainProgress.node = "node-1"
