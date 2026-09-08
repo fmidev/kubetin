@@ -84,8 +84,10 @@ func (s *Supervisor) coreClient(ctxName string) (*kubernetes.Clientset, error) {
 //
 //	{ Total: N, Phase: "starting" }      ← exactly once, after cordon
 //	{ Pod: ns/foo, Phase: "evicting" }   ← once per pod, in order
-//	{ Pod: ns/foo, Phase: "evicted" }    ← once per pod that drained
-//	{ Pod: ns/bar, Phase: "blocked" }    ← if PDB-blocked past retries
+//	{ Pod: ns/foo, Phase: "accepted" }   ← eviction accepted
+//	{ Phase: "waiting" }               ← checking accepted pods for termination
+//	{ Pod: ns/foo, Phase: "evicted" }    ← original UID confirmed gone
+//	{ Pod: ns/bar, Phase: "blocked" }    ← eviction or termination check failed
 //	{ Phase: "done", Done: K, Total: N } ← exactly once, terminal
 //	{ Phase: "error", Err: "…" }         ← exactly once if we abort
 //
@@ -93,13 +95,14 @@ func (s *Supervisor) coreClient(ctxName string) (*kubernetes.Clientset, error) {
 // Pod / Done / Total. Both terminal phases ("done", "error") close
 // the stream.
 type DrainProgress struct {
-	Context string
-	Node    string
-	Phase   string
-	Pod     string
-	Done    int
-	Total   int
-	Err     string
+	Context   string
+	Node      string
+	Phase     string
+	Pod       string
+	Done      int
+	Total     int
+	Err       string
+	Remaining []string // terminal events: pods whose original UIDs are not confirmed gone
 }
 
 // drainPDBMaxRetries bounds retries against a PodDisruptionBudget
@@ -109,15 +112,31 @@ type DrainProgress struct {
 // "blocked" in progress and the drain moves on.
 const drainPDBMaxRetries = 5
 
+const drainTimeout = 10 * time.Minute
+const drainPollInterval = time.Second
+
 // Drain cordons the node, validates all candidates, then requests
 // eviction. Mirror, DaemonSet-owned, and completed pods are skipped.
 // A failed preflight leaves the node cordoned and evicts nothing.
+// Callers must consume out until it closes, including after cancellation,
+// so the terminal result can report incomplete work reliably.
 func (s *Supervisor) Drain(ctx context.Context, ctxName, node string, out chan<- DrainProgress) {
+	s.drain(ctx, ctxName, node, out, drainTimeout, drainPollInterval)
+}
+
+func (s *Supervisor) drain(ctx context.Context, ctxName, node string, out chan<- DrainProgress, timeout, pollInterval time.Duration) {
 	defer close(out)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	send := func(ev DrainProgress) {
 		ev.Context = ctxName
 		ev.Node = node
+		if ev.Phase == "error" || ev.Phase == "done" {
+			// The forwarder drains the stream even after cancellation.
+			out <- ev
+			return
+		}
 		select {
 		case out <- ev:
 		case <-ctx.Done():
@@ -159,15 +178,34 @@ func (s *Supervisor) Drain(ctx context.Context, ctxName, node string, out chan<-
 	send(DrainProgress{Phase: "starting", Total: total})
 
 	done := 0
-	for _, p := range pods {
+	completed := make([]bool, total)
+	finish := func(err error) {
+		ev := DrainProgress{Phase: "done", Done: done, Total: total}
+		if err != nil {
+			ev.Phase = "error"
+			ev.Err = err.Error()
+		}
+		for i, p := range pods {
+			if !completed[i] {
+				ev.Remaining = append(ev.Remaining, p.Namespace+"/"+p.Name)
+			}
+		}
+		send(ev)
+	}
+	pending := make([]int, 0, total)
+	for i, p := range pods {
 		if err := ctx.Err(); err != nil {
-			send(DrainProgress{Phase: "error", Err: "cancelled"})
+			finish(err)
 			return
 		}
 		podRef := p.Namespace + "/" + p.Name
 		send(DrainProgress{Phase: "evicting", Pod: podRef, Done: done, Total: total})
 
 		if err := evictWithRetry(ctx, cs, p.Namespace, p.Name, p.UID); err != nil {
+			if ctx.Err() != nil {
+				finish(ctx.Err())
+				return
+			}
 			// "blocked" means we gave up on this specific pod after
 			// repeated PDB rejections (or got some other persistent
 			// error). The drain itself continues to the next pod —
@@ -177,10 +215,47 @@ func (s *Supervisor) Drain(ctx context.Context, ctxName, node string, out chan<-
 			send(DrainProgress{Phase: "blocked", Pod: podRef, Done: done, Total: total, Err: trimError(err)})
 			continue
 		}
-		done++
-		send(DrainProgress{Phase: "evicted", Pod: podRef, Done: done, Total: total})
+		pending = append(pending, i)
+		send(DrainProgress{Phase: "accepted", Pod: podRef, Done: done, Total: total})
 	}
-	send(DrainProgress{Phase: "done", Done: done, Total: total})
+	if len(pending) > 0 {
+		send(DrainProgress{Phase: "waiting", Done: done, Total: total})
+	}
+	// Submit all evictions before polling so grace periods can overlap.
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for len(pending) > 0 {
+		next := pending[:0]
+		for _, i := range pending {
+			p := pods[i]
+			podRef := p.Namespace + "/" + p.Name
+			current, err := cs.CoreV1().Pods(p.Namespace).Get(ctx, p.Name, metav1.GetOptions{})
+			if ctx.Err() != nil {
+				finish(ctx.Err())
+				return
+			}
+			if apierrors.IsNotFound(err) || err == nil && current.UID != p.UID {
+				completed[i] = true
+				done++
+				send(DrainProgress{Phase: "evicted", Pod: podRef, Done: done, Total: total})
+			} else if err != nil {
+				send(DrainProgress{Phase: "blocked", Pod: podRef, Done: done, Total: total, Err: "confirm termination: " + trimError(err)})
+			} else {
+				next = append(next, i)
+			}
+		}
+		pending = next
+		if len(pending) == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			finish(ctx.Err())
+			return
+		case <-ticker.C:
+		}
+	}
+	finish(nil)
 }
 
 // Validate the whole candidate list before the first eviction, so an

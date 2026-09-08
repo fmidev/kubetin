@@ -26,24 +26,25 @@ type drainConfirmState struct {
 // so the user can see exactly what's stuck rather than just a count;
 // successfully-evicted pods just bump the Done counter.
 type drainProgressState struct {
-	open    bool
-	context string // origin cluster, for the Tab-away guard
-	node    string
-	current string // pod currently being evicted
-	done    int
-	total   int
-	blocked []string // ns/name and error for pods whose eviction failed
-	phase   string   // mirrors cluster.DrainProgress.Phase
-	err     string
-	cancel  func()
-	started time.Time
+	open      bool
+	context   string // origin cluster, for the Tab-away guard
+	node      string
+	current   string // pod currently being evicted
+	done      int
+	total     int
+	blocked   []string // ns/name and error for pods whose eviction failed
+	remaining []string
+	phase     string // mirrors cluster.DrainProgress.Phase
+	err       string
+	cancel    func()
+	started   time.Time
 }
 
 // DrainStartMsg / DrainProgressMsg / DrainDoneMsg are the lifecycle
 // of one drain operation. Start surfaces a fatal setup error (RBAC
 // or kubeconfig failure before the first evict); Progress is one
-// event per pod / phase transition; Done fires once and closes the
-// modal.
+// event per pod / phase transition; Done closes a successful drain
+// or leaves an incomplete result open for inspection.
 type DrainStartMsg struct {
 	Context string
 	Node    string
@@ -54,12 +55,13 @@ type DrainStartMsg struct {
 type DrainProgressMsg cluster.DrainProgress
 
 type DrainDoneMsg struct {
-	Context string
-	Node    string
-	Done    int
-	Total   int
-	Err     string
-	Blocked []string
+	Context   string
+	Node      string
+	Done      int
+	Total     int
+	Err       string
+	Blocked   []string
+	Remaining []string
 }
 
 // openDrainConfirm shows the y/N modal for the given node. The
@@ -110,6 +112,10 @@ func (m Model) handleDrainConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleDrainProgressKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "esc", "q":
+		if m.drainProgress.phase == "done" || m.drainProgress.phase == "error" {
+			m.drainProgress.open = false
+			return m, nil
+		}
 		if m.drainProgress.cancel != nil {
 			m.drainProgress.cancel()
 		}
@@ -160,7 +166,7 @@ func (m Model) applyDrainProgress(msg DrainProgressMsg) (tea.Model, tea.Cmd) {
 		m.drainProgress.done = msg.Done
 	}
 	switch msg.Phase {
-	case "evicting":
+	case "evicting", "accepted":
 		m.drainProgress.current = msg.Pod
 	case "blocked":
 		m.drainProgress.blocked = append(m.drainProgress.blocked,
@@ -169,19 +175,44 @@ func (m Model) applyDrainProgress(msg DrainProgressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// applyDrainDone is the terminal event. We close the progress modal
-// and surface a toast with the summary.
+// applyDrainDone retains incomplete results until the user dismisses them.
 func (m Model) applyDrainDone(msg DrainDoneMsg) (tea.Model, tea.Cmd) {
 	if msg.Context != m.WatchedContext {
 		return m, nil
 	}
 	m.drainProgress.open = false
 	m.drainProgress.cancel = nil
+	if msg.Total > msg.Done {
+		m.drainProgress.open = true
+		m.drainProgress.node = msg.Node
+		m.drainProgress.phase = "done"
+		m.drainProgress.done = msg.Done
+		m.drainProgress.total = msg.Total
+		m.drainProgress.err = cleanDetail(msg.Err)
+		blockedDetails := make(map[string]string, len(msg.Blocked))
+		for _, detail := range msg.Blocked {
+			pod, _, _ := strings.Cut(detail, " (")
+			blockedDetails[pod] = cleanDetail(detail)
+		}
+		m.drainProgress.remaining = make([]string, len(msg.Remaining))
+		for i, pod := range msg.Remaining {
+			m.drainProgress.remaining[i] = cleanDetail(pod)
+			if detail, ok := blockedDetails[pod]; ok {
+				m.drainProgress.remaining[i] = detail
+			}
+		}
+	}
 	if msg.Err != "" {
-		m.toast = fmt.Sprintf("✕ Drain %s: %s", msg.Node, cleanDetail(msg.Err))
+		if msg.Total == 0 {
+			m.toast = fmt.Sprintf("✕ Drain %s: %s", msg.Node, cleanDetail(msg.Err))
+		} else {
+			m.toast = fmt.Sprintf("✕ Drain %s: %d/%d terminated; %s", msg.Node, msg.Done, msg.Total, cleanDetail(msg.Err))
+		}
 	} else if len(msg.Blocked) > 0 {
-		m.toast = fmt.Sprintf("⚠ Drained %s: %d/%d (%d blocked)",
+		m.toast = fmt.Sprintf("⚠ Drain %s incomplete: %d/%d (%d blocked)",
 			msg.Node, msg.Done, msg.Total, len(msg.Blocked))
+	} else if msg.Done < msg.Total {
+		m.toast = fmt.Sprintf("⚠ Drain %s incomplete: %d/%d terminated", msg.Node, msg.Done, msg.Total)
 	} else {
 		m.toast = fmt.Sprintf("✓ Drained %s: %d/%d", msg.Node, msg.Done, msg.Total)
 	}
@@ -204,7 +235,8 @@ func (m Model) renderDrainConfirm(canvasWidth, canvasHeight int) string {
 	b.WriteString(" No pods are evicted if any candidate uses emptyDir\n")
 	b.WriteString(" or its controller cannot be verified. The node stays\n")
 	b.WriteString(" cordoned if checks fail. Mirror, DaemonSet-owned,\n")
-	b.WriteString(" and completed pods are skipped. PDBs are respected.\n\n")
+	b.WriteString(" and completed pods are skipped. PDBs are respected.\n")
+	b.WriteString(" Waits for pod termination; stops after 10 minutes.\n\n")
 	if m.drainConfirm.pending {
 		b.WriteString(m.Theme.StatusWrn.Render(" starting…") + "\n")
 	} else {
@@ -231,32 +263,53 @@ func (m Model) renderDrainProgress(canvasWidth, canvasHeight int) string {
 	case "starting":
 		b.WriteString(" cordoning + checking pods and controllers…\n")
 	case "evicting":
-		fmt.Fprintf(&b, " %d / %d evicted    %s\n",
+		fmt.Fprintf(&b, " %d / %d terminated    %s\n",
 			m.drainProgress.done, m.drainProgress.total,
 			m.Theme.Dim.Render("evicting "+m.drainProgress.current))
+	case "waiting":
+		fmt.Fprintf(&b, " %d / %d terminated\n", m.drainProgress.done, m.drainProgress.total)
+		b.WriteString(m.Theme.Dim.Render(" waiting for pod termination") + "\n")
+	case "accepted":
+		fmt.Fprintf(&b, " %d / %d terminated\n", m.drainProgress.done, m.drainProgress.total)
+		b.WriteString(m.Theme.Dim.Render(" eviction accepted: "+truncate(m.drainProgress.current, w-24)) + "\n")
 	case "evicted", "blocked":
-		fmt.Fprintf(&b, " %d / %d evicted\n",
+		fmt.Fprintf(&b, " %d / %d terminated\n",
 			m.drainProgress.done, m.drainProgress.total)
+	case "done", "error":
+		fmt.Fprintf(&b, " Drain incomplete: %d / %d terminated\n", m.drainProgress.done, m.drainProgress.total)
+		if m.drainProgress.err != "" {
+			b.WriteString(" " + truncate(m.drainProgress.err, w-6) + "\n")
+		}
 	}
 
-	if n := len(m.drainProgress.blocked); n > 0 {
+	lines := m.drainProgress.blocked
+	label := "pod(s) blocked"
+	if len(m.drainProgress.remaining) > 0 {
+		lines = m.drainProgress.remaining
+		label = "pod(s) not confirmed terminated"
+	}
+	if n := len(lines); n > 0 {
 		b.WriteString("\n")
-		b.WriteString(m.Theme.StatusWrn.Render(fmt.Sprintf(" %d pod(s) blocked:\n", n)))
+		b.WriteString(m.Theme.StatusWrn.Render(fmt.Sprintf(" %d %s:", n, label)) + "\n")
 		// Cap to last 5 — for nodes with dozens of blocked pods the
 		// modal would otherwise grow taller than the canvas.
 		start := 0
 		if n > 5 {
 			start = n - 5
-			b.WriteString(m.Theme.Dim.Render(fmt.Sprintf("   …%d earlier omitted\n", start)))
+			b.WriteString(m.Theme.Dim.Render(fmt.Sprintf("   …%d earlier omitted", start)) + "\n")
 		}
-		for _, line := range m.drainProgress.blocked[start:] {
+		for _, line := range lines[start:] {
 			b.WriteString(m.Theme.Dim.Render("   " + truncate(line, w-6)))
 			b.WriteByte('\n')
 		}
 	}
 
 	b.WriteString("\n")
-	b.WriteString(m.Theme.Footer.Render(" esc to cancel  (already-evicted pods stay evicted)"))
+	if m.drainProgress.phase == "done" || m.drainProgress.phase == "error" {
+		b.WriteString(m.Theme.Footer.Render(" esc to close  (node remains cordoned)"))
+	} else {
+		b.WriteString(m.Theme.Footer.Render(" esc to cancel  (accepted evictions continue)"))
+	}
 	return m.boxed(b.String(), w, canvasWidth, canvasHeight)
 }
 

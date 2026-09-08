@@ -42,11 +42,14 @@ type drainTestAPI struct {
 	clusterController bool
 	listStatus        int
 	evictionStatus    int
+	podGet            func(string) (*corev1.Pod, int)
+	onEviction        func()
 
 	mu             sync.Mutex
 	requests       []string
 	evictions      []policyv1.Eviction
 	controllerGets int
+	podGets        int
 }
 
 func (a *drainTestAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +65,20 @@ func (a *drainTestAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	switch {
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/default/pods/"):
+		a.podGets++
+		if a.podGet != nil {
+			pod, code := a.podGet(strings.TrimPrefix(r.URL.Path, "/api/v1/namespaces/default/pods/"))
+			if pod != nil {
+				pod = pod.DeepCopy()
+				pod.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"}
+				_ = json.NewEncoder(w).Encode(pod)
+				return
+			}
+			status(code)
+			return
+		}
+		status(http.StatusNotFound)
 	case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/nodes/worker":
 		_ = json.NewEncoder(w).Encode(corev1.Node{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Node"},
@@ -120,6 +137,9 @@ func (a *drainTestAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.evictions = append(a.evictions, eviction)
+		if a.onEviction != nil {
+			a.onEviction()
+		}
 		if a.evictionStatus != 0 {
 			status(a.evictionStatus)
 			return
@@ -134,13 +154,16 @@ func (a *drainTestAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 func runTestDrain(t *testing.T, api *drainTestAPI) []DrainProgress {
 	t.Helper()
+	return runTestDrainContext(t, api, context.Background(), 5*time.Second)
+}
+
+func runTestDrainContext(t *testing.T, api *drainTestAPI, ctx context.Context, timeout time.Duration) []DrainProgress {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(api.serveHTTP))
 	defer srv.Close()
 	sup, _ := newProbeFixture(t, srv, "")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out := make(chan DrainProgress, 32)
-	sup.Drain(ctx, "slow", "worker", out)
+	out := make(chan DrainProgress)
+	go sup.drain(ctx, "slow", "worker", out, timeout, 100*time.Millisecond)
 	var progress []DrainProgress
 	for ev := range out {
 		if ev.Context != "slow" || ev.Node != "worker" {
@@ -227,7 +250,7 @@ func TestDrainPreflightPreservesSafeAndSkippedPods(t *testing.T) {
 			}
 			progress := runTestDrain(t, api)
 			last := progress[len(progress)-1]
-			if last.Phase != "done" || last.Total != 2 || len(api.evictions) != 2 {
+			if last.Phase != "done" || last.Total != 2 || last.Done != 2 || len(last.Remaining) != 0 || len(api.evictions) != 2 || api.podGets != 2 {
 				t.Fatalf("safe pods did not proceed: %+v, evictions=%+v", last, api.evictions)
 			}
 			if api.controllerGets != 1 {
@@ -241,6 +264,142 @@ func TestDrainPreflightPreservesSafeAndSkippedPods(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDrainWaitsForOriginalUIDToDisappear(t *testing.T) {
+	for _, replacement := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replacement=%v", replacement), func(t *testing.T) {
+			pod := drainTestPod("terminating")
+			now := metav1.Now()
+			pod.DeletionTimestamp = &now
+			pod.Finalizers = []string{"example.com/hold"}
+			reads := 0
+			api := &drainTestAPI{pods: []corev1.Pod{pod}}
+			api.podGet = func(string) (*corev1.Pod, int) {
+				reads++
+				if reads < 3 {
+					return &pod, 0
+				}
+				if replacement {
+					other := pod.DeepCopy()
+					other.UID = "new-uid"
+					return other, 0
+				}
+				return nil, http.StatusNotFound
+			}
+			progress := runTestDrain(t, api)
+			if reads != 3 || len(api.evictions) != 1 {
+				t.Fatalf("did not wait for original UID: reads=%d evictions=%d", reads, len(api.evictions))
+			}
+			wantPhases := []string{"starting", "evicting", "accepted", "waiting", "evicted", "done"}
+			if len(progress) != len(wantPhases) {
+				t.Fatalf("unexpected progress: %+v", progress)
+			}
+			for i, ev := range progress {
+				wantDone := 0
+				if i >= 4 {
+					wantDone = 1
+				}
+				if ev.Phase != wantPhases[i] || ev.Done != wantDone {
+					t.Fatalf("progress[%d]=%+v, want phase=%s done=%d", i, ev, wantPhases[i], wantDone)
+				}
+			}
+		})
+	}
+}
+
+func TestDrainIncompleteOnCancellationOrTimeout(t *testing.T) {
+	for _, cancellation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancellation=%v", cancellation), func(t *testing.T) {
+			pods := []corev1.Pod{drainTestPod("gone"), drainTestPod("terminating"), drainTestPod("also-terminating")}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			api := &drainTestAPI{pods: pods}
+			api.podGet = func(name string) (*corev1.Pod, int) {
+				if name == "gone" {
+					return nil, http.StatusNotFound
+				}
+				if cancellation {
+					cancel()
+				}
+				pod := drainTestPod(name)
+				return &pod, 0
+			}
+			progress := runTestDrainContext(t, api, ctx, 250*time.Millisecond)
+			last := progress[len(progress)-1]
+			wantErr := context.DeadlineExceeded.Error()
+			if cancellation {
+				wantErr = context.Canceled.Error()
+			}
+			if last.Phase != "error" || last.Err != wantErr || last.Done != 1 || last.Total != 3 ||
+				strings.Join(last.Remaining, ",") != "default/terminating,default/also-terminating" {
+				t.Fatalf("inaccurate incomplete result: %+v", last)
+			}
+			if len(api.evictions) != 3 {
+				t.Fatalf("did not submit all evictions before waiting: %+v", api.evictions)
+			}
+		})
+	}
+}
+
+func TestDrainDoesNotCountFailedTerminationChecks(t *testing.T) {
+	for _, code := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			api := &drainTestAPI{
+				pods:   []corev1.Pod{drainTestPod("unknown")},
+				podGet: func(string) (*corev1.Pod, int) { return nil, code },
+			}
+			progress := runTestDrain(t, api)
+			last := progress[len(progress)-1]
+			if last.Done != 0 || strings.Join(last.Remaining, ",") != "default/unknown" {
+				t.Fatalf("failed check counted as termination: %+v", last)
+			}
+			blocked := progress[len(progress)-2]
+			if blocked.Phase != "blocked" || !strings.Contains(blocked.Err, "confirm termination") {
+				t.Fatalf("missing check failure: %+v", progress)
+			}
+		})
+	}
+}
+
+func TestDrainCancellationIncludesUnattemptedPods(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	api := &drainTestAPI{
+		pods:       []corev1.Pod{drainTestPod("accepted"), drainTestPod("unattempted")},
+		onEviction: cancel,
+	}
+	progress := runTestDrainContext(t, api, ctx, 5*time.Second)
+	last := progress[len(progress)-1]
+	if last.Phase != "error" || last.Err != context.Canceled.Error() || last.Done != 0 || last.Total != 2 ||
+		strings.Join(last.Remaining, ",") != "default/accepted,default/unattempted" || len(api.evictions) != 1 {
+		t.Fatalf("cancellation lost remaining work: %+v, evictions=%+v", last, api.evictions)
+	}
+}
+
+func TestDrainChecksAllAcceptedPodsWithoutSerialShutdownWaits(t *testing.T) {
+	reads := map[string]int{}
+	api := &drainTestAPI{pods: []corev1.Pod{drainTestPod("slow"), drainTestPod("fast")}}
+	allSubmitted := true
+	api.podGet = func(name string) (*corev1.Pod, int) {
+		allSubmitted = allSubmitted && len(api.evictions) == 2
+		reads[name]++
+		if name == "slow" && reads[name] < 3 {
+			pod := drainTestPod(name)
+			return &pod, 0
+		}
+		return nil, http.StatusNotFound
+	}
+	progress := runTestDrain(t, api)
+	var terminated []string
+	for _, ev := range progress {
+		if ev.Phase == "evicted" {
+			terminated = append(terminated, ev.Pod)
+		}
+	}
+	if !allSubmitted || strings.Join(terminated, ",") != "default/fast,default/slow" || reads["fast"] != 1 {
+		t.Fatalf("slow pod delayed other terminations: submitted=%v terminated=%v reads=%v", allSubmitted, terminated, reads)
 	}
 }
 
