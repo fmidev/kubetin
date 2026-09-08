@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -50,19 +49,20 @@ type EndpointSliceEvent struct {
 
 // EndpointSliceWatcher mirrors ServiceWatcher.
 type EndpointSliceWatcher struct {
-	Context       string
-	Out           chan EndpointSliceEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[EndpointSliceEvent]
 }
 
 func NewEndpointSliceWatcher(ctxName string, cap int) *EndpointSliceWatcher {
 	return &EndpointSliceWatcher{
-		Context: ctxName,
-		Out:     make(chan EndpointSliceEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[EndpointSliceEvent](cap),
 	}
 }
 
 func (w *EndpointSliceWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -139,11 +139,7 @@ func (w *EndpointSliceWatcher) emit(kind EndpointSliceEventKind, obj any) {
 		Ready:       ready,
 		Total:       len(es.Endpoints),
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == EndpointSliceDeleted)
 }
 
 // itoaPort renders a port number for the "name:port" backend cells.

@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -142,19 +141,18 @@ type PodEvent struct {
 }
 
 // PodWatcher runs a SharedInformerFactory for v1.Pods against one
-// cluster and forwards events to Out. Out is bounded; if the consumer
-// can't keep up, events are dropped and DroppedEvents is incremented.
+// cluster and forwards state changes to Out. Slow consumers receive
+// coalesced updates through the shared eventDelivery contract.
 type PodWatcher struct {
-	Context       string
-	Out           chan PodEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[PodEvent]
 }
 
 // NewPodWatcher returns a watcher with a buffered channel of cap.
 func NewPodWatcher(ctxName string, cap int) *PodWatcher {
 	return &PodWatcher{
-		Context: ctxName,
-		Out:     make(chan PodEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[PodEvent](cap),
 	}
 }
 
@@ -163,6 +161,8 @@ func NewPodWatcher(ctxName string, cap int) *PodWatcher {
 // (watch 410, reconnects) are handled by the informer machinery itself
 // and surface only as resync events on the consumer channel.
 func (w *PodWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -262,11 +262,7 @@ func (w *PodWatcher) emit(kind PodEventKind, obj any) {
 		Labels:            copyLabels(pod.Labels),
 		Conditions:        projectPodConditions(pod.Status.Conditions),
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == PodDeleted)
 }
 
 // projectContainerInfo builds the rich per-container projection from

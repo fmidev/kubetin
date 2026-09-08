@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -43,19 +42,20 @@ type EventEvent struct {
 
 // EventWatcher mirrors the other watchers.
 type EventWatcher struct {
-	Context       string
-	Out           chan EventEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[EventEvent]
 }
 
 func NewEventWatcher(ctxName string, cap int) *EventWatcher {
 	return &EventWatcher{
-		Context: ctxName,
-		Out:     make(chan EventEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[EventEvent](cap),
 	}
 }
 
 func (w *EventWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -135,9 +135,5 @@ func (w *EventWatcher) emit(kind EvtKind, obj any) {
 		InvolvedName: e.InvolvedObject.Name,
 		InvolvedNs:   e.InvolvedObject.Namespace,
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == EvtDeleted)
 }
