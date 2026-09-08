@@ -1,22 +1,15 @@
 // Node maintenance operations: Cordon, Uncordon, Drain.
 //
-// Cordon / Uncordon are single strategic-merge PATCH calls on
-// /spec/unschedulable. Drain is a higher-level operation: list pods
-// on the node, filter out the ones kubectl drain would also skip
-// (mirror, DaemonSet-owned, already-completed), and evict the rest
-// via the policy/v1 pods/eviction subresource with PDB-aware retry.
-//
-// We deliberately don't replicate every kubectl-drain flag here.
-// --force, --delete-emptydir-data, --grace-period, --timeout: useful
-// in scripts, less so for a TUI where the user already sees per-pod
-// progress and can hit Esc. v1 ships with safe defaults
-// (evict-only, retry on PDB, no force).
+// Drain cordons the node and checks every candidate before eviction.
+// Pods with emptyDir data or without a verifiable controller refuse
+// the drain; there is no force or local-data-deletion override.
 package cluster
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -24,8 +17,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 // NodeOpResult is the outcome of a Cordon or Uncordon call. Context
@@ -113,21 +109,9 @@ type DrainProgress struct {
 // "blocked" in progress and the drain moves on.
 const drainPDBMaxRetries = 5
 
-// Drain cordons the node, then evicts every pod on it that kubectl
-// drain would also evict (skipping mirror, DaemonSet-owned, and
-// already-completed pods). Progress events flow to out; the caller
-// is expected to range over it from a goroutine and ship each event
-// to the UI.
-//
-// Cancellation: parent ctx is honored at every yield point — between
-// pods, between PDB retries, and during the eviction call itself.
-// On cancel the function emits a final {Phase:"error", Err:"cancelled"}
-// and closes out.
-//
-// The "best-effort cordon first" step matches kubectl drain. If the
-// user has a watcher running it'll instantly reflect the cordon in
-// the table; that's signal that something is happening even before
-// the first eviction lands.
+// Drain cordons the node, validates all candidates, then requests
+// eviction. Mirror, DaemonSet-owned, and completed pods are skipped.
+// A failed preflight leaves the node cordoned and evicts nothing.
 func (s *Supervisor) Drain(ctx context.Context, ctxName, node string, out chan<- DrainProgress) {
 	defer close(out)
 
@@ -145,6 +129,17 @@ func (s *Supervisor) Drain(ctx context.Context, ctxName, node string, out chan<-
 		send(DrainProgress{Phase: "error", Err: err.Error()})
 		return
 	}
+	restCfg, err := s.RestConfigFor(ctxName)
+	if err != nil {
+		send(DrainProgress{Phase: "error", Err: err.Error()})
+		return
+	}
+	restCfg.Timeout = 30 * time.Second
+	dyn, err := dynamic.NewForConfig(restCfg)
+	if err != nil {
+		send(DrainProgress{Phase: "error", Err: err.Error()})
+		return
+	}
 
 	// Best-effort cordon first. If this fails we surface the error
 	// and bail — draining while still schedulable means new pods can
@@ -154,9 +149,9 @@ func (s *Supervisor) Drain(ctx context.Context, ctxName, node string, out chan<-
 		return
 	}
 
-	pods, err := listDrainablePods(ctx, cs, node)
+	pods, err := listDrainablePods(ctx, cs, dyn, node)
 	if err != nil {
-		send(DrainProgress{Phase: "error", Err: "list pods: " + err.Error()})
+		send(DrainProgress{Phase: "error", Err: "preflight refused: " + err.Error() + "; node remains cordoned"})
 		return
 	}
 
@@ -172,7 +167,7 @@ func (s *Supervisor) Drain(ctx context.Context, ctxName, node string, out chan<-
 		podRef := p.Namespace + "/" + p.Name
 		send(DrainProgress{Phase: "evicting", Pod: podRef, Done: done, Total: total})
 
-		if err := evictWithRetry(ctx, cs, p.Namespace, p.Name); err != nil {
+		if err := evictWithRetry(ctx, cs, p.Namespace, p.Name, p.UID); err != nil {
 			// "blocked" means we gave up on this specific pod after
 			// repeated PDB rejections (or got some other persistent
 			// error). The drain itself continues to the next pod —
@@ -188,21 +183,9 @@ func (s *Supervisor) Drain(ctx context.Context, ctxName, node string, out chan<-
 	send(DrainProgress{Phase: "done", Done: done, Total: total})
 }
 
-// listDrainablePods returns the pods on the node that kubectl drain
-// would also evict. Three buckets are skipped:
-//
-//   - Mirror pods (have the kubernetes.io/config.mirror annotation):
-//     these are static pods owned by the kubelet, not by the
-//     apiserver. Evicting them is a no-op; kubelet just recreates.
-//
-//   - DaemonSet-owned pods: kubectl drain skips these by default
-//     (--ignore-daemonsets, which has been on by default since k8s
-//     1.10ish). DS controllers will re-create them on the next
-//     scheduling pass anyway.
-//
-//   - Already-completed pods (Phase == Succeeded or Failed): nothing
-//     to evict.
-func listDrainablePods(ctx context.Context, cs *kubernetes.Clientset, node string) ([]corev1.Pod, error) {
+// Validate the whole candidate list before the first eviction, so an
+// unsafe pod late in the list cannot leave a partially drained node.
+func listDrainablePods(ctx context.Context, cs *kubernetes.Clientset, dyn dynamic.Interface, node string) ([]corev1.Pod, error) {
 	all, err := cs.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", node).String(),
 	})
@@ -210,6 +193,12 @@ func listDrainablePods(ctx context.Context, cs *kubernetes.Clientset, node strin
 		return nil, err
 	}
 	out := make([]corev1.Pod, 0, len(all.Items))
+	preflight := drainPreflight{
+		client:    dyn,
+		discovery: cs.Discovery().RESTClient(),
+		resources: make(map[string][]metav1.APIResource),
+		checked:   make(map[corev1.ObjectReference]bool),
+	}
 	for _, p := range all.Items {
 		if isMirrorPod(&p) {
 			continue
@@ -220,9 +209,77 @@ func listDrainablePods(ctx context.Context, cs *kubernetes.Clientset, node strin
 		if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
 			continue
 		}
+		if err := preflight.check(ctx, &p); err != nil {
+			return nil, fmt.Errorf("%s/%s: %w", p.Namespace, p.Name, err)
+		}
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+type drainPreflight struct {
+	client    dynamic.Interface
+	discovery rest.Interface
+	resources map[string][]metav1.APIResource
+	checked   map[corev1.ObjectReference]bool
+}
+
+func (p *drainPreflight) check(ctx context.Context, pod *corev1.Pod) error {
+	for _, volume := range pod.Spec.Volumes {
+		if volume.EmptyDir != nil {
+			return fmt.Errorf("emptyDir volume %q may contain local data that eviction would delete", volume.Name)
+		}
+	}
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil {
+		return errors.New("no controller to recreate the pod")
+	}
+	key := corev1.ObjectReference{
+		APIVersion: owner.APIVersion, Kind: owner.Kind,
+		Namespace: pod.Namespace, Name: owner.Name, UID: owner.UID,
+	}
+	if p.checked[key] {
+		return nil
+	}
+	gv, err := schema.ParseGroupVersion(owner.APIVersion)
+	if err != nil {
+		return fmt.Errorf("invalid controller API version: %w", err)
+	}
+	resources, ok := p.resources[owner.APIVersion]
+	if !ok {
+		path := "/apis/" + gv.String()
+		if gv.Group == "" {
+			path = "/api/" + gv.Version
+		}
+		var list metav1.APIResourceList
+		if err := p.discovery.Get().AbsPath(path).Do(ctx).Into(&list); err != nil {
+			return fmt.Errorf("cannot discover controller %s/%s: %w", owner.Kind, owner.Name, err)
+		}
+		resources = list.APIResources
+		p.resources[owner.APIVersion] = resources
+	}
+	for _, resource := range resources {
+		if resource.Kind != owner.Kind || strings.Contains(resource.Name, "/") {
+			continue
+		}
+		var client dynamic.ResourceInterface = p.client.Resource(gv.WithResource(resource.Name))
+		if resource.Namespaced {
+			client = p.client.Resource(gv.WithResource(resource.Name)).Namespace(pod.Namespace)
+		}
+		controller, err := client.Get(ctx, owner.Name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("cannot verify controller %s/%s: %w", owner.Kind, owner.Name, err)
+		}
+		if owner.UID == "" || controller.GetUID() != owner.UID {
+			return fmt.Errorf("controller %s/%s UID does not match the pod's owner", owner.Kind, owner.Name)
+		}
+		if controller.GetDeletionTimestamp() != nil {
+			return fmt.Errorf("controller %s/%s is being deleted", owner.Kind, owner.Name)
+		}
+		p.checked[key] = true
+		return nil
+	}
+	return fmt.Errorf("cannot resolve controller kind %s in %s", owner.Kind, owner.APIVersion)
 }
 
 func isMirrorPod(p *corev1.Pod) bool {
@@ -253,10 +310,10 @@ func isDaemonSetOwned(p *corev1.Pod) bool {
 // 404 is treated as success: somebody else (the kubelet, a
 // controller) already removed the pod between our list and our
 // evict — there's nothing left to do.
-func evictWithRetry(ctx context.Context, cs *kubernetes.Clientset, ns, name string) error {
+func evictWithRetry(ctx context.Context, cs *kubernetes.Clientset, ns, name string, uid types.UID) error {
 	backoff := time.Second
 	for attempt := 0; ; attempt++ {
-		err := evictOnce(ctx, cs, ns, name)
+		err := evictOnce(ctx, cs, ns, name, uid)
 		if err == nil {
 			return nil
 		}
@@ -278,9 +335,11 @@ func evictWithRetry(ctx context.Context, cs *kubernetes.Clientset, ns, name stri
 	}
 }
 
-func evictOnce(ctx context.Context, cs *kubernetes.Clientset, ns, name string) error {
+func evictOnce(ctx context.Context, cs *kubernetes.Clientset, ns, name string, uid types.UID) error {
 	ev := &policyv1.Eviction{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		// A replacement with the same name has not passed preflight.
+		DeleteOptions: &metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}},
 	}
 	return cs.PolicyV1().Evictions(ns).Evict(ctx, ev)
 }
