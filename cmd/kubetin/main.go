@@ -24,6 +24,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -1089,17 +1090,19 @@ func pickWatchContext(ctx context.Context, store *model.Store, want, prefer stri
 }
 
 func consumePodEvents(ctx context.Context, w *cluster.PodWatcher, count *atomic.Int64) {
+	pods := make(map[types.UID]struct{})
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			switch ev.Kind {
-			case cluster.PodAdded:
-				count.Add(1)
-			case cluster.PodDeleted:
-				count.Add(-1)
+			if ev.Kind == cluster.PodDeleted {
+				delete(pods, ev.UID)
+			} else {
+				// A coalesced UPDATE can be the first observation of a UID.
+				pods[ev.UID] = struct{}{}
 			}
+			count.Store(int64(len(pods)))
 			fmt.Printf("   %s  %s  %s/%-40s  phase=%-10s  restarts=%d  node=%s\n",
 				time.Now().Format("15:04:05"),
 				ev.Kind, ev.Namespace, ev.Name, ev.Phase, ev.Restarts, ev.NodeName)
@@ -1114,11 +1117,11 @@ func printStatus(s *model.Store, watched string, podCount *atomic.Int64, w *clus
 	now := time.Now().Format("15:04:05")
 	suffix := ""
 	if watched != "" {
-		dropped := uint64(0)
+		coalesced := uint64(0)
 		if w != nil {
-			dropped = w.DroppedEvents.Load()
+			coalesced = w.CoalescedEvents.Load()
 		}
-		suffix = fmt.Sprintf(" · watching=%s pods=%d dropped=%d", watched, podCount.Load(), dropped)
+		suffix = fmt.Sprintf(" · watching=%s pods=%d coalesced=%d", watched, podCount.Load(), coalesced)
 	}
 	fmt.Printf("── %s ── %d clusters%s ───────────────────────────\n", now, len(snap), suffix)
 	for _, st := range snap {

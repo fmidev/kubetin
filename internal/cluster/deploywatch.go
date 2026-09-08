@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -64,19 +63,20 @@ type DeployEvent struct {
 
 // DeployWatcher mirrors PodWatcher / NodeWatcher.
 type DeployWatcher struct {
-	Context       string
-	Out           chan DeployEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[DeployEvent]
 }
 
 func NewDeployWatcher(ctxName string, cap int) *DeployWatcher {
 	return &DeployWatcher{
-		Context: ctxName,
-		Out:     make(chan DeployEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[DeployEvent](cap),
 	}
 }
 
 func (w *DeployWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -161,11 +161,7 @@ func (w *DeployWatcher) emit(kind DeployEventKind, obj any) {
 		MaxUnavailable: maxUnavail,
 		Conditions:     projectDeployConditions(d.Status.Conditions),
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == DeployDeleted)
 }
 
 func projectDeployConditions(conds []appsv1.DeploymentCondition) []DeployCondition {

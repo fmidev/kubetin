@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	networkingv1 "k8s.io/api/networking/v1"
@@ -58,19 +57,20 @@ type IngressEvent struct {
 
 // IngressWatcher mirrors ServiceWatcher.
 type IngressWatcher struct {
-	Context       string
-	Out           chan IngressEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[IngressEvent]
 }
 
 func NewIngressWatcher(ctxName string, cap int) *IngressWatcher {
 	return &IngressWatcher{
-		Context: ctxName,
-		Out:     make(chan IngressEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[IngressEvent](cap),
 	}
 }
 
 func (w *IngressWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -201,9 +201,5 @@ func (w *IngressWatcher) emit(kind IngEventKind, obj any) {
 		TLSHosts:  tlsHosts,
 		CreatedAt: ing.CreationTimestamp.Time,
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == IngDeleted)
 }
