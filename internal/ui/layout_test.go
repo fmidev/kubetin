@@ -252,6 +252,16 @@ func TestViewFitsCanvas(t *testing.T) {
 				"kube-system/etcd-0 (PDB blocked after 5 retries)",
 			}
 		}},
+		{"drain-waiting/narrow", 80, 24, ViewNodes, func(m *Model) {
+			m.drainProgress = drainProgressState{open: true, node: "worker", phase: "waiting", current: "default/terminating", done: 1, total: 3}
+		}},
+		{"drain-incomplete/tiny", 60, 20, ViewNodes, func(m *Model) {
+			m.drainProgress = drainProgressState{
+				open: true, node: "worker", phase: "done", done: 1, total: 7,
+				err:       "context deadline exceeded",
+				remaining: []string{"default/a", "default/b", "default/c", "default/d", "default/e", "default/f"},
+			}
+		}},
 		{"ns-picker", 120, 40, ViewPods, func(m *Model) {
 			m.nsPickerOpen = true
 			m.nsPickerOptions = []string{"(all namespaces)", "default", "kube-system"}

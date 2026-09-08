@@ -56,12 +56,61 @@ func TestDrainBlockedLabelsPreserveCause(t *testing.T) {
 				t.Fatalf("progress misrepresents cause %q: %s", cause, view)
 			}
 			updated, _ = m.applyDrainDone(DrainDoneMsg{
-				Context: "alpha", Node: "worker", Total: 1, Blocked: []string{"default/pod (" + cause + ")"},
+				Context: "alpha", Node: "worker", Total: 1, Blocked: []string{"default/pod (" + cause + ")"}, Remaining: []string{"default/pod"},
 			})
 			m = updated.(Model)
 			if !strings.Contains(m.toast, "(1 blocked)") || strings.Contains(m.toast, "PDB") {
 				t.Fatalf("summary misrepresents cause %q: %s", cause, m.toast)
 			}
+			if view := m.renderDrainProgress(120, 40); !strings.Contains(view, cause) {
+				t.Fatalf("incomplete result lost cause %q: %s", cause, view)
+			}
 		})
+	}
+}
+
+func TestDrainWaitingDoesNotReportCompletion(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.drainProgress = drainProgressState{open: true, context: "alpha", node: "worker"}
+	updated, _ := m.applyDrainProgress(DrainProgressMsg{
+		Context: "alpha", Node: "worker", Phase: "waiting", Done: 0, Total: 1,
+	})
+	m = updated.(Model)
+	view := m.renderDrainProgress(120, 40)
+	if !m.drainProgress.open || !strings.Contains(view, "0 / 1 terminated") || !strings.Contains(view, "waiting for pod termination") {
+		t.Fatalf("accepted eviction reported incorrectly: %s", view)
+	}
+}
+
+func TestDrainIncompleteResultRemainsVisible(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.drainProgress = drainProgressState{open: true, context: "alpha", node: "worker"}
+	updated, _ := m.applyDrainDone(DrainDoneMsg{
+		Context: "alpha", Node: "worker", Done: 1, Total: 3,
+		Err: "context deadline exceeded\n\x1b[31m", Remaining: []string{"default/terminating", "default/unattempted"},
+	})
+	m = updated.(Model)
+	view := m.renderDrainProgress(120, 40)
+	for _, want := range []string{"Drain incomplete: 1 / 3 terminated", "context deadline exceeded", "default/terminating", "default/unattempted", "esc to close"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("incomplete result missing %q: %s", want, view)
+		}
+	}
+	if !m.drainProgress.open || strings.ContainsFunc(m.drainProgress.err, unicode.IsControl) || strings.Contains(m.toast, "✓") {
+		t.Fatalf("incorrect incomplete state: %+v toast=%q", m.drainProgress, m.toast)
+	}
+	updated, _ = m.handleDrainProgressKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(Model).drainProgress.open {
+		t.Fatal("escape did not dismiss incomplete result")
+	}
+}
+
+func TestDrainSuccessClosesProgress(t *testing.T) {
+	m := New("alpha", model.NewStore(), []string{"alpha"})
+	m.drainProgress = drainProgressState{open: true, context: "alpha", node: "worker"}
+	updated, _ := m.applyDrainDone(DrainDoneMsg{Context: "alpha", Node: "worker", Done: 2, Total: 2})
+	m = updated.(Model)
+	if m.drainProgress.open || !strings.Contains(m.toast, "✓ Drained worker: 2/2") {
+		t.Fatalf("successful drain did not complete: open=%v toast=%q", m.drainProgress.open, m.toast)
 	}
 }

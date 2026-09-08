@@ -404,8 +404,8 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 		klog.Infof("drain: %s on %s requested", node, focusedCtx)
 		// Drain context is detached from the per-request timeout —
 		// the UI cancels via the function we return on the
-		// DrainStartMsg, not via a wall-clock deadline. ctx is the
-		// process-level context, so an outer shutdown still aborts.
+		// DrainStartMsg. The supervisor also enforces a drain deadline;
+		// an outer process shutdown still aborts.
 		drainCtx, cancel := context.WithCancel(ctx)
 		progress := make(chan cluster.DrainProgress, 64)
 
@@ -419,6 +419,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 			var blocked []string
 			var finalDone, finalTotal int
 			var finalErr string
+			var remaining []string
 			for ev := range progress {
 				prog.Send(ui.DrainProgressMsg(ev))
 				if ev.Total > finalTotal {
@@ -433,16 +434,20 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 				if ev.Phase == "error" {
 					finalErr = ev.Err
 				}
+				if ev.Phase == "error" || ev.Phase == "done" {
+					remaining = ev.Remaining
+				}
 			}
 			klog.Infof("drain: %s on %s ended done=%d/%d err=%q blocked=%d",
 				node, focusedCtx, finalDone, finalTotal, finalErr, len(blocked))
 			prog.Send(ui.DrainDoneMsg{
-				Context: focusedCtx,
-				Node:    node,
-				Done:    finalDone,
-				Total:   finalTotal,
-				Err:     finalErr,
-				Blocked: blocked,
+				Context:   focusedCtx,
+				Node:      node,
+				Done:      finalDone,
+				Total:     finalTotal,
+				Err:       finalErr,
+				Blocked:   blocked,
+				Remaining: remaining,
 			})
 			cancel() // releases the drain context once the stream is fully drained
 		}()
