@@ -199,7 +199,7 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	cb := m.OnLogsStart
 	focused := m.WatchedContext
 	req := LogStartMsg{Session: m.logs.session, Ref: ref, Container: container, Tail: tail}
-	return func() tea.Msg { return cb(focused, req) }
+	return m.focusedCmd(func() tea.Msg { return cb(focused, req) })
 }
 
 // tailOrDefault reports the tail this stream actually requested,

@@ -81,10 +81,6 @@ type NodeOpResultMsg cluster.NodeOpResult
 // without the message.
 type toastClearMsg time.Time
 
-// PodsClearedMsg is sent when the focused cluster changes so the
-// pods/nodes tables empty before new ADD events arrive.
-type PodsClearedMsg struct{}
-
 // View identifies which resource view is currently shown.
 type View int
 
@@ -109,10 +105,12 @@ type ProbeTickMsg time.Time
 
 // Model is the top-level bubbletea Model.
 type Model struct {
-	WatchedContext string
-	Store          *model.Store
-	Theme          Theme
-	Contexts       []string // ordered list of all kubeconfig contexts
+	WatchedContext  string
+	focusGeneration uint64
+	focusLife       *focusLifetime
+	Store           *model.Store
+	Theme           Theme
+	Contexts        []string // ordered list of all kubeconfig contexts
 	// Build is the version line shown in the help overlay. main wires
 	// this; left empty when not provided (the help renders without it).
 	Build string
@@ -133,7 +131,7 @@ type Model struct {
 	// OnFocusChange is called from a tea.Cmd when the user switches
 	// the focused cluster (Tab/Shift-Tab). Main wires this to the
 	// watcher swap coordinator.
-	OnFocusChange func(ctx string)
+	OnFocusChange func(FocusTarget)
 
 	// OnDescribe runs the describe fetch off-thread and returns the
 	// result as a tea.Msg. Main wires this so the UI doesn't have to
@@ -184,7 +182,7 @@ type Model struct {
 	// DrainDoneMsg events flow asynchronously over the program's
 	// channel — main.go spawns a forwarder goroutine for the same
 	// reason logs do.
-	OnDrainStart func(focusedCtx, node string) tea.Msg
+	OnDrainStart func(focus FocusTarget, node string) tea.Msg
 
 	pods        map[types.UID]podRow
 	nodes       map[types.UID]nodeRow
@@ -206,7 +204,7 @@ type Model struct {
 	filterFocused  bool   // capturing keystrokes into filterText
 
 	// Per-view "first event received" flags. Reset when the focused
-	// cluster changes (PodsClearedMsg), set to true on the first event
+	// cluster changes synchronously, set to true on the first event
 	// of that kind. Used so the empty-table placeholder can distinguish
 	// "still syncing" from "synced with zero rows" — otherwise a Tab to
 	// a cluster with no pods looks identical to a stuck informer.
@@ -267,6 +265,7 @@ type Model struct {
 func New(context string, store *model.Store, contexts []string) Model {
 	return Model{
 		WatchedContext: context,
+		focusLife:      newFocusLifetime(),
 		Store:          store,
 		Theme:          DefaultTheme(),
 		Contexts:       contexts,
@@ -303,6 +302,24 @@ func tickCmd() tea.Cmd {
 
 // Update handles all incoming messages.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if focused, ok := msg.(FocusedMsg); ok {
+		if focused.Focus != m.Focus() {
+			discardFocusedMessage(focused.Msg)
+			return m, nil
+		}
+		msg = focused.Msg
+	} else if m.focusGeneration != 0 {
+		// Once focus has changed, untagged cluster work cannot identify
+		// which visit produced it, even when its context name matches.
+		switch msg.(type) {
+		case PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
+			SvcEventMsg, IngEventMsg, EndpointSliceEventMsg, MetricsSnapshotMsg, NetworkSnapshotMsg,
+			DescribeResultMsg, PermissionResultMsg, DeleteResultMsg, ScaleResultMsg, RolloutResultMsg,
+			NodeOpResultMsg, DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
+			discardFocusedMessage(msg)
+			return m, nil
+		}
+	}
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
@@ -721,34 +738,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case PodsClearedMsg:
-		m.pods = make(map[types.UID]podRow)
-		m.nodes = make(map[types.UID]nodeRow)
-		m.deployments = make(map[types.UID]deploymentRow)
-		m.events = make(map[types.UID]eventRow)
-		m.namespaces = make(map[types.UID]nsRow)
-		m.services = make(map[types.UID]serviceRow)
-		m.ingresses = make(map[types.UID]ingressRow)
-		m.endpointSlices = make(map[types.UID]endpointSliceRow)
-		m.cursor = ""
-		m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents, m.syncedNamespaces = false, false, false, false, false
-		m.syncedServices, m.syncedIngresses = false, false
-		m.syncStartedAt = time.Now()
-		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
-		m.netHistory = netRing{}
-		m.restartBaseline = make(map[types.UID]int32)
-		// A scoped object on the previous cluster doesn't exist on the
-		// new one — close the lens rather than leave it filtered down
-		// to zero matches with no obvious way to recover. The
-		// dashboard's target is the same story, and it owns a log
-		// stream that has to stop with it.
-		m.eventsLens = eventsLensState{}
-		if m.dashboard.open {
-			m.dashboard = dashboardState{}
-			m.stopDashboardLogs()
-		}
-		return m, nil
-
 	case FleetDetailMsg:
 		// Guard on the cluster the dashboard requested, not on
 		// WatchedContext — the dashboard shows all clusters. A result
@@ -1122,9 +1111,9 @@ func (m *Model) dispatchPermissionChecks(ref cluster.DescribeRef) []tea.Cmd {
 		ctxName := m.WatchedContext
 		ns := ref.Namespace
 		v := av
-		cmds = append(cmds, func() tea.Msg {
+		cmds = append(cmds, m.focusedCmd(func() tea.Msg {
 			return cb(ctxName, v.Verb, v.Group, v.Resource, ns)
-		})
+		}))
 	}
 	return cmds
 }
@@ -1155,9 +1144,9 @@ func (m *Model) dispatchRBACOverview() []tea.Cmd {
 			cb := m.OnCanI
 			ctxName := m.WatchedContext
 			verb, group, res, scope := p.Verb, p.APIGroup, p.Resource, ns
-			cmds = append(cmds, func() tea.Msg {
+			cmds = append(cmds, m.focusedCmd(func() tea.Msg {
 				return cb(ctxName, verb, group, res, scope)
-			})
+			}))
 		}
 	}
 	return cmds
@@ -1222,7 +1211,7 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		req := DescribeRequestMsg{Ref: ref, Reveal: false}
 		cb := m.OnDescribe
 		focused := m.WatchedContext
-		return m, func() tea.Msg { return cb(req, focused) }
+		return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
 	case ActLogs:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1252,7 +1241,7 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		cb := m.OnCordon
 		focused := m.WatchedContext
 		name := ref.Name
-		return m, func() tea.Msg { return cb(focused, name) }
+		return m, m.focusedCmd(func() tea.Msg { return cb(focused, name) })
 	case ActUncordon:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1262,7 +1251,7 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		cb := m.OnUncordon
 		focused := m.WatchedContext
 		name := ref.Name
-		return m, func() tea.Msg { return cb(focused, name) }
+		return m, m.focusedCmd(func() tea.Msg { return cb(focused, name) })
 	case ActDrain:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1309,7 +1298,7 @@ func (m Model) openDescribe(reveal bool) (tea.Model, tea.Cmd) {
 	req := DescribeRequestMsg{Ref: ref, Reveal: reveal}
 	cb := m.OnDescribe
 	focused := m.WatchedContext
-	return m, func() tea.Msg { return cb(req, focused) }
+	return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
 }
 
 // handleDescribeKey routes input while the describe overlay is open.
@@ -1364,7 +1353,7 @@ func (m Model) handleDescribeKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			req := DescribeRequestMsg{Ref: ref, Reveal: true}
 			cb := m.OnDescribe
 			focused := m.WatchedContext
-			return m, func() tea.Msg { return cb(req, focused) }
+			return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
 		}
 	}
 	return m, nil
@@ -1428,7 +1417,7 @@ func (m Model) handleFilterKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) cycleFocus(delta int) tea.Cmd {
 	// <=1 rather than ==0: with a single context the loop below lands
 	// back on the context already focused and "switches" to it, which
-	// cancels every watcher, blanks the tables via PodsClearedMsg and
+	// cancels every watcher, blanks the tables and
 	// pays for a full re-list — a visible resync in exchange for no
 	// navigation at all.
 	if len(m.Contexts) <= 1 || m.OnFocusChange == nil {
@@ -1476,17 +1465,25 @@ func (m *Model) cycleFocus(delta int) tea.Cmd {
 
 // focusContext points the watchers and the tables at ctx.
 func (m *Model) focusContext(c string) tea.Cmd {
+	if c == m.WatchedContext {
+		return nil
+	}
+	if m.focusLife != nil {
+		m.focusLife.cancel()
+	}
+	m.focusLife = newFocusLifetime()
+	m.focusGeneration++
 	m.WatchedContext = c
-	// Permissions are per-cluster — a stale entry from the old
-	// context would let the new view paint a confident wrong
-	// answer (the RBAC overlay especially, which renders straight
-	// from cache). Drop both caches; they refill on demand.
-	m.permissions = make(map[string]permState)
-	m.permissionsInFlight = make(map[string]struct{})
+	// Clear before returning a command: its execution may be delayed
+	// or reordered relative to the next focus change.
+	m.clearFocusedState()
 	cb := m.OnFocusChange
+	focus := m.Focus()
 	return func() tea.Msg {
-		cb(c)
-		return PodsClearedMsg{}
+		if cb != nil {
+			cb(focus)
+		}
+		return nil
 	}
 }
 

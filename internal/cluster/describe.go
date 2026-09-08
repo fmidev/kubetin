@@ -8,6 +8,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"sigs.k8s.io/yaml"
 )
@@ -21,6 +22,7 @@ type DescribeRef struct {
 	Kind      string // singular, capitalized: "Pod", "Node", "Deployment", "Secret"
 	Namespace string // empty for cluster-scoped
 	Name      string
+	UID       types.UID // selected resource identity, when available
 }
 
 // DescribeResult is what the UI renders. Context is the kubeconfig

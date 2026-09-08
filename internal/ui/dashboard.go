@@ -815,7 +815,7 @@ func (m Model) openDescribeFor(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
 	cb := m.OnDescribe
 	focused := m.WatchedContext
 	req := DescribeRequestMsg{Ref: ref}
-	return m, func() tea.Msg { return cb(req, focused) }
+	return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
 }
 
 // drillIntoSelectedPod pushes the pod under the PODS-pane cursor onto

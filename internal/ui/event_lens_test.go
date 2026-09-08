@@ -213,7 +213,8 @@ func TestEventsLensScrollClamps(t *testing.T) {
 // Switching clusters closes the lens: its target doesn't exist there.
 func TestEventsLensClosedOnClusterSwitch(t *testing.T) {
 	m := lensModel(120, 24, nil)
-	out, _ := m.Update(PodsClearedMsg{})
+	m.focusContext("other")
+	var out tea.Model = m
 	if out.(Model).eventsLens.open {
 		t.Error("lens survived a cluster switch")
 	}

@@ -108,7 +108,11 @@ func (s *Supervisor) Delete(ctx context.Context, ctxName string, ref DescribeRef
 
 	delCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := resource.Delete(delCtx, ref.Name, metav1.DeleteOptions{}); err != nil {
+	options := metav1.DeleteOptions{}
+	if ref.UID != "" {
+		options.Preconditions = &metav1.Preconditions{UID: &ref.UID}
+	}
+	if err := resource.Delete(delCtx, ref.Name, options); err != nil {
 		out.Err = err.Error()
 		return out
 	}

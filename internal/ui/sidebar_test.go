@@ -67,13 +67,13 @@ func TestFooterHintDropsTabForSingleCluster(t *testing.T) {
 
 // Tab with a single context used to re-focus the cluster already
 // focused: that cancels every watcher, blanks the tables through
-// PodsClearedMsg and pays for a full re-list, all for no navigation.
+// a focus reset and pays for a full re-list, all for no navigation.
 func TestTabIsNoOpWithSingleContext(t *testing.T) {
 	m := sidebarModel([]string{"alpha"}, 120, 20)
 	m.Store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
 
 	called := false
-	m.OnFocusChange = func(string) { called = true }
+	m.OnFocusChange = func(FocusTarget) { called = true }
 
 	cmd := m.cycleFocus(+1)
 	if cmd != nil {
@@ -96,17 +96,16 @@ func TestTabStillSwitchesWithMultipleContexts(t *testing.T) {
 	m.Store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachHealthy})
 
 	var switched string
-	m.OnFocusChange = func(c string) { switched = c }
+	m.OnFocusChange = func(c FocusTarget) { switched = c.Context }
 
 	cmd := m.cycleFocus(+1)
 	if cmd == nil {
 		t.Fatal("cycleFocus returned no command with two healthy contexts")
 	}
-	if msg := cmd(); msg == nil {
-		t.Error("expected PodsClearedMsg from the focus swap")
-	} else if _, ok := msg.(PodsClearedMsg); !ok {
-		t.Errorf("got %T, want PodsClearedMsg", msg)
+	if msg := cmd(); msg != nil {
+		t.Errorf("focus command must not clear state asynchronously: %T", msg)
 	}
+
 	if switched != "beta" || m.WatchedContext != "beta" {
 		t.Errorf("switched to %q / watching %q, want beta", switched, m.WatchedContext)
 	}
@@ -152,7 +151,7 @@ func TestHiddenRailKeepsClusterSwitching(t *testing.T) {
 	m.HideSidebar = true
 	m.Store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
 	m.Store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachHealthy})
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 
 	if !strings.Contains(m.renderFooter(), "Tab:cluster") {
 		t.Error("footer dropped Tab:cluster even though two clusters are configured")
@@ -174,7 +173,7 @@ func TestTabFollowsRailOrder(t *testing.T) {
 	for _, c := range []string{"alpha", "beta", "gamma"} {
 		m.Store.ApplyProbe(c, model.ProbeFields{Reach: model.ReachHealthy})
 	}
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 
 	for _, want := range []string{"beta", "gamma", "alpha"} {
 		if cmd := m.cycleFocus(+1); cmd == nil {
@@ -202,7 +201,7 @@ func TestTabOrderTracksReachTier(t *testing.T) {
 	m.Store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
 	m.Store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachUnreachable})
 	m.Store.ApplyProbe("gamma", model.ProbeFields{Reach: model.ReachHealthy})
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 
 	// Rail order is alpha, gamma, beta — so Tab from alpha skips the
 	// unreachable beta and lands on gamma.
@@ -225,7 +224,7 @@ func TestTabFallsBackToUnreachableNeighbour(t *testing.T) {
 	m.Store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
 	m.Store.ApplyProbe("beta", model.ProbeFields{Reach: model.ReachUnreachable})
 	m.Store.ApplyProbe("gamma", model.ProbeFields{Reach: model.ReachAuthFailed})
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 
 	// Rail order: alpha (healthy), beta, gamma (both tier 4/3 — auth
 	// sorts before unreachable, so gamma is next).
@@ -250,7 +249,7 @@ func TestTabFallsBackToUnreachableNeighbour(t *testing.T) {
 func TestTabReachesUnprobedContext(t *testing.T) {
 	m := sidebarModel([]string{"alpha", "beta"}, 120, 20)
 	m.Store.ApplyProbe("alpha", model.ProbeFields{Reach: model.ReachHealthy})
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 
 	if cmd := m.cycleFocus(+1); cmd == nil {
 		t.Fatal("Tab refused to move to an unprobed context")

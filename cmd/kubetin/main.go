@@ -186,22 +186,16 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	// Build the watch coordinator first so we can wire its switchTo
 	// into the model before bubbletea takes ownership.
 	var coord *watchCoordinator
-	// focusContext is switchTo plus the "reopen here next time" record.
-	// Wrapped here rather than inside the coordinator so the coordinator
-	// stays about watcher lifetimes.
-	focusContext := func(c string) {
-		saveLastContext(c)
-		coord.switchTo(c)
-	}
 	if !noWatch {
 		coord = &watchCoordinator{
 			parent: ctx,
 			sup:    sup,
-			reqCh:  make(chan string, 4),
+			reqCh:  make(chan struct{}, 1),
 			stopCh: make(chan struct{}),
 			doneCh: make(chan struct{}),
 		}
-		m.OnFocusChange = focusContext
+		coord.spawn = coord.spawnWatchers
+		m.OnFocusChange = coord.switchTo
 	}
 
 	// Wire describe so the UI can fetch live YAML via the supervisor
@@ -401,7 +395,8 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 		}
 		return ui.NodeOpResultMsg(res)
 	}
-	m.OnDrainStart = func(focusedCtx, node string) tea.Msg {
+	m.OnDrainStart = func(focus ui.FocusTarget, node string) tea.Msg {
+		focusedCtx := focus.Context
 		klog.Infof("drain: %s on %s requested", node, focusedCtx)
 		// Drain context is detached from the per-request timeout —
 		// the UI cancels via the function we return on the
@@ -422,7 +417,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 			var finalErr string
 			var remaining []string
 			for ev := range progress {
-				prog.Send(ui.DrainProgressMsg(ev))
+				prog.Send(ui.FocusedMsg{Focus: focus, Msg: ui.DrainProgressMsg(ev)})
 				if ev.Total > finalTotal {
 					finalTotal = ev.Total
 				}
@@ -441,7 +436,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 			}
 			klog.Infof("drain: %s on %s ended done=%d/%d err=%q blocked=%d",
 				node, focusedCtx, finalDone, finalTotal, finalErr, len(blocked))
-			prog.Send(ui.DrainDoneMsg{
+			prog.Send(ui.FocusedMsg{Focus: focus, Msg: ui.DrainDoneMsg{
 				Context:   focusedCtx,
 				Node:      node,
 				Done:      finalDone,
@@ -449,7 +444,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 				Err:       finalErr,
 				Blocked:   blocked,
 				Remaining: remaining,
-			})
+			}})
 			cancel() // releases the drain context once the stream is fully drained
 		}()
 
@@ -469,7 +464,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	if coord != nil {
 		coord.prog = prog
 		go coord.loop()
-		focusContext(selected)
+		coord.switchTo(m.Focus())
 	}
 
 	defer func() {
@@ -503,28 +498,42 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	}
 }
 
-// watchCoordinator owns the currently-active PodWatcher. switchTo
-// cancels the old watcher (if any) and starts a new one for ctx.
-// Calls are serialised through reqCh so concurrent Tab presses don't
-// race each other.
+// watchCoordinator keeps the newest focus generation and debounces
+// swaps of the active watcher set, regardless of command arrival order.
 type watchCoordinator struct {
 	parent context.Context
 	sup    *cluster.Supervisor
 	prog   *tea.Program
 
-	reqCh  chan string
-	stopCh chan struct{}
-	doneCh chan struct{}
+	reqCh      chan struct{}
+	stopCh     chan struct{}
+	doneCh     chan struct{}
+	mu         sync.Mutex
+	latest     ui.FocusTarget
+	hasRequest bool
+	spawn      func(context.Context, ui.FocusTarget)
 }
 
-func (c *watchCoordinator) switchTo(target string) {
-	// Non-blocking send into a buffered channel. The loop debounces;
-	// a backed-up channel just means the loop will pick the latest
-	// target on the next iteration.
+func (c *watchCoordinator) switchTo(target ui.FocusTarget) {
+	c.mu.Lock()
+	if c.hasRequest && target.Generation <= c.latest.Generation {
+		c.mu.Unlock()
+		return
+	}
+	c.latest, c.hasRequest = target, true
+	c.mu.Unlock()
+	// The channel is a wake-up signal; a full channel still retains the
+	// newest intent in latest. Delayed commands cannot replace it.
 	select {
-	case c.reqCh <- target:
+	case c.reqCh <- struct{}{}:
 	default:
 	}
+}
+
+func (c *watchCoordinator) latestRequest() ui.FocusTarget {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.latest
 }
 
 func (c *watchCoordinator) stop() {
@@ -546,7 +555,8 @@ func (c *watchCoordinator) loop() {
 	defer close(c.doneCh)
 	var (
 		curCancel context.CancelFunc
-		pending   string
+		pending   ui.FocusTarget
+		active    ui.FocusTarget
 	)
 	// Pre-stopped timer; we only Reset() it when there's something
 	// queued. Drain on Reset to avoid stale fires.
@@ -556,7 +566,8 @@ func (c *watchCoordinator) loop() {
 	}
 	defer debounce.Stop()
 
-	apply := func(target string) {
+	apply := func(target ui.FocusTarget) {
+		active = target
 		if curCancel != nil {
 			curCancel()
 		}
@@ -577,8 +588,12 @@ func (c *watchCoordinator) loop() {
 				curCancel()
 			}
 			return
-		case target := <-c.reqCh:
-			pending = target
+		case <-c.reqCh:
+			pending = c.latestRequest()
+			if pending == active {
+				pending = ui.FocusTarget{}
+				continue
+			}
 			if !debounce.Stop() {
 				select {
 				case <-debounce.C:
@@ -587,21 +602,28 @@ func (c *watchCoordinator) loop() {
 			}
 			debounce.Reset(debounceWindow)
 		case <-debounce.C:
-			if pending == "" {
+			if pending.Context == "" {
+				continue
+			}
+			if latest := c.latestRequest(); latest != pending {
+				pending = latest
+				debounce.Reset(debounceWindow)
 				continue
 			}
 			target := pending
-			pending = ""
+			pending = ui.FocusTarget{}
 			apply(target)
 		}
 	}
 }
 
-// spawn starts the per-cluster watcher set inside the given child ctx.
+// spawnWatchers starts the per-cluster watcher set inside the given child ctx.
 // Extracted from loop() so the request/debounce flow stays readable.
-func (c *watchCoordinator) spawn(child context.Context, target string) {
+func (c *watchCoordinator) spawnWatchers(child context.Context, focus ui.FocusTarget) {
+	target := focus.Context
+	saveLastContext(target)
 	pw := cluster.NewPodWatcher(target, 256)
-	go forwardPodEvents(child, pw, c.prog)
+	go forwardPodEvents(child, pw, c.prog, focus)
 	go func() {
 		if err := pw.Run(child, c.sup); err != nil {
 			klog.Errorf("pod watcher (%s) exited: %v", target, err)
@@ -609,7 +631,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	}()
 
 	nw := cluster.NewNodeWatcher(target, 64)
-	go forwardNodeEvents(child, nw, c.prog)
+	go forwardNodeEvents(child, nw, c.prog, focus)
 	go func() {
 		if err := nw.Run(child, c.sup); err != nil {
 			klog.Errorf("node watcher (%s) exited: %v", target, err)
@@ -617,7 +639,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	}()
 
 	dw := cluster.NewDeployWatcher(target, 256)
-	go forwardDeployEvents(child, dw, c.prog)
+	go forwardDeployEvents(child, dw, c.prog, focus)
 	go func() {
 		if err := dw.Run(child, c.sup); err != nil {
 			klog.Errorf("deploy watcher (%s) exited: %v", target, err)
@@ -625,7 +647,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	}()
 
 	ew := cluster.NewEventWatcher(target, 512)
-	go forwardEvtEvents(child, ew, c.prog)
+	go forwardEvtEvents(child, ew, c.prog, focus)
 	go func() {
 		if err := ew.Run(child, c.sup); err != nil {
 			klog.Errorf("event watcher (%s) exited: %v", target, err)
@@ -638,7 +660,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	// always spawn it — RBAC checks live one layer down rather than
 	// being duplicated here.
 	nsw := cluster.NewNamespaceWatcher(target, 256)
-	go forwardNsEvents(child, nsw.Out, c.prog)
+	go forwardNsEvents(child, nsw.Out, c.prog, focus)
 	go func() {
 		if err := nsw.Run(child, c.sup); err != nil {
 			klog.Errorf("namespace watcher (%s) exited: %v", target, err)
@@ -651,7 +673,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	// namespace watcher above no-ops via its own projectsPreferred
 	// check, so the two are mutually exclusive at runtime.
 	projw := cluster.NewProjectWatcher(target, 256)
-	go forwardNsEvents(child, projw.Out, c.prog)
+	go forwardNsEvents(child, projw.Out, c.prog, focus)
 	go func() {
 		if err := projw.Run(child, c.sup); err != nil {
 			klog.Errorf("project watcher (%s) exited: %v", target, err)
@@ -662,7 +684,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	// so each scopes itself through Supervisor.ResolveScope inside
 	// Run() — same as the pod and deployment watchers.
 	svcw := cluster.NewServiceWatcher(target, 256)
-	go forwardSvcEvents(child, svcw, c.prog)
+	go forwardSvcEvents(child, svcw, c.prog, focus)
 	go func() {
 		if err := svcw.Run(child, c.sup); err != nil {
 			klog.Errorf("service watcher (%s) exited: %v", target, err)
@@ -670,7 +692,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	}()
 
 	ingw := cluster.NewIngressWatcher(target, 256)
-	go forwardIngEvents(child, ingw, c.prog)
+	go forwardIngEvents(child, ingw, c.prog, focus)
 	go func() {
 		if err := ingw.Run(child, c.sup); err != nil {
 			klog.Errorf("ingress watcher (%s) exited: %v", target, err)
@@ -681,7 +703,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	// leaves that column showing "—"; every other cell still comes off
 	// the Service itself.
 	esw := cluster.NewEndpointSliceWatcher(target, 512)
-	go forwardEndpointSliceEvents(child, esw, c.prog)
+	go forwardEndpointSliceEvents(child, esw, c.prog, focus)
 	go func() {
 		if err := esw.Run(child, c.sup); err != nil {
 			klog.Errorf("endpointslice watcher (%s) exited: %v", target, err)
@@ -689,7 +711,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	}()
 
 	mp := cluster.NewFocusedMetricsPoller(target, 4)
-	go forwardMetrics(child, mp, c.prog)
+	go forwardMetrics(child, mp, c.prog, focus)
 	go func() {
 		if err := mp.Run(child, c.sup); err != nil {
 			klog.Errorf("metrics poller (%s) exited: %v", target, err)
@@ -701,7 +723,7 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	// run standalone — clusters without metrics-server still get
 	// network panels (and vice versa).
 	np := cluster.NewNetworkPoller(target, 4)
-	go forwardNetwork(child, np, c.prog)
+	go forwardNetwork(child, np, c.prog, focus)
 	go func() {
 		if err := np.Run(child, c.sup); err != nil {
 			klog.Errorf("network poller (%s) exited: %v", target, err)
@@ -709,79 +731,83 @@ func (c *watchCoordinator) spawn(child context.Context, target string) {
 	}()
 }
 
-func forwardSvcEvents(ctx context.Context, w *cluster.ServiceWatcher, p *tea.Program) {
+type watchMessageSender interface {
+	Send(tea.Msg)
+}
+
+func forwardSvcEvents(ctx context.Context, w *cluster.ServiceWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			p.Send(ui.SvcEventMsg(ev))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.SvcEventMsg(ev)})
 		}
 	}
 }
 
-func forwardIngEvents(ctx context.Context, w *cluster.IngressWatcher, p *tea.Program) {
+func forwardIngEvents(ctx context.Context, w *cluster.IngressWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			p.Send(ui.IngEventMsg(ev))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.IngEventMsg(ev)})
 		}
 	}
 }
 
-func forwardEndpointSliceEvents(ctx context.Context, w *cluster.EndpointSliceWatcher, p *tea.Program) {
+func forwardEndpointSliceEvents(ctx context.Context, w *cluster.EndpointSliceWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			p.Send(ui.EndpointSliceEventMsg(ev))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.EndpointSliceEventMsg(ev)})
 		}
 	}
 }
 
-func forwardPodEvents(ctx context.Context, w *cluster.PodWatcher, p *tea.Program) {
+func forwardPodEvents(ctx context.Context, w *cluster.PodWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			p.Send(ui.PodEventMsg(ev))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.PodEventMsg(ev)})
 		}
 	}
 }
 
-func forwardNodeEvents(ctx context.Context, w *cluster.NodeWatcher, p *tea.Program) {
+func forwardNodeEvents(ctx context.Context, w *cluster.NodeWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			p.Send(ui.NodeEventMsg(ev))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.NodeEventMsg(ev)})
 		}
 	}
 }
 
-func forwardDeployEvents(ctx context.Context, w *cluster.DeployWatcher, p *tea.Program) {
+func forwardDeployEvents(ctx context.Context, w *cluster.DeployWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			p.Send(ui.DeployEventMsg(ev))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.DeployEventMsg(ev)})
 		}
 	}
 }
 
-func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p *tea.Program) {
+func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			p.Send(ui.EvtEventMsg(ev))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.EvtEventMsg(ev)})
 		}
 	}
 }
@@ -790,13 +816,13 @@ func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p *tea.Progr
 // or ProjectWatcher — both emit the same shape) into the bubbletea
 // program. Taking the channel directly rather than the concrete
 // watcher type keeps the forwarder shared.
-func forwardNsEvents(ctx context.Context, out <-chan cluster.NamespaceEvent, p *tea.Program) {
+func forwardNsEvents(ctx context.Context, out <-chan cluster.NamespaceEvent, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case ev := <-out:
-			p.Send(ui.NsEventMsg(ev))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.NsEventMsg(ev)})
 		}
 	}
 }
@@ -889,24 +915,24 @@ func forwardLogs(ls *cluster.LogStreamer, p *tea.Program, session uint64) {
 	}
 }
 
-func forwardNetwork(ctx context.Context, np *cluster.NetworkPoller, p *tea.Program) {
+func forwardNetwork(ctx context.Context, np *cluster.NetworkPoller, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case snap := <-np.Out:
-			p.Send(ui.NetworkSnapshotMsg(snap))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.NetworkSnapshotMsg(snap)})
 		}
 	}
 }
 
-func forwardMetrics(ctx context.Context, mp *cluster.FocusedMetricsPoller, p *tea.Program) {
+func forwardMetrics(ctx context.Context, mp *cluster.FocusedMetricsPoller, p watchMessageSender, focus ui.FocusTarget) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case snap := <-mp.Out:
-			p.Send(ui.MetricsSnapshotMsg(snap))
+			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.MetricsSnapshotMsg(snap)})
 		}
 	}
 }

@@ -99,8 +99,8 @@ func (m Model) handleDrainConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.drainConfirm.pending = true
 		cb := m.OnDrainStart
 		node := m.drainConfirm.node
-		focused := m.WatchedContext
-		return m, func() tea.Msg { return cb(focused, node) }
+		focused := m.Focus()
+		return m, m.focusedCmd(func() tea.Msg { return cb(focused, node) })
 	}
 	return m, nil
 }
