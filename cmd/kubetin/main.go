@@ -109,7 +109,12 @@ func main() {
 	}
 
 	store := model.NewStore()
-	sup := cluster.New(d, store, *probeInterval)
+	sup, err := cluster.New(d, store, *probeInterval)
+	if err != nil {
+		restoreStderr()
+		fmt.Fprintf(os.Stderr, "kubetin: %v\n", err)
+		os.Exit(1)
+	}
 
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

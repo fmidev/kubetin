@@ -53,11 +53,10 @@ func listAllOpts() metav1.ListOptions {
 // Supervisor runs one probe loop per context, writing into store.
 type Supervisor struct {
 	contexts []string
-	// refs maps unique context Name -> source file. Used so RestConfigFor
-	// uses the file that actually owns the context's auth credentials,
-	// avoiding the merge-collision problem on RKE2 configs that all
-	// name their user "default".
-	refs     map[string]contextSource
+	// Display names resolve to source identities; credentials are keyed by
+	// the file/context tuple, never by a generated label.
+	names    map[string]kubeconfig.ContextID
+	refs     map[kubeconfig.ContextID]contextSource
 	store    *model.Store
 	interval time.Duration
 
@@ -141,7 +140,7 @@ func (s *Supervisor) ResolveScope(ctx context.Context, ctxName string, cs *kuber
 
 func (s *Supervisor) resolveScopeNow(parent context.Context, ctxName string, cs *kubernetes.Clientset) (string, bool) {
 	hint := ""
-	if src, ok := s.refs[ctxName]; ok {
+	if src, ok := s.sourceFor(ctxName); ok {
 		hint = src.Namespace
 	}
 	probeCtx, cancel := context.WithTimeout(parent, ProbeTimeout)
@@ -205,24 +204,44 @@ func (s *Supervisor) accumulator(ctxName string) *reachAccumulator {
 }
 
 // New returns a Supervisor over the given Discovered kubeconfigs.
-func New(d *kubeconfig.Discovered, store *model.Store, interval time.Duration) *Supervisor {
-	refs := make(map[string]contextSource, len(d.Refs))
+func New(d *kubeconfig.Discovered, store *model.Store, interval time.Duration) (*Supervisor, error) {
+	refs := make(map[kubeconfig.ContextID]contextSource, len(d.Refs))
+	names := make(map[string]kubeconfig.ContextID, len(d.Refs))
+	contexts := make([]string, 0, len(d.Refs))
 	for _, r := range d.Refs {
-		refs[r.Name] = contextSource{
+		id := r.ID()
+		if _, exists := names[r.Name]; exists {
+			return nil, fmt.Errorf("duplicate kubeconfig context label %q", r.Name)
+		}
+		if _, exists := refs[id]; exists {
+			return nil, fmt.Errorf("duplicate kubeconfig context %q in %q", r.RawName, r.File)
+		}
+		names[r.Name] = id
+		contexts = append(contexts, r.Name)
+		refs[id] = contextSource{
 			File:      r.File,
 			RawName:   r.RawName,
 			Config:    d.Configs[r.File],
 			Namespace: r.Namespace,
 		}
 	}
-	contexts := make([]string, len(d.Contexts))
-	copy(contexts, d.Contexts)
+	sort.Strings(contexts)
 	return &Supervisor{
 		contexts: contexts,
+		names:    names,
 		refs:     refs,
 		store:    store,
 		interval: interval,
+	}, nil
+}
+
+func (s *Supervisor) sourceFor(name string) (contextSource, bool) {
+	id, ok := s.names[name]
+	if !ok {
+		return contextSource{}, false
 	}
+	src, ok := s.refs[id]
+	return src, ok
 }
 
 // Run launches a probe goroutine per context and blocks until ctx is done.
@@ -232,7 +251,7 @@ func (s *Supervisor) Run(ctx context.Context) {
 	for _, name := range s.contexts {
 		pf := model.NewProbeFields()
 		pf.Reach = model.ReachUnknown
-		if src, ok := s.refs[name]; ok {
+		if src, ok := s.sourceFor(name); ok {
 			pf.RawName = src.RawName
 			pf.File = src.File
 		}
@@ -869,7 +888,7 @@ func probeWarnEvents(parent context.Context, ns string, cs *kubernetes.Clientset
 // into the store. Metrics-owned slots are preserved by ApplyProbe so
 // a concurrent metrics tick can't lose its update under us.
 func (s *Supervisor) commit(ctxName string, pf model.ProbeFields, seen model.Reach) {
-	if src, ok := s.refs[ctxName]; ok {
+	if src, ok := s.sourceFor(ctxName); ok {
 		pf.RawName = src.RawName
 		pf.File = src.File
 	}
@@ -882,7 +901,7 @@ func (s *Supervisor) commit(ctxName string, pf model.ProbeFields, seen model.Rea
 // merged view — so duplicate user names across files don't poison
 // each other's auth.
 func (s *Supervisor) RestConfigFor(ctxName string) (*rest.Config, error) {
-	src, ok := s.refs[ctxName]
+	src, ok := s.sourceFor(ctxName)
 	if !ok {
 		return nil, fmt.Errorf("unknown context %q", ctxName)
 	}

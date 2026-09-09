@@ -88,7 +88,7 @@ func TestViewFitsCanvas(t *testing.T) {
 		{"fleet/very-narrow", 60, 20, ViewFleet, fleetLayoutFixture(nil)},
 		{"fleet/tiny", 40, 12, ViewFleet, fleetLayoutFixture(nil)},
 		{"fleet/cursor-on-card", 120, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
-			m.fleet.cursorCtx = "beta"
+			m.fleet.cursorCtx = fleetCJKContext
 		})},
 		{"fleet/cursor-windowed", 100, 14, ViewFleet, fleetLayoutFixture(func(m *Model) {
 			m.fleet.cursorCtx = "gamma"
@@ -116,10 +116,10 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.filterText = "zzz"
 		})},
 		{"fleet/expanded", 120, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
-			m.fleet.cursorCtx = "beta"
-			m.fleet.expanded = "beta"
+			m.fleet.cursorCtx = fleetCJKContext
+			m.fleet.expanded = fleetCJKContext
 			m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult{
-				Context: "beta",
+				Context: fleetCJKContext,
 				Pods: []cluster.FleetPodIssue{
 					{Namespace: "prod", Name: "smartmet-server-7f9c8-x2k4l", Phase: "Pending", Reason: "ImagePullBackOff", Restarts: 3},
 					{Namespace: "デフォルト", Name: strings.Repeat("名前", 40), Phase: "Failed", Reason: strings.Repeat("R", 80)},
@@ -846,6 +846,8 @@ func truncForErr(s string) string {
 	return s
 }
 
+const fleetCJKContext = "本番環境クラスタ北 (a/.kube/config)"
+
 // fleetLayoutFixture swaps m.Store for a per-case store — the shared
 // store must stay empty for every other case — seeded with a mixed
 // fleet: a healthy cluster with metrics, an alert-heavy degraded one
@@ -858,7 +860,7 @@ func fleetLayoutFixture(extra func(*Model)) func(*Model) {
 			UsageCPUMilli: 4000, UsageMemBytes: 60 << 20,
 			MetricsAvailable: true, MetricsAt: time.Now(),
 		})
-		seedFleetCluster(store, "beta", func(pf *model.ProbeFields) {
+		seedFleetCluster(store, fleetCJKContext, func(pf *model.ProbeFields) {
 			pf.RawName = "本番環境クラスタ北"
 			pf.Reach = model.ReachDegraded
 			pf.NodeCount, pf.NodeReady = 5, 3
@@ -872,7 +874,7 @@ func fleetLayoutFixture(extra func(*Model)) func(*Model) {
 			pf.WarnEvents15m = 42
 			pf.PodsTotal = 240
 		})
-		store.ApplyMetrics("beta", model.MetricsFields{
+		store.ApplyMetrics(fleetCJKContext, model.MetricsFields{
 			UsageCPUMilli: 11000, UsageMemBytes: 95 << 20,
 			MetricsAvailable: true, MetricsAt: time.Now(),
 		})
@@ -884,6 +886,7 @@ func fleetLayoutFixture(extra func(*Model)) func(*Model) {
 			pf.LastError = strings.Repeat("dial tcp 10.0.0.1:6443: i/o timeout ", 4)
 		})
 		m.Store = store
+		m.Contexts = []string{"alpha", fleetCJKContext, "gamma"}
 		if extra != nil {
 			extra(m)
 		}
