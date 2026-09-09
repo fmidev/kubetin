@@ -56,7 +56,7 @@ func (m Model) handleRestartConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.restartConfirm.pending = true
 		cb := m.OnRolloutRestart
 		focused := m.WatchedContext
-		return m, func() tea.Msg { return cb(focused, ref) }
+		return m, m.focusedCmd(func() tea.Msg { return cb(focused, ref) })
 	}
 	return m, nil
 }

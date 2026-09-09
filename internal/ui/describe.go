@@ -44,28 +44,28 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 		if r, ok := m.pods[m.cursor]; ok {
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "pods", Kind: "Pod",
-				Namespace: r.Namespace, Name: r.Name,
+				Namespace: r.Namespace, Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewDeployments:
 		if r, ok := m.deployments[m.cursor]; ok {
 			return cluster.DescribeRef{
 				Group: "apps", Version: "v1", Resource: "deployments", Kind: "Deployment",
-				Namespace: r.Namespace, Name: r.Name,
+				Namespace: r.Namespace, Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewNodes:
 		if r, ok := m.nodes[m.cursor]; ok {
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "nodes", Kind: "Node",
-				Name: r.Name,
+				Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewServices:
 		if r, ok := m.services[m.cursor]; ok {
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "services", Kind: "Service",
-				Namespace: r.Namespace, Name: r.Name,
+				Namespace: r.Namespace, Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewIngresses:
@@ -73,7 +73,7 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 			return cluster.DescribeRef{
 				Group: "networking.k8s.io", Version: "v1",
 				Resource: "ingresses", Kind: "Ingress",
-				Namespace: r.Namespace, Name: r.Name,
+				Namespace: r.Namespace, Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewNamespaces:
@@ -90,11 +90,12 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 					Resource: "projects",
 					Kind:     "Project",
 					Name:     r.Name,
+					UID:      m.cursor,
 				}, true
 			}
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "namespaces", Kind: "Namespace",
-				Name: r.Name,
+				Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	}

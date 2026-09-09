@@ -72,7 +72,7 @@ func (m Model) handleDeleteConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.deleteConfirm.pending = true
 			cb := m.OnDelete
 			focused := m.WatchedContext
-			return m, func() tea.Msg { return cb(focused, ref) }
+			return m, m.focusedCmd(func() tea.Msg { return cb(focused, ref) })
 		}
 		return m, nil
 	case tea.KeyRunes:

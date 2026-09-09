@@ -90,7 +90,7 @@ func (m Model) handleScaleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cb := m.OnScale
 		focused := m.WatchedContext
 		replicas := int32(n)
-		return m, func() tea.Msg { return cb(focused, ref, replicas) }
+		return m, m.focusedCmd(func() tea.Msg { return cb(focused, ref, replicas) })
 	case tea.KeyRunes:
 		// Digits only — ignore stray letters so the input never
 		// becomes invalid mid-typing.

@@ -334,7 +334,7 @@ func TestDashEventsScopedAndSorted(t *testing.T) {
 func TestLogViewerCloseKeepsDashboardStream(t *testing.T) {
 	stopped := false
 	m := dashModel(160, 40, nil)
-	m.OnLogsStop = func() { stopped = true }
+	m.logs.cancel = func() { stopped = true }
 
 	mm, _ := m.handleDashboardKey(key("l"))
 	if !mm.(Model).logs.open {
@@ -358,7 +358,7 @@ func TestLogViewerCloseKeepsDashboardStream(t *testing.T) {
 func TestCloseDashboardStopsStream(t *testing.T) {
 	stopped := false
 	m := dashModel(160, 40, nil)
-	m.OnLogsStop = func() { stopped = true }
+	m.logs.cancel = func() { stopped = true }
 
 	out, _ := m.handleDashboardKey(key("esc"))
 	if out.(Model).dashboard.open {
