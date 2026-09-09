@@ -176,11 +176,12 @@ func podRefFor(p podRow) cluster.DescribeRef {
 func (m *Model) startDashboardLogs() tea.Cmd {
 	ref := m.dashboard.logRef
 	if ref.Name == "" {
+		m.stopDashboardLogs()
+		m.logs.session++ // Reject messages already queued by the canceled stream.
 		m.logs.lineBase += len(m.logs.lines)
 		m.logs.lines = nil
 		m.recomputeLogsMatches()
 		m.logs.err = "no pod available to stream logs from"
-		m.logs.streaming = false
 		return nil
 	}
 	if st, ok := m.permissions[cluster.PermissionKey(m.WatchedContext, "get", "", "pods/log", ref.Namespace)]; ok && !st.Allowed {

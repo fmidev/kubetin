@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"slices"
@@ -136,6 +137,64 @@ func TestLogSearchClearAndRestart(t *testing.T) {
 			m.applyLogLine("match fresh")
 			if !slices.Equal(m.logs.searchMatches, []int{0}) {
 				t.Fatalf("restarted search = %v, want first new line", m.logs.searchMatches)
+			}
+		})
+	}
+}
+
+func TestDashboardWithoutPodsInvalidatesOldLogStream(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		t.Run(fmt.Sprintf("running=%t", running), func(t *testing.T) {
+			m := dashDeployModel(160, 40, nil)
+			var started []LogStartMsg
+			m.OnLogsStart = func(_ string, req LogStartMsg) tea.Msg {
+				started = append(started, req)
+				return nil
+			}
+			pod := m.deployOwnedPods(m.deployments["dep-uid"])[0]
+			opened, start := m.openDashboard(podRefFor(pod), pod.UID)
+			m = opened.(Model)
+			defer m.logs.cancel()
+			oldSession := m.logs.session
+			m.logs.searchTerm = "match"
+			if running {
+				start()
+				updated, _ := m.Update(LogLinesMsg{Session: oldSession, Lines: []string{"match old"}})
+				m = updated.(Model)
+			}
+
+			clear(m.pods)
+			popped, _ := m.popDashboard()
+			m = popped.(Model)
+			if m.dashboard.logRef.Name != "" || m.logs.err != "no pod available to stream logs from" {
+				t.Fatal("returning to the empty Deployment did not clear its log target")
+			}
+			if m.logs.session == oldSession || m.logs.streaming || m.logs.cancel != nil {
+				t.Error("empty target did not invalidate and stop the old stream")
+			}
+			if running {
+				if started[0].Context.Err() != context.Canceled {
+					t.Error("running stream was not canceled")
+				}
+			} else {
+				start()
+				if len(started) != 0 {
+					t.Error("queued stream started after its target disappeared")
+				}
+			}
+
+			for _, msg := range []tea.Msg{
+				LogLineMsg{Session: oldSession, Line: "match stale"},
+				LogLinesMsg{Session: oldSession, Lines: []string{"match stale batch"}},
+				LogErrorMsg{Session: oldSession, Err: "stale error"},
+				LogReconnectingMsg{Session: oldSession},
+				LogEOSMsg{Session: oldSession},
+			} {
+				updated, _ := m.Update(msg)
+				got := updated.(Model).logs
+				if len(got.lines) != 0 || len(got.searchMatches) != 0 || got.finished || got.reconnecting || got.err != "no pod available to stream logs from" {
+					t.Errorf("stale %T mutated the cleared log state", msg)
+				}
 			}
 		})
 	}
