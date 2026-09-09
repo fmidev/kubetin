@@ -32,11 +32,13 @@ type execState struct {
 }
 
 // ExecDoneMsg is delivered after the exec session ends and
-// bubbletea has reclaimed the terminal. Err is nil on a clean exit
+// bubbletea has reclaimed the terminal. Focus identifies the originating visit.
+// Err is nil on a clean exit
 // (the user typed `exit` or hit Ctrl-D), non-nil on transport /
 // auth / setup failures.
 type ExecDoneMsg struct {
-	Err error
+	Focus FocusTarget
+	Err   error
 }
 
 // openExec is the entry point from the action menu's Exec item. If
@@ -87,7 +89,15 @@ func (m Model) containersFor(ref cluster.DescribeRef) []string {
 }
 
 func (m Model) dispatchExec(ref cluster.DescribeRef, container string, shell []string) tea.Cmd {
-	return m.OnExec(m.WatchedContext, ref, container, shell)
+	cmd := m.OnExec(m.Focus(), ref, container, shell)
+	life := m.focusLife
+	return func() tea.Msg {
+		if life.ctx.Err() != nil || cmd == nil {
+			return nil
+		}
+		// tea.Exec's control message must reach the runtime unchanged.
+		return cmd()
+	}
 }
 
 // handleExecPickerKey routes input while the container picker is open.

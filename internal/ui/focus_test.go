@@ -21,7 +21,7 @@ func TestFocusClearsActionableStateBeforeCommandRuns(t *testing.T) {
 	m.syncedPods, m.clusterNetOK = true, true
 	m.clusterNetRX = 123
 	logsStopped, drainStopped := false, false
-	m.OnLogsStop = func() { logsStopped = true }
+	m.logs.cancel = func() { logsStopped = true }
 	m.drainProgress.cancel = func() { drainStopped = true }
 	called := false
 	m.OnFocusChange = func(FocusTarget) { called = true }

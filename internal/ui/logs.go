@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -63,6 +64,7 @@ type logsState struct {
 	// the view (or switches pods) can't contaminate the new stream's
 	// state. Same shape as PermissionResultMsg's context-keyed cache.
 	session uint64
+	cancel  context.CancelFunc
 }
 
 // LogStartMsg asks main to begin streaming. Session is a monotonic
@@ -70,6 +72,8 @@ type logsState struct {
 // downstream message so the UI can drop late lines from a previously-
 // cancelled stream.
 type LogStartMsg struct {
+	// Context is canceled synchronously when this session is superseded or closed.
+	Context   context.Context
 	Session   uint64
 	Ref       cluster.DescribeRef
 	Container string
@@ -175,6 +179,11 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	if m.OnLogsStart == nil {
 		return nil
 	}
+	if m.logs.cancel != nil {
+		m.logs.cancel()
+	}
+	streamCtx, cancel := context.WithCancel(m.focusLife.ctx)
+	m.logs.cancel = cancel
 	m.logs.session++
 	m.logs.streaming = true
 	m.logs.tail = tail
@@ -198,8 +207,13 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	m.syncDashboardLogTarget(ref, container)
 	cb := m.OnLogsStart
 	focused := m.WatchedContext
-	req := LogStartMsg{Session: m.logs.session, Ref: ref, Container: container, Tail: tail}
-	return m.focusedCmd(func() tea.Msg { return cb(focused, req) })
+	req := LogStartMsg{Context: streamCtx, Session: m.logs.session, Ref: ref, Container: container, Tail: tail}
+	return m.focusedCmd(func() tea.Msg {
+		if streamCtx.Err() != nil {
+			return nil
+		}
+		return cb(focused, req)
+	})
 }
 
 // tailOrDefault reports the tail this stream actually requested,
@@ -524,12 +538,8 @@ func (m Model) closeLogs() (tea.Model, tea.Cmd) {
 	if m.dashboard.open {
 		return m, nil
 	}
-	m.logs.streaming = false
-	if m.OnLogsStop != nil {
-		cb := m.OnLogsStop
-		return m, func() tea.Msg { cb(); return nil }
-	}
-	return m, nil
+	cmd := m.stopDashboardLogs()
+	return m, cmd
 }
 
 func (m Model) handleContainerPickerKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {

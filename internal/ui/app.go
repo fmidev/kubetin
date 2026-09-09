@@ -155,13 +155,11 @@ type Model struct {
 	// OnRolloutRestart bumps a template annotation to roll a deployment.
 	OnRolloutRestart func(focusedCtx string, ref cluster.DescribeRef) tea.Msg
 
-	// OnLogsStart kicks off a follow=true log stream. Reply messages
+	// OnLogsStart kicks off a follow=true log stream using req.Context.
+	// Reply messages
 	// (LogLineMsg / LogErrorMsg / LogEOSMsg) will arrive on the
 	// program's message channel.
 	OnLogsStart func(focusedCtx string, req LogStartMsg) tea.Msg
-
-	// OnLogsStop cancels the active log stream.
-	OnLogsStop func()
 
 	// OnExec opens an interactive shell into a pod container. Unlike
 	// the other callbacks which return a tea.Msg (synchronous fetch),
@@ -169,7 +167,7 @@ type Model struct {
 	// that wraps tea.Exec(cluster.ExecCmd) so bubbletea releases the
 	// alt-screen for the lifetime of the session and reclaims it on
 	// the user's `exit` / `Ctrl-D`.
-	OnExec func(focusedCtx string, ref cluster.DescribeRef, container string, command []string) tea.Cmd
+	OnExec func(focus FocusTarget, ref cluster.DescribeRef, container string, command []string) tea.Cmd
 
 	// OnCordon / OnUncordon: synchronous one-shot PATCH on
 	// /spec/unschedulable. Returns a NodeOpResultMsg.
@@ -561,6 +559,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyDrainDone(msg)
 
 	case ExecDoneMsg:
+		if msg.Focus != m.Focus() {
+			return m, nil
+		}
 		// Bubbletea has already reclaimed the alt-screen by the time
 		// this arrives. We only need to surface non-nil errors so a
 		// failed setup ("rbac: create pods/exec denied", "container
@@ -998,6 +999,7 @@ func (m Model) openActionMenu() (tea.Model, tea.Cmd) {
 // acts on the target it drilled into, and on the replica selected in
 // its PODS pane.
 func (m Model) openActionMenuFor(ref cluster.DescribeRef, uid types.UID) (tea.Model, tea.Cmd) {
+	ref.UID = uid
 	m.actionMenu.open = true
 	m.actionMenu.ref = ref
 	m.actionMenu.uid = uid

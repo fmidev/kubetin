@@ -54,6 +54,49 @@ func TestCoordinatorKeepsNewestFocusIntent(t *testing.T) {
 
 type focusTestSender chan tea.Msg
 
+func TestCoordinatorSerializesAcceptanceWithApplication(t *testing.T) {
+	applying := make(chan struct{})
+	release := make(chan struct{})
+	accepted := make(chan struct{})
+	started := make(chan ui.FocusTarget, 2)
+	c := &watchCoordinator{
+		parent: context.Background(), reqCh: make(chan struct{}, 1),
+		stopCh: make(chan struct{}), doneCh: make(chan struct{}),
+		spawn: func(_ context.Context, f ui.FocusTarget) {
+			if f.Generation == 1 {
+				close(applying)
+				<-release
+			}
+			started <- f
+		},
+	}
+	go c.loop()
+	defer c.stop()
+	c.switchTo(ui.FocusTarget{Context: "alpha", Generation: 1})
+	<-applying
+	go func() {
+		c.switchTo(ui.FocusTarget{Context: "beta", Generation: 2})
+		close(accepted)
+	}()
+	select {
+	case <-accepted:
+		t.Error("accepted a newer request while older context application was still in progress")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-accepted
+	for generation := uint64(1); generation <= 2; generation++ {
+		select {
+		case focus := <-started:
+			if focus.Generation != generation {
+				t.Fatalf("applied focus %+v, want generation %d", focus, generation)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("did not apply request after serialization")
+		}
+	}
+}
+
 func (s focusTestSender) Send(msg tea.Msg) { s <- msg }
 
 func TestWatchForwardersCarryFocusGeneration(t *testing.T) {

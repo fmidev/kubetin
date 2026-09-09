@@ -237,33 +237,19 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 		}
 	}
 
-	// Wire logs streaming. We hold a single cancellable context per
-	// stream — opening a new one cancels the old.
-	var (
-		logCancel context.CancelFunc
-		logMu     sync.Mutex
-	)
-	stopLogs := func() {
-		logMu.Lock()
-		defer logMu.Unlock()
-		if logCancel != nil {
-			logCancel()
-			logCancel = nil
-		}
-	}
-
+	// The UI owns each session's lifetime, including startup still in flight.
 	m.OnLogsStart = func(focusedCtx string, req ui.LogStartMsg) tea.Msg {
-		// Stop any stream already running.
-		stopLogs()
-		streamCtx, cancel := context.WithCancel(ctx)
-		logMu.Lock()
-		logCancel = cancel
-		logMu.Unlock()
+		streamCtx, cancel := context.WithCancel(req.Context)
+		stopShutdown := context.AfterFunc(ctx, cancel)
+		cleanup := func() {
+			stopShutdown()
+			cancel()
+		}
 
 		ls, err := sup.StreamLogs(streamCtx, focusedCtx,
 			req.Ref.Namespace, req.Ref.Name, req.Container, req.Tail)
 		if err != nil {
-			cancel()
+			cleanup()
 			return ui.LogErrorMsg{Session: req.Session, Err: err.Error()}
 		}
 
@@ -276,12 +262,12 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 		// the user never loses tail context to a buffered shutdown.
 		// Session id is echoed on every emitted message so the UI can
 		// drop late lines from a previously-cancelled stream.
-		go forwardLogs(ls, prog, req.Session)
+		go func() {
+			defer cleanup()
+			forwardLogs(ls, prog, req.Session)
+		}()
 		return nil
 	}
-	m.OnLogsStop = stopLogs
-	// Make sure we stop the stream on shutdown.
-	defer stopLogs()
 
 	// Wire exec. The callback returns a tea.Cmd rather than a tea.Msg
 	// because exec needs the program to release the alt-screen for
@@ -291,14 +277,15 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 	// session ends with the outcome. NewExecCmd failing means we
 	// never reached the apiserver — short-circuit with ExecDoneMsg
 	// so the UI surfaces the error without an empty terminal flicker.
-	m.OnExec = func(focusedCtx string, ref cluster.DescribeRef, container string, command []string) tea.Cmd {
+	m.OnExec = func(focus ui.FocusTarget, ref cluster.DescribeRef, container string, command []string) tea.Cmd {
+		focusedCtx := focus.Context
 		klog.Infof("exec: %s container=%s in ns/%s on %s cmd=%v requested",
 			ref.Name, container, ref.Namespace, focusedCtx, command)
 		execCmd, err := sup.NewExecCmd(focusedCtx, ref.Namespace, ref.Name, container, command)
 		if err != nil {
 			klog.Errorf("exec: %s container=%s on %s setup FAILED: %v",
 				ref.Name, container, focusedCtx, err)
-			return func() tea.Msg { return ui.ExecDoneMsg{Err: err} }
+			return func() tea.Msg { return ui.ExecDoneMsg{Focus: focus, Err: err} }
 		}
 		return tea.Exec(execCmd, func(execErr error) tea.Msg {
 			if execErr != nil {
@@ -308,7 +295,7 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 				klog.Infof("exec: %s container=%s on %s ended cleanly",
 					ref.Name, container, focusedCtx)
 			}
-			return ui.ExecDoneMsg{Err: execErr}
+			return ui.ExecDoneMsg{Focus: focus, Err: execErr}
 		})
 	}
 
@@ -605,14 +592,19 @@ func (c *watchCoordinator) loop() {
 			if pending.Context == "" {
 				continue
 			}
-			if latest := c.latestRequest(); latest != pending {
-				pending = latest
+			// Acceptance and application share the lock so an older set
+			// cannot start or persist its context after a newer request is accepted.
+			c.mu.Lock()
+			if c.latest != pending {
+				pending = c.latest
+				c.mu.Unlock()
 				debounce.Reset(debounceWindow)
 				continue
 			}
 			target := pending
 			pending = ui.FocusTarget{}
 			apply(target)
+			c.mu.Unlock()
 		}
 	}
 }
