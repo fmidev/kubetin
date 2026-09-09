@@ -1832,10 +1832,7 @@ func (m Model) renderHeader() string {
 // looking at.
 func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 	dot := m.Theme.styleForReach(st.Reach).Render(st.Reach.Glyph())
-	display := st.RawName
-	if display == "" {
-		display = m.WatchedContext
-	}
+	display := m.WatchedContext
 	ns := m.namespace
 	if ns == "" {
 		ns = "all"

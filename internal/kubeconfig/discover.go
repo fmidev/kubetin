@@ -27,12 +27,16 @@ type ContextRef struct {
 	Namespace string // context's default namespace; empty = cluster-scoped access
 }
 
-// GetName, GetRawName, GetFile, GetNamespace satisfy cluster.refLike
-// so the supervisor can consume ContextRef without an import cycle.
-func (r ContextRef) GetName() string      { return r.Name }
-func (r ContextRef) GetRawName() string   { return r.RawName }
-func (r ContextRef) GetFile() string      { return r.File }
-func (r ContextRef) GetNamespace() string { return r.Namespace }
+// ContextID identifies a source independently of its display name.
+// The tuple avoids delimiter or hash collisions in user-controlled names.
+type ContextID struct {
+	File    string
+	RawName string
+}
+
+func (r ContextRef) ID() ContextID {
+	return ContextID{File: r.File, RawName: r.RawName}
+}
 
 // Discovered is the result of scanning ~/.kube.
 type Discovered struct {
@@ -58,75 +62,7 @@ func Discover() (*Discovered, error) {
 		return nil, fmt.Errorf("no kubeconfig files found")
 	}
 
-	configs := make(map[string]*clientcmdapi.Config, len(files))
-	var refs []ContextRef
-	seen := make(map[string]int) // RawName -> count, to disambiguate
-
-	for _, f := range files {
-		cfg, err := clientcmd.LoadFromFile(f)
-		if err != nil {
-			// Skip unreadable files but don't fail the whole scan.
-			continue
-		}
-		configs[f] = cfg
-		for ctxName, kctx := range cfg.Contexts {
-			seen[ctxName]++
-			ns := ""
-			if kctx != nil {
-				ns = kctx.Namespace
-			}
-			refs = append(refs, ContextRef{
-				Name:      ctxName, // patched below if duplicated
-				RawName:   ctxName,
-				File:      f,
-				Namespace: ns,
-			})
-		}
-	}
-
-	// Disambiguate any context name that appears in more than one file
-	// by suffixing the file's basename. Stable: sort first by file path
-	// so the chosen "primary" is deterministic.
-	sort.Slice(refs, func(i, j int) bool {
-		if refs[i].RawName != refs[j].RawName {
-			return refs[i].RawName < refs[j].RawName
-		}
-		return refs[i].File < refs[j].File
-	})
-	// First pass: tentative basename suffix. Second pass: if those
-	// suffixes still collide (two files in different directories both
-	// named "config" with identically-named contexts), promote to a
-	// path-tail suffix so the final names stay unique. Without the
-	// second pass two contexts share a Name and the second silently
-	// overwrites the first in the supervisor's per-context map.
-	for i := range refs {
-		if seen[refs[i].RawName] > 1 {
-			refs[i].Name = refs[i].RawName + " (" + filepath.Base(refs[i].File) + ")"
-		}
-	}
-	final := map[string]int{}
-	for _, r := range refs {
-		final[r.Name]++
-	}
-	for i := range refs {
-		if final[refs[i].Name] > 1 {
-			parent := filepath.Base(filepath.Dir(refs[i].File))
-			refs[i].Name = refs[i].RawName + " (" + parent + "/" + filepath.Base(refs[i].File) + ")"
-		}
-	}
-
-	names := make([]string, 0, len(refs))
-	for _, r := range refs {
-		names = append(names, r.Name)
-	}
-	sort.Strings(names)
-
-	return &Discovered{
-		Files:    files,
-		Refs:     refs,
-		Configs:  configs,
-		Contexts: names,
-	}, nil
+	return discoverFiles(files), nil
 }
 
 // DiscoverTrusted scans like Discover but filters out files whose
@@ -149,23 +85,24 @@ func DiscoverTrusted(tl *TrustList) (d *Discovered, untrusted []string, err erro
 		return &Discovered{Files: files, Configs: map[string]*clientcmdapi.Config{}}, untrusted, nil
 	}
 
-	// Re-run the rest of Discover() against the trusted subset only.
-	configs := make(map[string]*clientcmdapi.Config, len(trusted))
+	return discoverFiles(trusted), untrusted, nil
+}
+
+func discoverFiles(files []string) *Discovered {
+	configs := make(map[string]*clientcmdapi.Config, len(files))
 	var refs []ContextRef
-	seen := make(map[string]int)
-	for _, f := range trusted {
+	for _, f := range files {
 		cfg, err := clientcmd.LoadFromFile(f)
 		if err != nil {
 			continue
 		}
 		configs[f] = cfg
-		for ctxName, kctx := range cfg.Contexts {
-			seen[ctxName]++
+		for name, ctx := range cfg.Contexts {
 			ns := ""
-			if kctx != nil {
-				ns = kctx.Namespace
+			if ctx != nil {
+				ns = ctx.Namespace
 			}
-			refs = append(refs, ContextRef{Name: ctxName, RawName: ctxName, File: f, Namespace: ns})
+			refs = append(refs, ContextRef{RawName: name, File: f, Namespace: ns})
 		}
 	}
 	sort.Slice(refs, func(i, j int) bool {
@@ -174,39 +111,70 @@ func DiscoverTrusted(tl *TrustList) (d *Discovered, untrusted []string, err erro
 		}
 		return refs[i].File < refs[j].File
 	})
-	// First pass: tentative basename suffix. Second pass: if those
-	// suffixes still collide (two files in different directories both
-	// named "config" with identically-named contexts), promote to a
-	// path-tail suffix so the final names stay unique. Without the
-	// second pass two contexts share a Name and the second silently
-	// overwrites the first in the supervisor's per-context map.
-	for i := range refs {
-		if seen[refs[i].RawName] > 1 {
-			refs[i].Name = refs[i].RawName + " (" + filepath.Base(refs[i].File) + ")"
-		}
-	}
-	final := map[string]int{}
-	for _, r := range refs {
-		final[r.Name]++
-	}
-	for i := range refs {
-		if final[refs[i].Name] > 1 {
-			parent := filepath.Base(filepath.Dir(refs[i].File))
-			refs[i].Name = refs[i].RawName + " (" + parent + "/" + filepath.Base(refs[i].File) + ")"
-		}
-	}
+	assignContextNames(refs)
 	names := make([]string, 0, len(refs))
 	for _, r := range refs {
 		names = append(names, r.Name)
 	}
 	sort.Strings(names)
+	return &Discovered{Files: files, Refs: refs, Configs: configs, Contexts: names}
+}
 
-	return &Discovered{
-		Files:    trusted,
-		Refs:     refs,
-		Configs:  configs,
-		Contexts: names,
-	}, untrusted, nil
+// Reserve raw names before generating labels so a context literally named
+// "prod (config)" cannot be mistaken for another file's disambiguated prod.
+func assignContextNames(refs []ContextRef) {
+	rawCounts := make(map[string]int)
+	used := make(map[string]bool)
+	for _, r := range refs {
+		rawCounts[r.RawName]++
+		used[r.RawName] = true
+	}
+	candidates := make([][]string, len(refs))
+	counts := make(map[string]int)
+	for i, r := range refs {
+		if rawCounts[r.RawName] == 1 {
+			continue
+		}
+		for _, tail := range pathTails(r.File) {
+			name := r.RawName + " (" + tail + ")"
+			candidates[i] = append(candidates[i], name)
+			counts[name]++
+		}
+	}
+	for i := range refs {
+		r := &refs[i]
+		if rawCounts[r.RawName] == 1 {
+			r.Name = r.RawName
+			continue
+		}
+		for _, name := range candidates[i] {
+			if counts[name] == 1 && !used[name] {
+				r.Name = name
+				break
+			}
+		}
+		if r.Name == "" {
+			base := r.RawName + " (" + r.File + ")"
+			for n := 2; ; n++ {
+				name := fmt.Sprintf("%s [%d]", base, n)
+				if !used[name] {
+					r.Name = name
+					break
+				}
+			}
+		}
+		used[r.Name] = true
+	}
+}
+
+func pathTails(path string) []string {
+	tails := []string{filepath.Base(path)}
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		if parent := filepath.Dir(dir); parent == dir {
+			return append(tails, path)
+		}
+		tails = append(tails, filepath.Join(filepath.Base(dir), tails[len(tails)-1]))
+	}
 }
 
 // RefByName returns the ContextRef whose Name matches.
@@ -231,7 +199,7 @@ func candidateFiles() ([]string, error) {
 				out = append(out, p)
 			}
 		}
-		return out, nil
+		return absoluteFiles(out)
 	}
 
 	home, err := os.UserHomeDir()
@@ -263,5 +231,24 @@ func candidateFiles() ([]string, error) {
 		files = append(files, filepath.Join(dir, name))
 	}
 	sort.Strings(files)
-	return files, nil
+	return absoluteFiles(files)
+}
+
+// Keep the load path rather than resolving symlinks: relative credential paths
+// in kubeconfigs are resolved relative to that path by client-go.
+func absoluteFiles(files []string) ([]string, error) {
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(files))
+	for _, file := range files {
+		path, err := filepath.Abs(file)
+		if err != nil {
+			return nil, fmt.Errorf("kubeconfig path %q: %w", file, err)
+		}
+		if !seen[path] {
+			seen[path] = true
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }

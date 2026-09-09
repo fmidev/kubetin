@@ -171,12 +171,15 @@ func newProbeFixture(t *testing.T, srv *httptest.Server, ns string) (*Supervisor
 	cfg.CurrentContext = "ctx"
 
 	store := model.NewStore()
-	sup := New(&kubeconfig.Discovered{
+	sup, err := New(&kubeconfig.Discovered{
 		Files:    []string{"/fake"},
 		Refs:     []kubeconfig.ContextRef{{Name: "slow", RawName: "ctx", File: "/fake", Namespace: ns}},
 		Configs:  map[string]*clientcmdapi.Config{"/fake": cfg},
 		Contexts: []string{"slow"},
 	}, store, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return sup, store
 }
 
