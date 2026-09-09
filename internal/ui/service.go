@@ -183,7 +183,7 @@ var serviceColumns = []column{
 }
 
 func (m Model) renderServiceTable(maxRows, maxWidth int) string {
-	rows := m.visibleServiceRows()
+	rows := rowsForUIDs(m.services, m.windowUIDs(ViewServices, maxRows))
 	counts := collectEndpointCounts(m.endpointSlices)
 
 	w := fitColumns(serviceColumns, maxWidth-1)
@@ -203,11 +203,10 @@ func (m Model) renderServiceTable(maxRows, maxWidth int) string {
 	b.WriteString(header)
 	b.WriteByte('\n')
 
-	if len(rows) == 0 {
+	if m.tableCount(ViewServices) == 0 {
 		b.WriteString(m.emptyPlaceholder(m.syncedServices, "services"))
 		return b.String()
 	}
-	rows = windowRows(rows, m.cursor, maxRows, func(r serviceRow) types.UID { return r.UID })
 
 	warnIdx := recentWarningIndex(m.events)
 	for _, r := range rows {
@@ -280,12 +279,7 @@ func (m Model) visibleServiceRows() []serviceRow {
 	all := sortedServiceRows(m.services)
 	out := make([]serviceRow, 0, len(all))
 	for _, r := range all {
-		if m.namespace != "" && r.Namespace != m.namespace {
-			continue
-		}
-		if needle != "" &&
-			!strings.Contains(strings.ToLower(r.Name), needle) &&
-			!strings.Contains(strings.ToLower(r.Namespace), needle) {
+		if !matchesNames(r.Namespace, r.Name, m.namespace, needle) {
 			continue
 		}
 		out = append(out, r)

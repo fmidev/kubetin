@@ -404,13 +404,3 @@ func lessBy(a, b podRow, k SortKey) bool {
 	}
 	return a.UID < b.UID
 }
-
-// rowIndex returns the index of uid in rows, or -1.
-func rowIndex(rows []podRow, uid types.UID) int {
-	for i, r := range rows {
-		if r.UID == uid {
-			return i
-		}
-	}
-	return -1
-}

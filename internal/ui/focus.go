@@ -53,6 +53,7 @@ func (m Model) focusedCmd(cmd tea.Cmd) tea.Cmd {
 }
 
 func (m *Model) clearFocusedState() {
+	m.tables = &tableCache{}
 	m.pods = make(map[types.UID]podRow)
 	m.nodes = make(map[types.UID]nodeRow)
 	m.deployments = make(map[types.UID]deploymentRow)

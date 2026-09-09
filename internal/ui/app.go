@@ -42,6 +42,10 @@ type IngEventMsg cluster.IngressEvent
 // rather than merged into the service row.
 type EndpointSliceEventMsg cluster.EndpointSliceEvent
 
+// ResourceBatchMsg applies a bounded informer burst before the next render.
+// The forwarder binds the whole batch to one FocusTarget with FocusedMsg.
+type ResourceBatchMsg []tea.Msg
+
 // MetricsSnapshotMsg wraps a focused-cluster metrics snapshot.
 type MetricsSnapshotMsg cluster.MetricsSnapshot
 
@@ -108,6 +112,7 @@ type Model struct {
 	WatchedContext  string
 	focusGeneration uint64
 	focusLife       *focusLifetime
+	tables          *tableCache
 	Store           *model.Store
 	Theme           Theme
 	Contexts        []string // ordered list of all kubeconfig contexts
@@ -264,6 +269,7 @@ func New(context string, store *model.Store, contexts []string) Model {
 	return Model{
 		WatchedContext: context,
 		focusLife:      newFocusLifetime(),
+		tables:         &tableCache{},
 		Store:          store,
 		Theme:          DefaultTheme(),
 		Contexts:       contexts,
@@ -310,7 +316,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Once focus has changed, untagged cluster work cannot identify
 		// which visit produced it, even when its context name matches.
 		switch msg.(type) {
-		case PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
+		case ResourceBatchMsg, PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
 			SvcEventMsg, IngEventMsg, EndpointSliceEventMsg, MetricsSnapshotMsg, NetworkSnapshotMsg,
 			DescribeResultMsg, PermissionResultMsg, DeleteResultMsg, ScaleResultMsg, RolloutResultMsg,
 			NodeOpResultMsg, DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
@@ -319,6 +325,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	switch msg := msg.(type) {
+	case ResourceBatchMsg:
+		var cmds []tea.Cmd
+		for _, event := range msg {
+			updated, cmd := m.Update(FocusedMsg{Focus: m.Focus(), Msg: event})
+			m = updated.(Model)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		return m, tea.Batch(cmds...)
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -385,7 +401,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		noteRestartBaseline(m.restartBaseline, msg.UID, msg.Restarts, msg.Kind == cluster.PodDeleted)
+		before, existed := m.pods[msg.UID]
 		applyPodEvent(m.pods, cluster.PodEvent(msg))
+		after, exists := m.pods[msg.UID]
+		m.invalidatePodOrder(before, after)
+		if existed != exists || before.Phase != after.Phase {
+			m.tables.phasesValid = false
+		}
+		if existed != exists || before.Namespace != after.Namespace {
+			m.invalidateTables(ViewNamespaces)
+			m.tables.nsCounts = nil
+		}
 		m.syncedPods = true
 		// Guard cursor wipe to ViewPods only — non-pod views park the
 		// cursor on a non-pod UID that will never appear in m.pods,
@@ -401,6 +427,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyNodeEvent(m.nodes, cluster.NodeEvent(msg))
+		m.invalidateTables(ViewNodes)
 		m.syncedNodes = true
 		if _, ok := m.nodes[m.cursor]; !ok && m.view == ViewNodes {
 			m.cursor = ""
@@ -412,6 +439,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyDeployEvent(m.deployments, cluster.DeployEvent(msg))
+		m.invalidateTables(ViewDeployments, ViewNamespaces)
+		m.tables.nsCounts = nil
 		m.syncedDeploys = true
 		if _, ok := m.deployments[m.cursor]; !ok && m.view == ViewDeployments {
 			m.cursor = ""
@@ -423,6 +452,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyEvtEvent(m.events, cluster.EventEvent(msg))
+		m.invalidateTables(ViewNamespaces)
+		m.tables.nsCounts = nil
 		m.syncedEvents = true
 		return m, nil
 
@@ -431,6 +462,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyNsEvent(m.namespaces, cluster.NamespaceEvent(msg))
+		m.invalidateTables(ViewNamespaces)
 		m.syncedNamespaces = true
 		return m, nil
 
@@ -439,6 +471,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyServiceEvent(m.services, cluster.ServiceEvent(msg))
+		m.invalidateTables(ViewServices)
 		m.syncedServices = true
 		if _, ok := m.services[m.cursor]; !ok && m.view == ViewServices {
 			m.cursor = ""
@@ -450,6 +483,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyIngressEvent(m.ingresses, cluster.IngressEvent(msg))
+		m.invalidateTables(ViewIngresses)
 		m.syncedIngresses = true
 		if _, ok := m.ingresses[m.cursor]; !ok && m.view == ViewIngresses {
 			m.cursor = ""
@@ -677,10 +711,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		for uid, row := range m.pods {
 			if n, ok := netByKey[row.Namespace+"/"+row.Name]; ok {
+				before := row
 				row.NetRXBps = n.RXBytesPerSec
 				row.NetTXBps = n.TXBytesPerSec
 				row.HasNetwork = true
 				m.pods[uid] = row
+				m.invalidatePodOrder(before, row)
 			}
 		}
 		m.clusterNetRX = msg.Cluster.RXBytesPerSec
@@ -712,6 +748,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// failure, RBAC change, eviction-then-recreate with new UID)
 		// keeps its old numbers indefinitely.
 		for uid, row := range m.pods {
+			before := row
 			if pm, ok := pmByKey[row.Namespace+"/"+row.Name]; ok {
 				row.CPUMilli = pm.CPUMilli
 				row.MemBytes = pm.MemBytes
@@ -722,6 +759,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				row.ContainerMemBytes = nil
 			}
 			m.pods[uid] = row
+			m.invalidatePodOrder(before, row)
 		}
 		nmByName := make(map[string]cluster.NodeMetric, len(msg.Nodes))
 		for _, nm := range msg.Nodes {
@@ -1580,6 +1618,70 @@ func (m Model) View() string {
 		bodyHeight = 1
 	}
 
+	var body string
+	// Overlay precedence (highest first):
+	// logs → confirms (delete/scale/restart) → describe → action menu
+	// → exec picker → help → ns picker.
+	switch {
+	case m.logs.open:
+		body = m.renderLogs(m.width, bodyHeight)
+	case m.deleteConfirm.open:
+		body = m.renderDeleteConfirm(m.width, bodyHeight)
+	case m.scaleConfirm.open:
+		body = m.renderScaleConfirm(m.width, bodyHeight)
+	case m.restartConfirm.open:
+		body = m.renderRestartConfirm(m.width, bodyHeight)
+	case m.drainProgress.open:
+		body = m.renderDrainProgress(m.width, bodyHeight)
+	case m.drainConfirm.open:
+		body = m.renderDrainConfirm(m.width, bodyHeight)
+	case m.describe.open:
+		body = m.renderDescribe(m.width, bodyHeight)
+	case m.eventsLens.open:
+		body = m.renderEventsLens(m.width, bodyHeight)
+	case m.actionMenu.open:
+		// Floating overlay: keep the underlying table visible around
+		// the menu so the user can still see the row they came from.
+		// clampCanvas below guarantees the composited result matches
+		// (m.width, bodyHeight) — overlayAt only splices, it doesn't
+		// alter visible dimensions.
+		body = clampCanvas(m.renderBody(bodyHeight, fleetFull), m.width, bodyHeight)
+		panel := m.renderActionMenuPanel()
+		panelW, panelH := lipgloss.Width(panel), lipgloss.Height(panel)
+		col := (m.width - panelW) / 2
+		row := (bodyHeight - panelH) / 2
+		if row < 0 {
+			row = 0
+		}
+		body = overlayAt(body, panel, col, row)
+	case m.exec.pickerOpen:
+		body = m.renderExecPicker(m.width, bodyHeight)
+	case m.helpOpen:
+		body = m.renderHelp(m.width, bodyHeight)
+	case m.rbacOpen:
+		body = m.renderRBAC(m.width, bodyHeight)
+	case m.nsPickerOpen:
+		body = m.renderNsPicker(m.width, bodyHeight)
+	default:
+		body = m.renderBody(bodyHeight, fleetFull)
+	}
+	// Body and footer are run through clampCanvas so their dimensions
+	// match what bodyHeight + footerHeight told JoinVertical to expect.
+	// Without this, trailing newlines in body strings or wider-than-
+	// inner separators in overlay boxes silently add visual rows that
+	// scroll the top header line off the alt-screen.
+	footerH := lipgloss.Height(footer)
+	body = clampCanvas(body, m.width, bodyHeight)
+	footer = clampCanvas(footer, m.width, footerH)
+	if fleetFull {
+		// Joining the empty header string would add a phantom blank
+		// row; the full-bleed layout has no header at all.
+		return lipgloss.JoinVertical(lipgloss.Left, body, footer)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m Model) renderBody(bodyHeight int, fleetFull bool) string {
 	mainWidth := m.width - SidebarWidth
 	var body string
 	switch {
@@ -1607,64 +1709,7 @@ func (m Model) View() string {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, main)
 	}
 
-	// Overlay precedence (highest first):
-	// logs → confirms (delete/scale/restart) → describe → action menu
-	// → exec picker → help → ns picker.
-	switch {
-	case m.logs.open:
-		body = m.renderLogs(m.width, bodyHeight)
-	case m.deleteConfirm.open:
-		body = m.renderDeleteConfirm(m.width, bodyHeight)
-	case m.scaleConfirm.open:
-		body = m.renderScaleConfirm(m.width, bodyHeight)
-	case m.restartConfirm.open:
-		body = m.renderRestartConfirm(m.width, bodyHeight)
-	case m.drainProgress.open:
-		body = m.renderDrainProgress(m.width, bodyHeight)
-	case m.drainConfirm.open:
-		body = m.renderDrainConfirm(m.width, bodyHeight)
-	case m.describe.open:
-		body = m.renderDescribe(m.width, bodyHeight)
-	case m.eventsLens.open:
-		body = m.renderEventsLens(m.width, bodyHeight)
-	case m.actionMenu.open:
-		// Floating overlay: keep the underlying table visible around
-		// the menu so the user can still see the row they came from.
-		// clampCanvas below guarantees the composited result matches
-		// (m.width, bodyHeight) — overlayAt only splices, it doesn't
-		// alter visible dimensions.
-		body = clampCanvas(body, m.width, bodyHeight)
-		panel := m.renderActionMenuPanel()
-		panelW, panelH := lipgloss.Width(panel), lipgloss.Height(panel)
-		col := (m.width - panelW) / 2
-		row := (bodyHeight - panelH) / 2
-		if row < 0 {
-			row = 0
-		}
-		body = overlayAt(body, panel, col, row)
-	case m.exec.pickerOpen:
-		body = m.renderExecPicker(m.width, bodyHeight)
-	case m.helpOpen:
-		body = m.renderHelp(m.width, bodyHeight)
-	case m.rbacOpen:
-		body = m.renderRBAC(m.width, bodyHeight)
-	case m.nsPickerOpen:
-		body = m.renderNsPicker(m.width, bodyHeight)
-	}
-	// Body and footer are run through clampCanvas so their dimensions
-	// match what bodyHeight + footerHeight told JoinVertical to expect.
-	// Without this, trailing newlines in body strings or wider-than-
-	// inner separators in overlay boxes silently add visual rows that
-	// scroll the top header line off the alt-screen.
-	footerH := lipgloss.Height(footer)
-	body = clampCanvas(body, m.width, bodyHeight)
-	footer = clampCanvas(footer, m.width, footerH)
-	if fleetFull {
-		// Joining the empty header string would add a phantom blank
-		// row; the full-bleed layout has no header at all.
-		return lipgloss.JoinVertical(lipgloss.Left, body, footer)
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	return body
 }
 
 // chromeHeights returns the header and footer heights View() will use,
@@ -1702,13 +1747,20 @@ func (m Model) mainPane(height, width int) string {
 // visibleUIDs returns the set of UIDs currently visible (filter +
 // namespace + view) so cursor logic can be written generically.
 func (m Model) visibleUIDs() []types.UID {
+	if m.view == ViewFleet {
+		return make([]types.UID, len(m.fleetOrder()))
+	}
+	return m.tableUIDs(m.view)
+}
+
+func (m Model) buildTableUIDs(view View) []types.UID {
 	needle := strings.ToLower(m.filterText)
-	switch m.view {
+	switch view {
 	case ViewNodes:
 		rows := sortedNodeRows(m.nodes)
 		out := make([]types.UID, 0, len(rows))
 		for _, r := range rows {
-			if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
+			if !matchesNames("", r.Name, "", needle) {
 				continue
 			}
 			out = append(out, r.UID)
@@ -1718,12 +1770,7 @@ func (m Model) visibleUIDs() []types.UID {
 		rows := sortedDeployRows(m.deployments)
 		out := make([]types.UID, 0, len(rows))
 		for _, r := range rows {
-			if m.namespace != "" && r.Namespace != m.namespace {
-				continue
-			}
-			if needle != "" &&
-				!strings.Contains(strings.ToLower(r.Name), needle) &&
-				!strings.Contains(strings.ToLower(r.Namespace), needle) {
+			if !matchesNames(r.Namespace, r.Name, m.namespace, needle) {
 				continue
 			}
 			out = append(out, r.UID)
@@ -1735,11 +1782,11 @@ func (m Model) visibleUIDs() []types.UID {
 		// view should still show every namespace. Walk in the same
 		// order the renderer paints (active sort key + direction) so
 		// j/k step through the visible table.
-		counts := m.collectNsCounts()
+		counts := m.namespaceCounts()
 		rows := sortedNsRows(m.namespaces, m.nsSortKey, m.nsSortDesc, counts)
 		out := make([]types.UID, 0, len(rows))
 		for _, r := range rows {
-			if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
+			if !matchesNames("", r.Name, "", needle) {
 				continue
 			}
 			out = append(out, r.UID)
@@ -1761,15 +1808,7 @@ func (m Model) visibleUIDs() []types.UID {
 			out = append(out, r.UID)
 		}
 		return out
-	case ViewFleet:
-		// The dashboard's cursor is context-keyed, not UID-keyed; this
-		// only feeds the filter footer's matched count.
-		order := m.fleetOrder()
-		out := make([]types.UID, 0, len(order))
-		for range order {
-			out = append(out, "")
-		}
-		return out
+
 	}
 	rows := m.visibleRows()
 	out := make([]types.UID, 0, len(rows))
@@ -1783,22 +1822,12 @@ func (m Model) visibleUIDs() []types.UID {
 // sorted pod rows. Text filter matches namespace and name (case-insensitive).
 func (m Model) visibleRows() []podRow {
 	rows := sortedRows(m.pods, m.sortKey, m.sortDesc)
-	needle := ""
-	if m.filterText != "" {
-		needle = strings.ToLower(m.filterText)
-	}
+	needle := strings.ToLower(m.filterText)
 	out := make([]podRow, 0, len(rows))
 	for _, r := range rows {
-		if m.namespace != "" && r.Namespace != m.namespace {
-			continue
+		if matchesNames(r.Namespace, r.Name, m.namespace, needle) {
+			out = append(out, r)
 		}
-		if needle != "" {
-			if !strings.Contains(strings.ToLower(r.Namespace), needle) &&
-				!strings.Contains(strings.ToLower(r.Name), needle) {
-				continue
-			}
-		}
-		out = append(out, r)
 	}
 	return out
 }
@@ -1860,7 +1889,7 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 		fmt.Sprintf(" kubetin %s · ns:%s · %s ", strings.TrimSpace(display), ns, viewLabel),
 	)
 
-	visible := len(m.visibleUIDs())
+	visible, _ := m.filterCounts()
 	right := fmt.Sprintf(" %d/%d %s · %s · %s ",
 		visible, total, viewLabel, st.Reach, time.Now().Format("15:04:05"))
 	right = m.Theme.Dim.Render(right)
@@ -1881,19 +1910,9 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 // modal swap, and the sidebar's compact bars don't carry the
 // absolute numbers a top-like tool needs.
 func (m Model) renderHeaderMetrics(st model.ClusterState) string {
-	// Pod phase tally — only walk if we have pods cached. This is the
-	// focused cluster's pod set, not a fleet aggregate.
-	var running, pending, failed int
-	for _, p := range m.pods {
-		switch p.Phase {
-		case corev1.PodRunning:
-			running++
-		case corev1.PodPending:
-			pending++
-		case corev1.PodFailed:
-			failed++
-		}
-	}
+	// The focused cluster's phase tally changes only with pod membership
+	// or phase updates, independently of the table's sort and filters.
+	running, pending, failed := m.podPhaseCounts()
 
 	podStr := fmt.Sprintf("pods %d", len(m.pods))
 	if pending > 0 || failed > 0 {
@@ -2041,7 +2060,11 @@ func (m Model) filterCounts() (matched, total int) {
 	default:
 		total = len(m.pods)
 	}
-	matched = len(m.visibleUIDs())
+	if m.view == ViewFleet {
+		matched = len(m.fleetOrder())
+	} else {
+		matched = m.tableCount(m.view)
+	}
 	return
 }
 
@@ -2066,7 +2089,7 @@ var podColumns = []column{
 }
 
 func (m Model) renderTable(maxRows int, maxWidth int) string {
-	rows := m.visibleRows()
+	rows := rowsForUIDs(m.pods, m.windowUIDs(ViewPods, maxRows))
 
 	// maxWidth-1: the warn-glyph column prefixes every line.
 	w := fitColumns(podColumns, maxWidth-1)
@@ -2109,36 +2132,13 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 	b.WriteString(header)
 	b.WriteByte('\n')
 
-	if len(rows) == 0 {
+	if m.tableCount(ViewPods) == 0 {
 		b.WriteString(m.emptyPlaceholder(m.syncedPods, "pods"))
 		return b.String()
 	}
 
-	visible := rows
-	if maxRows > 0 && len(visible) > maxRows-1 {
-		// Keep cursor in view: simple windowing centered on cursor.
-		idx := rowIndex(rows, m.cursor)
-		if idx < 0 {
-			idx = 0
-		}
-		half := (maxRows - 1) / 2
-		start := idx - half
-		if start < 0 {
-			start = 0
-		}
-		end := start + (maxRows - 1)
-		if end > len(rows) {
-			end = len(rows)
-			start = end - (maxRows - 1)
-			if start < 0 {
-				start = 0
-			}
-		}
-		visible = rows[start:end]
-	}
-
 	warnIdx := recentWarningIndex(m.events)
-	for _, r := range visible {
+	for _, r := range rows {
 		cpuStr, memStr := "—", "—"
 		if r.HasMetrics {
 			cpuStr = formatCPU(r.CPUMilli)

@@ -104,7 +104,7 @@ var ingressColumns = []column{
 }
 
 func (m Model) renderIngressTable(maxRows, maxWidth int) string {
-	rows := m.visibleIngressRows()
+	rows := rowsForUIDs(m.ingresses, m.windowUIDs(ViewIngresses, maxRows))
 
 	w := fitColumns(ingressColumns, maxWidth-1)
 	hdr := m.Theme.Header
@@ -124,11 +124,10 @@ func (m Model) renderIngressTable(maxRows, maxWidth int) string {
 	b.WriteString(header)
 	b.WriteByte('\n')
 
-	if len(rows) == 0 {
+	if m.tableCount(ViewIngresses) == 0 {
 		b.WriteString(m.emptyPlaceholder(m.syncedIngresses, "ingresses"))
 		return b.String()
 	}
-	rows = windowRows(rows, m.cursor, maxRows, func(r ingressRow) types.UID { return r.UID })
 
 	warnIdx := recentWarningIndex(m.events)
 	for _, r := range rows {
