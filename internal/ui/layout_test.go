@@ -302,6 +302,16 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.logs.searchMatches = []int{1, 3}
 			m.logs.searchIdx = 0
 		}},
+		{"logs-search-evicted", 120, 40, ViewPods, func(m *Model) {
+			m.logs.open = true
+			m.logs.cap = 100
+			m.logs.follow = true
+			m.logs.searchTerm = "match"
+			for i := 0; i < 150; i++ {
+				m.applyLogLine("\x1b[31mMATCH\x1b[0m after eviction")
+			}
+			m.logs.searchIdx = 75
+		}},
 		{"logs-search-focused", 120, 40, ViewPods, func(m *Model) {
 			m.logs.open = true
 			m.logs.lines = []string{"a", "b", "c"}
