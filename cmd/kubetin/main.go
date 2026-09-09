@@ -733,80 +733,31 @@ type watchMessageSender interface {
 }
 
 func forwardSvcEvents(ctx context.Context, w *cluster.ServiceWatcher, p watchMessageSender, focus ui.FocusTarget) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-w.Out:
-			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.SvcEventMsg(ev)})
-		}
-	}
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.ServiceEvent) tea.Msg { return ui.SvcEventMsg(ev) })
 }
 
 func forwardIngEvents(ctx context.Context, w *cluster.IngressWatcher, p watchMessageSender, focus ui.FocusTarget) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-w.Out:
-			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.IngEventMsg(ev)})
-		}
-	}
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.IngressEvent) tea.Msg { return ui.IngEventMsg(ev) })
 }
 
 func forwardEndpointSliceEvents(ctx context.Context, w *cluster.EndpointSliceWatcher, p watchMessageSender, focus ui.FocusTarget) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-w.Out:
-			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.EndpointSliceEventMsg(ev)})
-		}
-	}
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.EndpointSliceEvent) tea.Msg { return ui.EndpointSliceEventMsg(ev) })
 }
 
 func forwardPodEvents(ctx context.Context, w *cluster.PodWatcher, p watchMessageSender, focus ui.FocusTarget) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-w.Out:
-			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.PodEventMsg(ev)})
-		}
-	}
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.PodEvent) tea.Msg { return ui.PodEventMsg(ev) })
 }
 
 func forwardNodeEvents(ctx context.Context, w *cluster.NodeWatcher, p watchMessageSender, focus ui.FocusTarget) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-w.Out:
-			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.NodeEventMsg(ev)})
-		}
-	}
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.NodeEvent) tea.Msg { return ui.NodeEventMsg(ev) })
 }
 
 func forwardDeployEvents(ctx context.Context, w *cluster.DeployWatcher, p watchMessageSender, focus ui.FocusTarget) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-w.Out:
-			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.DeployEventMsg(ev)})
-		}
-	}
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.DeployEvent) tea.Msg { return ui.DeployEventMsg(ev) })
 }
 
 func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p watchMessageSender, focus ui.FocusTarget) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-w.Out:
-			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.EvtEventMsg(ev)})
-		}
-	}
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.EventEvent) tea.Msg { return ui.EvtEventMsg(ev) })
 }
 
 // forwardNsEvents pumps NamespaceEvents (from either NamespaceWatcher
@@ -814,14 +765,7 @@ func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p watchMessa
 // program. Taking the channel directly rather than the concrete
 // watcher type keeps the forwarder shared.
 func forwardNsEvents(ctx context.Context, out <-chan cluster.NamespaceEvent, p watchMessageSender, focus ui.FocusTarget) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-out:
-			p.Send(ui.FocusedMsg{Focus: focus, Msg: ui.NsEventMsg(ev)})
-		}
-	}
+	forwardResourceEvents(ctx, out, p, focus, func(ev cluster.NamespaceEvent) tea.Msg { return ui.NsEventMsg(ev) })
 }
 
 // Log forwarding constants. logBatchWindow is short enough that the

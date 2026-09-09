@@ -213,17 +213,9 @@ func (m Model) renderNamespacesView(maxRows, maxWidth int) string {
 
 	// Single-pass count of pods / deploys / warning events per
 	// namespace. Avoids O(N · (P+D+E)) inside the row loop.
-	counts := m.collectNsCounts()
+	counts := m.namespaceCounts()
 
-	all := sortedNsRows(m.namespaces, m.nsSortKey, m.nsSortDesc, counts)
-	needle := strings.ToLower(m.filterText)
-	rows := make([]nsRow, 0, len(all))
-	for _, r := range all {
-		if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
-			continue
-		}
-		rows = append(rows, r)
-	}
+	rows := rowsForUIDs(m.namespaces, m.windowUIDs(ViewNamespaces, maxRows))
 
 	// Mixed-style header cell: bold-grey label + cyan arrow when this
 	// column is the active sort. Same pattern as the pod table — label
@@ -257,37 +249,9 @@ func (m Model) renderNamespacesView(maxRows, maxWidth int) string {
 	b.WriteString(header)
 	b.WriteByte('\n')
 
-	if len(rows) == 0 {
+	if m.tableCount(ViewNamespaces) == 0 {
 		b.WriteString(m.emptyPlaceholder(m.syncedNamespaces, m.namespacesNoun()))
 		return b.String()
-	}
-
-	// Cursor-centred windowing, same shape as the deployment table.
-	if maxRows > 0 && len(rows) > maxRows-1 {
-		idx := -1
-		for i, r := range rows {
-			if r.UID == m.cursor {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			idx = 0
-		}
-		half := (maxRows - 1) / 2
-		start := idx - half
-		if start < 0 {
-			start = 0
-		}
-		end := start + (maxRows - 1)
-		if end > len(rows) {
-			end = len(rows)
-			start = end - (maxRows - 1)
-			if start < 0 {
-				start = 0
-			}
-		}
-		rows = rows[start:end]
 	}
 
 	for _, r := range rows {
