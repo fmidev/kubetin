@@ -47,6 +47,11 @@ import (
 // kubelet's internal cAdvisor housekeeping runs on a similar period.
 const NetworkInterval = 15 * time.Second
 
+const (
+	networkScrapeWorkers = 4
+	networkScrapeTimeout = 5 * time.Second
+)
+
 // PodNetwork is a per-pod rate snapshot.
 type PodNetwork struct {
 	Namespace     string
@@ -63,12 +68,14 @@ type ClusterNetwork struct {
 
 // NetworkSnapshot is one tick's worth of rates.
 type NetworkSnapshot struct {
-	Context string
-	Pods    []PodNetwork
-	Cluster ClusterNetwork
-	At      time.Time
-	OK      bool
-	Error   string
+	Context      string
+	Pods         []PodNetwork
+	Cluster      ClusterNetwork
+	At           time.Time
+	OK           bool // true only when every listed node was sampled (or none exist)
+	Error        string
+	NodesTotal   int
+	NodesScraped int // positive with OK=false means partial coverage
 }
 
 // podKey identifies a pod across samples. We don't have UID from
@@ -76,6 +83,12 @@ type NetworkSnapshot struct {
 // across recreates are tolerable because a recreated pod resets its
 // counters and the rate clamps to zero.
 type podKey struct{ ns, name string }
+
+// Counters from different kubelets must not share a rate baseline.
+type nodePodKey struct {
+	node string
+	podKey
+}
 
 // counterSample stores a pair (value, time) so the next scrape can
 // derive a rate without re-walking history.
@@ -93,7 +106,7 @@ type NetworkPoller struct {
 	DroppedEvents atomic.Uint64
 
 	mu   sync.Mutex
-	prev map[podKey]counterSample
+	prev map[nodePodKey]counterSample
 }
 
 // NewNetworkPoller returns a poller. cap is the channel buffer.
@@ -101,7 +114,7 @@ func NewNetworkPoller(ctxName string, cap int) *NetworkPoller {
 	return &NetworkPoller{
 		Context: ctxName,
 		Out:     make(chan NetworkSnapshot, cap),
-		prev:    map[podKey]counterSample{},
+		prev:    map[nodePodKey]counterSample{},
 	}
 }
 
@@ -111,9 +124,7 @@ func (p *NetworkPoller) Run(ctx context.Context, sup *Supervisor) error {
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
 	}
-	// Generous per-scrape timeout: parse + walk + multiplied by node
-	// count happens inside one tick. Kubelet proxy can be slow under
-	// load.
+	// The tick and each node request have their own context deadlines.
 	restCfg.Timeout = 0
 	cs, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
@@ -154,47 +165,86 @@ func (p *NetworkPoller) tick(parent context.Context, cs *kubernetes.Clientset) {
 		p.send(snap)
 		return
 	}
-	if len(nodes.Items) == 0 {
-		snap.OK = true // no nodes is not an error, just nothing to report
-		p.send(snap)
-		return
-	}
-
-	// Aggregate cumulative counters per pod across all nodes. cAdvisor
-	// reports each pod's network on the node where it runs, so summing
-	// across nodes is correct (not double-counting).
-	cur := map[podKey]counterSample{}
-	now := time.Now()
-	scraped := 0
-	for _, n := range nodes.Items {
-		// Only scrape Ready nodes — a NotReady kubelet either won't
-		// answer or will time out, dragging the whole tick down.
-		if !nodeReady(n) {
-			continue
+	snap.NodesTotal = len(nodes.Items)
+	var ready []string
+	for _, node := range nodes.Items {
+		if nodeReady(node) {
+			ready = append(ready, node.Name)
 		}
-		body, err := scrapeKubelet(tickCtx, cs, n.Name)
-		if err != nil {
-			klog.V(2).Infof("net[%s]: scrape %s: %v", p.Context, n.Name, err)
-			continue
+	}
+	cur, scraped := p.scrapeNodes(tickCtx, cs, ready, networkScrapeTimeout)
+	snap.At = time.Now()
+	snap.NodesScraped = scraped
+	snap.OK = scraped == snap.NodesTotal
+	if !snap.OK {
+		snap.Error = fmt.Sprintf("scraped %d/%d nodes (%d Ready): nodes/proxy unavailable or scrape failed", scraped, snap.NodesTotal, len(ready))
+		if scraped == 0 {
+			p.send(snap)
+			return
 		}
-		scraped++
-		parseCAdvisor(body, now, cur)
 	}
 
-	if scraped == 0 {
-		snap.Error = "no nodes scraped (RBAC nodes/proxy missing, or all nodes NotReady)"
-		p.send(snap)
-		return
-	}
-
-	// Rate calculation against last tick. First-ever sample emits
-	// zeros; subsequent samples use real deltas.
+	// Only successful node samples can supply the next rate baseline.
 	p.mu.Lock()
 	prev := p.prev
 	p.prev = cur
 	p.mu.Unlock()
+	snap.Pods, snap.Cluster = networkRates(cur, prev)
+	p.send(snap)
+}
 
-	var clusterRX, clusterTX int64
+func (p *NetworkPoller) scrapeNodes(ctx context.Context, cs *kubernetes.Clientset, nodes []string, timeout time.Duration) (map[nodePodKey]counterSample, int) {
+	type result struct {
+		node string
+		pods map[podKey]counterSample
+	}
+	jobs := make(chan string, len(nodes))
+	for _, node := range nodes {
+		jobs <- node
+	}
+	close(jobs)
+	results := make(chan result, networkScrapeWorkers)
+	var workers sync.WaitGroup
+	for range min(networkScrapeWorkers, len(nodes)) {
+		workers.Go(func() {
+			for node := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				scrapeCtx, cancel := context.WithTimeout(ctx, timeout)
+				body, err := scrapeKubelet(scrapeCtx, cs, node)
+				at := time.Now()
+				cancel()
+				if err != nil {
+					klog.V(2).Infof("net[%s]: scrape %s: %v", p.Context, node, err)
+					continue
+				}
+				pods := make(map[podKey]counterSample)
+				parseCAdvisor(body, at, pods)
+				results <- result{node: node, pods: pods}
+			}
+		})
+	}
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+	cur := make(map[nodePodKey]counterSample)
+	scraped := 0
+	for r := range results {
+		scraped++
+		for key, sample := range r.pods {
+			cur[nodePodKey{node: r.node, podKey: key}] = sample
+		}
+	}
+	return cur, scraped
+}
+
+// Calculate each node's deltas using its own sample times before
+// summing rates. Concurrent scrapes can finish at different times.
+func networkRates(cur, prev map[nodePodKey]counterSample) ([]PodNetwork, ClusterNetwork) {
+	byPod := make(map[podKey]PodNetwork)
+	var total ClusterNetwork
 	for k, c := range cur {
 		var rx, tx int64
 		if pv, ok := prev[k]; ok {
@@ -204,18 +254,19 @@ func (p *NetworkPoller) tick(parent context.Context, cs *kubernetes.Clientset) {
 				tx = clampRate(c.tx, pv.tx, dt)
 			}
 		}
-		clusterRX += rx
-		clusterTX += tx
-		snap.Pods = append(snap.Pods, PodNetwork{
-			Namespace:     k.ns,
-			Name:          k.name,
-			RXBytesPerSec: rx,
-			TXBytesPerSec: tx,
-		})
+		total.RXBytesPerSec += rx
+		total.TXBytesPerSec += tx
+		pod := byPod[k.podKey]
+		pod.Namespace, pod.Name = k.ns, k.name
+		pod.RXBytesPerSec += rx
+		pod.TXBytesPerSec += tx
+		byPod[k.podKey] = pod
 	}
-	snap.Cluster = ClusterNetwork{RXBytesPerSec: clusterRX, TXBytesPerSec: clusterTX}
-	snap.OK = true
-	p.send(snap)
+	pods := make([]PodNetwork, 0, len(byPod))
+	for _, pod := range byPod {
+		pods = append(pods, pod)
+	}
+	return pods, total
 }
 
 func clampRate(cur, prev int64, dt float64) int64 {

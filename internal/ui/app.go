@@ -215,13 +215,11 @@ type Model struct {
 	syncedServices, syncedIngresses                                        bool
 	syncStartedAt                                                          time.Time
 
-	// Cluster-aggregate network rates, last sample. clusterNetOK is
-	// false until the first non-error NetworkSnapshotMsg arrives —
-	// without that flag a fresh Tab would briefly show "0 B/s" which
-	// is indistinguishable from "scraped successfully and traffic is
-	// idle". When OK=false the UI hides the network panels entirely.
+	// Last available network rates. Partial samples carry a coverage
+	// label; until any data arrives the panel stays hidden.
 	clusterNetRX, clusterNetTX int64
 	clusterNetOK               bool
+	clusterNetCoverage         string // empty for a complete sample
 	netHistory                 netRing
 	restartBaseline            map[types.UID]int32 // first-seen restart count per pod, see noteRestartBaseline
 
@@ -699,7 +697,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
-		if !msg.OK {
+		if !msg.OK && msg.NodesScraped == 0 {
 			// Don't clobber a previously-good reading on a transient
 			// failure — the existing rates remain on screen until the
 			// next successful scrape.
@@ -722,7 +720,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clusterNetRX = msg.Cluster.RXBytesPerSec
 		m.clusterNetTX = msg.Cluster.TXBytesPerSec
 		m.clusterNetOK = true
-		m.netHistory.push(msg.Cluster.RXBytesPerSec, msg.Cluster.TXBytesPerSec, msg.At)
+		m.clusterNetCoverage = ""
+		if msg.OK {
+			m.netHistory.push(msg.Cluster.RXBytesPerSec, msg.Cluster.TXBytesPerSec, msg.At)
+		} else {
+			m.clusterNetCoverage = fmt.Sprintf("partial %d/%d nodes · ", msg.NodesScraped, msg.NodesTotal)
+		}
 		return m, nil
 
 	case MetricsSnapshotMsg:
@@ -1944,7 +1947,7 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 	// that they can't act on.
 	netStr := ""
 	if m.clusterNetOK {
-		netStr = fmt.Sprintf("  ·  ↓ %s  ↑ %s", formatRate(m.clusterNetRX), formatRate(m.clusterNetTX))
+		netStr = fmt.Sprintf("  ·  %s↓ %s  ↑ %s", m.clusterNetCoverage, formatRate(m.clusterNetRX), formatRate(m.clusterNetTX))
 	}
 
 	// Right-side context strip (net · pods · nodes · version) is
