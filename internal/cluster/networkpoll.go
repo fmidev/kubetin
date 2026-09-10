@@ -14,10 +14,11 @@
 // for a single user-driven CLI but worth knowing if we ever go
 // "always-on" against many large clusters.
 //
-// RBAC: requires `get` on `nodes/proxy`. Many users won't have that;
-// the snapshot then carries OK=false and the UI hides network panels
-// silently. There is no per-pod aggregate available from less
-// privileged endpoints, so this is a hard requirement.
+// RBAC: requires `get` on `nodes/proxy`. A total failure has OK=false
+// and NodesScraped==0, with no usable measurements. Network panels
+// stay hidden until usable data arrives. OK=false with NodesScraped>0
+// carries partial rates, which the UI displays with a coverage label.
+// No per-pod aggregate is available from less privileged endpoints.
 //
 // Rates: cAdvisor counters are monotonic since container start. We
 // remember the previous sample per (pod, namespace) and per node and
@@ -30,6 +31,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,8 +107,9 @@ type NetworkPoller struct {
 	Out           chan NetworkSnapshot
 	DroppedEvents atomic.Uint64
 
-	mu   sync.Mutex
-	prev map[nodePodKey]counterSample
+	mu       sync.Mutex
+	prev     map[nodePodKey]counterSample
+	nextNode string
 }
 
 // NewNetworkPoller returns a poller. cap is the channel buffer.
@@ -199,13 +202,27 @@ func (p *NetworkPoller) tick(parent context.Context, cs *kubernetes.Clientset) {
 }
 
 func (p *NetworkPoller) scrapeNodes(ctx context.Context, cs *kubernetes.Clientset, nodes []string, timeout time.Duration) (map[nodePodKey]counterSample, map[string]bool) {
+	nodes = slices.Clone(nodes)
+	slices.Sort(nodes)
+	p.mu.Lock()
+	start, _ := slices.BinarySearch(nodes, p.nextNode)
+	if start == len(nodes) {
+		start = 0
+	}
+	// Rotate the first worker group so repeated tick deadlines cannot
+	// starve the tail. Node names keep the cursor stable across list reordering.
+	if len(nodes) > 0 && ctx.Err() == nil {
+		p.nextNode = nodes[(start+networkScrapeWorkers)%len(nodes)]
+	}
+	p.mu.Unlock()
+
 	type result struct {
 		node string
 		pods map[podKey]counterSample
 	}
 	jobs := make(chan string, len(nodes))
-	for _, node := range nodes {
-		jobs <- node
+	for i := range nodes {
+		jobs <- nodes[(start+i)%len(nodes)]
 	}
 	close(jobs)
 	results := make(chan result, networkScrapeWorkers)

@@ -179,6 +179,49 @@ func TestNetworkScrapeConcurrencyBoundAndCancellation(t *testing.T) {
 	}
 }
 
+func TestNetworkScrapeFairnessAcrossCancelledTicks(t *testing.T) {
+	const count = networkScrapeWorkers*3 + 1
+	nodes := make([]string, count)
+	for i := range nodes {
+		nodes[i] = fmt.Sprintf("node-%02d", i)
+	}
+	started := make(chan string, count)
+	cs := networkTestClient(t, nil, func(w http.ResponseWriter, r *http.Request, node string) {
+		started <- node
+		<-r.Context().Done()
+	})
+	p := NewNetworkPoller("test", 1)
+	seen := make(map[string]bool)
+	for tick := 0; tick < (count+networkScrapeWorkers-1)/networkScrapeWorkers; tick++ {
+		// API list order is not a scheduling identity.
+		slices.Reverse(nodes)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		done := make(chan struct{})
+		go func() {
+			p.scrapeNodes(ctx, cs, nodes, time.Minute)
+			close(done)
+		}()
+		for range networkScrapeWorkers {
+			select {
+			case node := <-started:
+				seen[node] = true
+			case <-ctx.Done():
+				cancel()
+				t.Fatal("first worker group did not start")
+			}
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("scrapes did not stop after tick cancellation")
+		}
+	}
+	if len(seen) != count {
+		t.Fatalf("repeated cancellation starved nodes: contacted %d/%d: %v", len(seen), count, seen)
+	}
+}
+
 func TestNetworkScrapeUsesNodeCompletionTimes(t *testing.T) {
 	var mu sync.Mutex
 	var released time.Time
