@@ -2,11 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
 	"github.com/fmidev/kubetin/internal/model"
@@ -56,6 +58,73 @@ func TestNetworkPartialCoverageAndRecovery(t *testing.T) {
 	m = updated.(Model)
 	if m.clusterNetCoverage != "" || m.clusterNetOK {
 		t.Fatal("old context's partial snapshot contaminated the new focus")
+	}
+}
+
+func TestNetworkSnapshotClearsAbsentPodRates(t *testing.T) {
+	for _, sortKey := range []SortKey{SortNetRX, SortNetTX} {
+		for _, tc := range []struct {
+			name            string
+			complete, empty bool
+		}{
+			{"partial", false, false},
+			{"complete", true, false},
+			{"partial-empty", false, true},
+			{"complete-empty", true, true},
+		} {
+			t.Run(sortKey.label()+"/"+tc.name, func(t *testing.T) {
+				m := New("alpha", model.NewStore(), []string{"alpha"})
+				m.sortKey = sortKey
+				m.pods["a"] = podRow{UID: "a", Namespace: "ns", Name: "a"}
+				m.pods["b"] = podRow{UID: "b", Namespace: "ns", Name: "b"}
+				complete := NetworkSnapshotMsg{
+					Context: "alpha", OK: true, NodesTotal: 2, NodesScraped: 2,
+					Pods: []cluster.PodNetwork{
+						{Namespace: "ns", Name: "a", RXBytesPerSec: 1000, TXBytesPerSec: 100},
+						{Namespace: "ns", Name: "b", RXBytesPerSec: 2000, TXBytesPerSec: 200},
+					},
+				}
+				updated, _ := m.Update(complete)
+				m = updated.(Model)
+				if got := m.visibleUIDs(); !slices.Equal(got, []types.UID{"a", "b"}) {
+					t.Fatalf("initial network sort = %v", got)
+				}
+				snap := complete
+				snap.OK = tc.complete
+				if !tc.complete {
+					snap.NodesScraped = 1
+				}
+				snap.Pods = snap.Pods[:1]
+				if tc.empty {
+					snap.Pods = nil
+				}
+				updated, _ = m.Update(snap)
+				m = updated.(Model)
+				if row := m.pods["b"]; row.HasNetwork || row.NetRXBps != 0 || row.NetTXBps != 0 {
+					t.Errorf("absent pod retained HasNetwork=%t RX=%d TX=%d", row.HasNetwork, row.NetRXBps, row.NetTXBps)
+				}
+				if tc.empty {
+					if row := m.pods["a"]; row.HasNetwork || row.NetRXBps != 0 || row.NetTXBps != 0 {
+						t.Error("empty measurement did not clear all pod rates")
+					}
+				} else {
+					if row := m.pods["a"]; !row.HasNetwork || row.NetRXBps != 1000 || row.NetTXBps != 100 {
+						t.Error("present pod lost its current reading")
+					}
+					if got := m.visibleUIDs(); !slices.Equal(got, []types.UID{"b", "a"}) {
+						t.Errorf("cleared network rate left stale cached sorting: %v", got)
+					}
+				}
+				updated, _ = m.Update(complete)
+				m = updated.(Model)
+				if row := m.pods["b"]; !row.HasNetwork || row.NetRXBps != 2000 || row.NetTXBps != 200 {
+					t.Fatal("recovery did not restore the missing pod's reading")
+				}
+				if got := m.visibleUIDs(); !slices.Equal(got, []types.UID{"a", "b"}) {
+					t.Fatalf("recovery left stale cached sorting: %v", got)
+				}
+			})
+		}
 	}
 }
 

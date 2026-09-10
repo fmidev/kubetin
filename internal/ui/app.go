@@ -708,14 +708,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			netByKey[n.Namespace+"/"+n.Name] = n
 		}
 		for uid, row := range m.pods {
+			before := row
 			if n, ok := netByKey[row.Namespace+"/"+row.Name]; ok {
-				before := row
 				row.NetRXBps = n.RXBytesPerSec
 				row.NetTXBps = n.TXBytesPerSec
 				row.HasNetwork = true
-				m.pods[uid] = row
-				m.invalidatePodOrder(before, row)
+			} else {
+				row.NetRXBps, row.NetTXBps, row.HasNetwork = 0, 0, false
 			}
+			m.pods[uid] = row
+			m.invalidatePodOrder(before, row)
 		}
 		m.clusterNetRX = msg.Cluster.RXBytesPerSec
 		m.clusterNetTX = msg.Cluster.TXBytesPerSec
