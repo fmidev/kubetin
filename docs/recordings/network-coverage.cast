@@ -1,0 +1,5 @@
+{"height":1,"title":"Network coverage: complete, partial, recovered (UI fixture)","version":2,"width":220}
+[0,"o","\u001b[2J\u001b[H metrics unavailable for this cluster                                                                                                                                  ·  ↓ 4.1kB/s  ↑ 2.0kB/s  ·  pods 0  ·  nodes —  ·  — "]
+[2,"o","\u001b[2J\u001b[H metrics unavailable for this cluster                                                                                                              ·  partial 2/3 nodes · ↓ 2.0kB/s  ↑ 1.0kB/s  ·  pods 0  ·  nodes —  ·  — "]
+[4,"o","\u001b[2J\u001b[H metrics unavailable for this cluster                                                                                                                                  ·  ↓ 4.1kB/s  ↑ 2.0kB/s  ·  pods 0  ·  nodes —  ·  — "]
+[6,"o",""]

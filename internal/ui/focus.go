@@ -67,6 +67,7 @@ func (m *Model) clearFocusedState() {
 	m.syncedServices, m.syncedIngresses = false, false
 	m.syncStartedAt = time.Now()
 	m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
+	m.clusterNetCoverage = ""
 	m.netHistory = netRing{}
 	m.restartBaseline = make(map[types.UID]int32)
 	m.permissions = make(map[string]permState)
