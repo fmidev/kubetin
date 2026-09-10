@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,8 +134,8 @@ func TestNetworkScrapeIndividualDeadlines(t *testing.T) {
 	defer cancel()
 	p := NewNetworkPoller("test", 1)
 	_, scraped := p.scrapeNodes(ctx, cs, names, 100*time.Millisecond)
-	if ctx.Err() != nil || scraped != networkScrapeWorkers {
-		t.Fatalf("individual deadlines did not free workers for later nodes: scraped=%d, parent=%v", scraped, ctx.Err())
+	if ctx.Err() != nil || len(scraped) != networkScrapeWorkers {
+		t.Fatalf("individual deadlines did not free workers for later nodes: scraped=%d, parent=%v", len(scraped), ctx.Err())
 	}
 }
 
@@ -192,7 +193,7 @@ func TestNetworkScrapeUsesNodeCompletionTimes(t *testing.T) {
 	})
 	p := NewNetworkPoller("test", 1)
 	cur, scraped := p.scrapeNodes(context.Background(), cs, []string{"fast", "slow"}, time.Second)
-	if scraped != 2 {
+	if len(scraped) != 2 {
 		t.Fatal("expected both nodes to be sampled")
 	}
 	mu.Lock()
@@ -201,6 +202,98 @@ func TestNetworkScrapeUsesNodeCompletionTimes(t *testing.T) {
 	slow := cur[nodePodKey{node: "slow", podKey: podKey{"ns", "slow"}}]
 	if slow.at.Before(released) || !fast.at.Before(slow.at) {
 		t.Fatalf("sample times do not reflect node completion: fast=%s slow=%s release=%s", fast.at, slow.at, released)
+	}
+}
+
+func TestNetworkTickRecoveryPreservesUnsampledBaselines(t *testing.T) {
+	for _, totalFailure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("total-failure=%t", totalFailure), func(t *testing.T) {
+			var round atomic.Int64
+			cs := networkTestClient(t, []corev1.Node{readyNetworkNode("a"), readyNetworkNode("b")}, func(w http.ResponseWriter, r *http.Request, node string) {
+				n := round.Load()
+				if n == 1 && (node == "b" || totalFailure) {
+					http.Error(w, "unavailable", http.StatusForbidden)
+					return
+				}
+				fmt.Fprintf(w, "container_network_receive_bytes_total{namespace=\"ns\",pod=\"%s\"} %d\n", node, (n+1)*1000)
+			})
+			p := NewNetworkPoller("test", 1)
+			p.tick(context.Background(), cs)
+			if snap := <-p.Out; !snap.OK {
+				t.Fatalf("initial snapshot should be complete: %+v", snap)
+			}
+			b := nodePodKey{node: "b", podKey: podKey{"ns", "b"}}
+			first := p.prev[b]
+			round.Store(1)
+			p.tick(context.Background(), cs)
+			missed := <-p.Out
+			wantScraped := 1
+			if totalFailure {
+				wantScraped = 0
+			}
+			if missed.OK || missed.NodesScraped != wantScraped {
+				t.Fatalf("unexpected failure coverage: %+v", missed)
+			}
+			if got, ok := p.prev[b]; !ok || got != first {
+				t.Errorf("missed node lost its last successful baseline: got %+v, want %+v", got, first)
+			}
+			for _, pod := range missed.Pods {
+				if pod.Name == "b" {
+					t.Error("retained baseline was emitted as a fresh measurement")
+				}
+			}
+			round.Store(2)
+			p.tick(context.Background(), cs)
+			recovered := <-p.Out
+			current := p.prev[b]
+			want := int64(float64(current.rx-first.rx) / current.at.Sub(first.at).Seconds())
+			var got, total int64
+			for _, pod := range recovered.Pods {
+				total += pod.RXBytesPerSec
+				if pod.Name == "b" {
+					got = pod.RXBytesPerSec
+				}
+			}
+			if !recovered.OK || recovered.NodesScraped != 2 || got != want || got <= 0 || recovered.Cluster.RXBytesPerSec != total {
+				t.Fatalf("recovery should include the missed node's rate over its full sample interval: got %d, want %d; snapshot %+v", got, want, recovered)
+			}
+		})
+	}
+}
+
+func TestNetworkTickPrunesObsoleteBaselines(t *testing.T) {
+	for _, mode := range []string{"empty", "failed", "not-ready"} {
+		t.Run(mode, func(t *testing.T) {
+			node := readyNetworkNode("a")
+			if mode == "not-ready" {
+				node.Status.Conditions[0].Status = corev1.ConditionFalse
+			}
+			cs := networkTestClient(t, []corev1.Node{node}, func(w http.ResponseWriter, r *http.Request, node string) {
+				if mode == "not-ready" {
+					t.Error("scraped a NotReady node")
+				}
+				if mode == "failed" {
+					http.Error(w, "unavailable", http.StatusForbidden)
+				}
+				// A successful empty scrape means the old pod is gone.
+			})
+			p := NewNetworkPoller("test", 1)
+			oldPod := nodePodKey{node: "a", podKey: podKey{"ns", "old"}}
+			removedNode := nodePodKey{node: "gone", podKey: podKey{"ns", "old"}}
+			p.prev[oldPod] = counterSample{rx: 1000, at: time.Now()}
+			p.prev[removedNode] = p.prev[oldPod]
+			p.tick(context.Background(), cs)
+			snap := <-p.Out
+			if _, ok := p.prev[oldPod]; ok != (mode != "empty") {
+				t.Errorf("old pod baseline retained=%t, want %t", ok, mode != "empty")
+			}
+			if _, ok := p.prev[removedNode]; ok {
+				t.Error("baseline for a node absent from the node list was retained")
+			}
+			if len(snap.Pods) != 0 || snap.Cluster.RXBytesPerSec != 0 {
+				t.Fatal("obsolete or retained samples leaked into the snapshot")
+			}
+		})
 	}
 }
 

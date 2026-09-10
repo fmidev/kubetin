@@ -166,34 +166,39 @@ func (p *NetworkPoller) tick(parent context.Context, cs *kubernetes.Clientset) {
 		return
 	}
 	snap.NodesTotal = len(nodes.Items)
+	listed := make(map[string]bool, len(nodes.Items))
 	var ready []string
 	for _, node := range nodes.Items {
+		listed[node.Name] = true
 		if nodeReady(node) {
 			ready = append(ready, node.Name)
 		}
 	}
 	cur, scraped := p.scrapeNodes(tickCtx, cs, ready, networkScrapeTimeout)
 	snap.At = time.Now()
-	snap.NodesScraped = scraped
-	snap.OK = scraped == snap.NodesTotal
+	snap.NodesScraped = len(scraped)
+	snap.OK = len(scraped) == snap.NodesTotal
 	if !snap.OK {
-		snap.Error = fmt.Sprintf("scraped %d/%d nodes (%d Ready): nodes/proxy unavailable or scrape failed", scraped, snap.NodesTotal, len(ready))
-		if scraped == 0 {
-			p.send(snap)
-			return
-		}
+		snap.Error = fmt.Sprintf("scraped %d/%d nodes (%d Ready): nodes/proxy unavailable or scrape failed", len(scraped), snap.NodesTotal, len(ready))
 	}
 
-	// Only successful node samples can supply the next rate baseline.
 	p.mu.Lock()
-	prev := p.prev
-	p.prev = cur
+	snap.Pods, snap.Cluster = networkRates(cur, p.prev)
+	// Keep missed nodes' last successful samples for recovery, but
+	// never include those old readings in this tick's measurements.
+	for key := range p.prev {
+		if !listed[key.node] || scraped[key.node] {
+			delete(p.prev, key)
+		}
+	}
+	for key, sample := range cur {
+		p.prev[key] = sample
+	}
 	p.mu.Unlock()
-	snap.Pods, snap.Cluster = networkRates(cur, prev)
 	p.send(snap)
 }
 
-func (p *NetworkPoller) scrapeNodes(ctx context.Context, cs *kubernetes.Clientset, nodes []string, timeout time.Duration) (map[nodePodKey]counterSample, int) {
+func (p *NetworkPoller) scrapeNodes(ctx context.Context, cs *kubernetes.Clientset, nodes []string, timeout time.Duration) (map[nodePodKey]counterSample, map[string]bool) {
 	type result struct {
 		node string
 		pods map[podKey]counterSample
@@ -230,9 +235,9 @@ func (p *NetworkPoller) scrapeNodes(ctx context.Context, cs *kubernetes.Clientse
 		close(results)
 	}()
 	cur := make(map[nodePodKey]counterSample)
-	scraped := 0
+	scraped := make(map[string]bool)
 	for r := range results {
-		scraped++
+		scraped[r.node] = true
 		for key, sample := range r.pods {
 			cur[nodePodKey{node: r.node, podKey: key}] = sample
 		}
