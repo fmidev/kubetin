@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -659,7 +660,7 @@ func dashDeploySetup(extra func(*Model)) func(*Model) {
 			Replicas: 3, Ready: 2, UpToDate: 3, Available: 2, Unavailable: 1,
 			CreatedAt:    now.Add(-12 * 24 * time.Hour),
 			StrategyType: "RollingUpdate", MaxSurge: "25%", MaxUnavailable: "25%",
-			Selector:   sel,
+			Selector:   &metav1.LabelSelector{MatchLabels: sel},
 			Conditions: []cluster.DeployCondition{{Type: "Available", Status: "True"}},
 		}
 		m.events["dep-evt"] = eventRow{

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -48,12 +49,7 @@ type DeployEvent struct {
 	CreatedAt    time.Time
 	StrategyType string // RollingUpdate | Recreate
 
-	// Selector backs the dashboard's owned-pod lookup. Only
-	// MatchLabels is projected — MatchExpressions is legal in the API
-	// but Deployments created by any normal path use MatchLabels, and
-	// the dashboard falls back to the name-prefix heuristic when this
-	// is empty.
-	Selector map[string]string
+	Selector *metav1.LabelSelector
 
 	MaxSurge       string
 	MaxUnavailable string
@@ -130,10 +126,6 @@ func (w *DeployWatcher) emit(kind DeployEventKind, obj any) {
 	if d.Spec.Replicas != nil {
 		desired = *d.Spec.Replicas
 	}
-	var selector map[string]string
-	if d.Spec.Selector != nil {
-		selector = copyLabels(d.Spec.Selector.MatchLabels)
-	}
 	maxSurge, maxUnavail := "", ""
 	if ru := d.Spec.Strategy.RollingUpdate; ru != nil {
 		if ru.MaxSurge != nil {
@@ -156,7 +148,7 @@ func (w *DeployWatcher) emit(kind DeployEventKind, obj any) {
 		Unavailable:    d.Status.UnavailableReplicas,
 		CreatedAt:      d.CreationTimestamp.Time,
 		StrategyType:   string(d.Spec.Strategy.Type),
-		Selector:       selector,
+		Selector:       d.Spec.Selector.DeepCopy(),
 		MaxSurge:       maxSurge,
 		MaxUnavailable: maxUnavail,
 		Conditions:     projectDeployConditions(d.Status.Conditions),

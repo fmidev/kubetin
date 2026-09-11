@@ -13,7 +13,7 @@ import (
 
 func TestDashboardDeletePreservesSelectedUID(t *testing.T) {
 	m := dashDeployModel(200, 50, nil)
-	want := m.deployOwnedPods(m.deployments["dep-uid"])[1]
+	want := m.deploymentPods(m.deployments["dep-uid"])[1]
 	var deleted cluster.DescribeRef
 	m.OnDelete = func(_ string, ref cluster.DescribeRef) tea.Msg {
 		deleted = ref

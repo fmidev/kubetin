@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -27,7 +29,7 @@ type deploymentRow struct {
 	StrategyType   string
 	MaxSurge       string
 	MaxUnavailable string
-	Selector       map[string]string
+	Selector       *metav1.LabelSelector
 	Conditions     []cluster.DeployCondition
 }
 
@@ -66,6 +68,31 @@ func sortedDeployRows(m map[types.UID]deploymentRow) []deploymentRow {
 			return out[i].Namespace < out[j].Namespace
 		}
 		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// deploymentPods groups pods by the deployment's selector, as log lookup
+// does in kubectl. It does not establish the ReplicaSet ownership chain.
+func (m Model) deploymentPods(d deploymentRow) []podRow {
+	if d.Selector == nil {
+		return nil
+	}
+	sel, err := metav1.LabelSelectorAsSelector(d.Selector)
+	if err != nil || sel.Empty() {
+		return nil
+	}
+	out := make([]podRow, 0, 8)
+	for _, p := range m.pods {
+		if p.Namespace == d.Namespace && sel.Matches(labels.Set(p.Labels)) {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].UID < out[j].UID
 	})
 	return out
 }
