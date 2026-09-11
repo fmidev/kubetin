@@ -283,40 +283,19 @@ func (m Model) openLogsForPod(ref cluster.DescribeRef, containers []string) (tea
 	return m, nil
 }
 
-// openLogsForDeployment finds a Running pod from the local cache that
-// belongs to the deployment and streams its logs. The owner mapping
-// is heuristic: deployment "foo" produces pods "foo-<rs-hash>-<id>",
-// so namespace match + Name prefix `foo-` is correct in practice. We
-// pick the most recently created Running pod so a recent rollout
-// surfaces over older replicas.
+// openLogsForDeployment uses the dashboard's membership and replica choice.
 func (m Model) openLogsForDeployment(deployRef cluster.DescribeRef) (tea.Model, tea.Cmd) {
-	prefix := deployRef.Name + "-"
-	var picked *podRow
-	for _, p := range m.pods {
-		if p.Namespace != deployRef.Namespace {
-			continue
-		}
-		if !strings.HasPrefix(p.Name, prefix) {
-			continue
-		}
-		if string(p.Phase) != "Running" {
-			continue
-		}
-		if picked == nil || p.CreatedAt.After(picked.CreatedAt) {
-			pp := p
-			picked = &pp
+	for _, d := range m.deployments {
+		if d.Namespace == deployRef.Namespace && d.Name == deployRef.Name {
+			if p, ok := newestRunningPod(m.deploymentPods(d)); ok {
+				return m.openLogsForPod(podRefFor(p), p.Containers)
+			}
+			break
 		}
 	}
-	if picked == nil {
-		m.toast = "✕ No Running pod found for " + deployRef.Name
-		m.toastUntil = time.Now().Add(3 * time.Second)
-		return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
-	}
-	podRef := cluster.DescribeRef{
-		Version: "v1", Resource: "pods", Kind: "Pod",
-		Namespace: picked.Namespace, Name: picked.Name,
-	}
-	return m.openLogsForPod(podRef, picked.Containers)
+	m.toast = "✕ No matching pod found for " + deployRef.Name
+	m.toastUntil = time.Now().Add(3 * time.Second)
+	return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
 }
 
 func (m Model) handleLogsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {

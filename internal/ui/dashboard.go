@@ -125,7 +125,7 @@ func (m *Model) prepareLogTarget(t dashboardTarget) {
 		if !ok {
 			return
 		}
-		p, ok := newestRunningPod(m.deployOwnedPods(d))
+		p, ok := newestRunningPod(m.deploymentPods(d))
 		if !ok {
 			return
 		}
@@ -250,7 +250,7 @@ func (m Model) dashSubjectNow() (dashSubject, bool) {
 		if !ok {
 			return dashSubject{}, false
 		}
-		return dashSubject{Kind: "Deployment", Deploy: d, Pods: m.deployOwnedPods(d)}, true
+		return dashSubject{Kind: "Deployment", Deploy: d, Pods: m.deploymentPods(d)}, true
 	}
 	r, ok := m.pods[t.UID]
 	if !ok {

@@ -151,7 +151,7 @@ func TestDashboardWithoutPodsInvalidatesOldLogStream(t *testing.T) {
 				started = append(started, req)
 				return nil
 			}
-			pod := m.deployOwnedPods(m.deployments["dep-uid"])[0]
+			pod := m.deploymentPods(m.deployments["dep-uid"])[0]
 			opened, start := m.openDashboard(podRefFor(pod), pod.UID)
 			m = opened.(Model)
 			defer m.logs.cancel()

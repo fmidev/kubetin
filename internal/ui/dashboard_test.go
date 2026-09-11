@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -610,7 +611,7 @@ func TestDeployOwnedPodsUseSelector(t *testing.T) {
 	m := dashDeployModel(200, 50, nil)
 	d := m.deployments["dep-uid"]
 
-	got := m.deployOwnedPods(d)
+	got := m.deploymentPods(d)
 	if len(got) != 3 {
 		t.Fatalf("len = %d, want 3; got %v", len(got), podNames(got))
 	}
@@ -625,34 +626,12 @@ func TestDeployOwnedPodsUseSelector(t *testing.T) {
 	}
 }
 
-// With no selector projected we fall back to the prefix heuristic
-// rather than showing an empty pane. The fallback is deliberately
-// imprecise — "payments-api-worker-…" shares the "payments-api-"
-// prefix and does get pulled in — which is exactly why the selector
-// path above is preferred whenever a selector exists. This test pins
-// that trade-off so the fallback isn't mistaken for an exact match.
-func TestDeployOwnedPodsPrefixFallback(t *testing.T) {
-	m := dashDeployModel(200, 50, func(m *Model) {
-		d := m.deployments["dep-uid"]
-		d.Selector = nil
-		m.deployments["dep-uid"] = d
-	})
-	got := podNames(m.deployOwnedPods(m.deployments["dep-uid"]))
-
-	// Every real replica is found: the pane is never empty when pods exist.
-	for _, want := range []string{
-		"payments-api-7f9c8-aaaaa",
-		"payments-api-7f9c8-bbbbb",
-		"payments-api-7f9c8-x2k4l",
-	} {
-		if !contains(got, want) {
-			t.Errorf("fallback missed replica %q; got %v", want, got)
-		}
-	}
-	// And the known over-match is present, unlike the selector path.
-	if !contains(got, "payments-api-worker-1234-zzzzz") {
-		t.Log("prefix fallback no longer over-matches; if that was deliberate, " +
-			"update this test and the deployOwnedPods comment together")
+func TestDeploymentPodsMissingSelector(t *testing.T) {
+	m := dashDeployModel(200, 50, nil)
+	d := m.deployments["dep-uid"]
+	d.Selector = nil
+	if got := m.deploymentPods(d); len(got) != 0 {
+		t.Fatalf("missing selector matched pods: %v", podNames(got))
 	}
 }
 
@@ -677,7 +656,7 @@ func TestDashDeployEventsAggregates(t *testing.T) {
 		}
 	})
 	d := m.deployments["dep-uid"]
-	got := m.dashDeployEvents(d, m.deployOwnedPods(d))
+	got := m.dashDeployEvents(d, m.deploymentPods(d))
 
 	kinds := map[string]int{}
 	for _, e := range got {
@@ -788,7 +767,7 @@ func TestDeployBlockingCondition(t *testing.T) {
 }
 
 func TestFormatSelectorIsStable(t *testing.T) {
-	sel := map[string]string{"tier": "backend", "app": "payments", "env": "prod"}
+	sel := &metav1.LabelSelector{MatchLabels: map[string]string{"tier": "backend", "app": "payments", "env": "prod"}}
 	want := "app=payments,env=prod,tier=backend"
 	for i := 0; i < 10; i++ {
 		if got := formatSelector(sel); got != want {
@@ -1418,7 +1397,7 @@ func TestDashEnterTargetsSelectedPod(t *testing.T) {
 	if !o.actionMenu.open {
 		t.Fatal("enter did not open the action menu")
 	}
-	want := m.deployOwnedPods(m.deployments["dep-uid"])[1]
+	want := m.deploymentPods(m.deployments["dep-uid"])[1]
 	if o.actionMenu.ref.Kind != "Pod" || o.actionMenu.ref.Name != want.Name {
 		t.Errorf("menu ref = %s/%s, want Pod/%s",
 			o.actionMenu.ref.Kind, o.actionMenu.ref.Name, want.Name)
@@ -1463,7 +1442,7 @@ func TestDashEnterAfterDrillIn(t *testing.T) {
 	if d.cursor != "dep-uid" {
 		t.Fatalf("premise broken: table cursor moved to %q", d.cursor)
 	}
-	want := m.deployOwnedPods(m.deployments["dep-uid"])[0]
+	want := m.deploymentPods(m.deployments["dep-uid"])[0]
 
 	opened, _ := d.handleDashboardKey(key("enter"))
 	o := opened.(Model)
