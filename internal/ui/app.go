@@ -320,11 +320,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.(type) {
 		case ResourceBatchMsg, PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
 			SvcEventMsg, IngEventMsg, EndpointSliceEventMsg, MetricsSnapshotMsg, NetworkSnapshotMsg,
-			DescribeResultMsg, PermissionResultMsg, DeleteResultMsg, ScaleResultMsg, RolloutResultMsg,
+			modalResultMsg, DescribeResultMsg, PermissionResultMsg, DeleteResultMsg, ScaleResultMsg, RolloutResultMsg,
 			NodeOpResultMsg, DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
 			discardFocusedMessage(msg)
 			return m, nil
 		}
+	}
+	var request *modalRequest
+	if result, ok := msg.(modalResultMsg); ok {
+		request, msg = result.request, result.msg
 	}
 	switch msg := msg.(type) {
 	case ResourceBatchMsg:
@@ -502,12 +506,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case DescribeResultMsg:
-		// Drop describes that returned from a context we already
-		// Tabbed away from — otherwise stale YAML overwrites the new
-		// view's loading state.
-		if msg.Context != m.WatchedContext {
+		if msg.Context != m.WatchedContext || !m.describe.open || !m.describe.loading || !m.describe.request.accepts(request) {
 			return m, nil
 		}
+		m.describe.request.stop()
 		m.describe.loading = false
 		m.describe.result = cluster.DescribeResult(msg)
 		m.describe.scroll = 0
@@ -546,13 +548,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case DeleteResultMsg:
 		res := cluster.DeleteResult(msg)
-		// Drop results from a context the user already Tabbed away
-		// from. Without this, an in-flight Delete that returns after
-		// the user opened a fresh confirm on cluster B would force-
-		// close B's modal and toast "Deleted A/foo" over the top.
-		if res.Context != m.WatchedContext {
+		if res.Context != m.WatchedContext || !m.deleteConfirm.open || !m.deleteConfirm.pending || !m.deleteConfirm.request.accepts(request) {
 			return m, nil
 		}
+		m.deleteConfirm.request.stop()
 		// Close the confirm modal whether it succeeded or not — the
 		// result is communicated via the footer toast.
 		m.deleteConfirm.open = false
@@ -613,9 +612,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ScaleResultMsg:
 		res := cluster.ScaleResult(msg)
-		if res.Context != m.WatchedContext {
+		if res.Context != m.WatchedContext || !m.scaleConfirm.open || !m.scaleConfirm.pending || !m.scaleConfirm.request.accepts(request) {
 			return m, nil
 		}
+		m.scaleConfirm.request.stop()
 		m.scaleConfirm.open = false
 		m.scaleConfirm.pending = false
 		if res.OK {
@@ -628,9 +628,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case RolloutResultMsg:
 		res := cluster.RolloutResult(msg)
-		if res.Context != m.WatchedContext {
+		if res.Context != m.WatchedContext || !m.restartConfirm.open || !m.restartConfirm.pending || !m.restartConfirm.request.accepts(request) {
 			return m, nil
 		}
+		m.restartConfirm.request.stop()
 		m.restartConfirm.open = false
 		m.restartConfirm.pending = false
 		if res.OK {
@@ -1221,17 +1222,7 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 	case ActDescribe:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
-		if m.OnDescribe == nil {
-			return m, nil
-		}
-		m.describe.open = true
-		m.describe.loading = true
-		m.describe.scroll = 0
-		m.describe.result = cluster.DescribeResult{Ref: ref}
-		req := DescribeRequestMsg{Ref: ref, Reveal: false}
-		cb := m.OnDescribe
-		focused := m.WatchedContext
-		return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
+		return m.startDescribe(ref, false)
 	case ActLogs:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1308,17 +1299,7 @@ func (m Model) openDescribe(reveal bool) (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
-	if m.OnDescribe == nil {
-		return m, nil
-	}
-	m.describe.open = true
-	m.describe.loading = true
-	m.describe.scroll = 0
-	m.describe.result = cluster.DescribeResult{Ref: ref}
-	req := DescribeRequestMsg{Ref: ref, Reveal: reveal}
-	cb := m.OnDescribe
-	focused := m.WatchedContext
-	return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
+	return m.startDescribe(ref, reveal)
 }
 
 // handleDescribeKey routes input while the describe overlay is open.
@@ -1329,14 +1310,9 @@ func (m Model) handleDescribeKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch k.String() {
 	case "esc", "q":
-		m.describe.open = false
-		// Drop the YAML buffer once the modal closes. When reveal=true
-		// was used the buffer holds plaintext Secret values; we don't
-		// want them to linger in the model for the rest of the session
-		// (panic stack dumps, scroll-up artefacts, etc.).
-		m.describe.result.YAML = ""
-		m.describe.revealed = false
+		m.closeDescribe()
 	case "ctrl+c":
+		m.closeDescribe()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case "j", "down":
@@ -1367,13 +1343,7 @@ func (m Model) handleDescribeKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// the entire session of this modal.
 		ref := m.describe.result.Ref
 		if ref.Kind == "Secret" && m.OnDescribe != nil {
-			m.describe.loading = true
-			m.describe.scroll = 0
-			m.describe.revealed = true
-			req := DescribeRequestMsg{Ref: ref, Reveal: true}
-			cb := m.OnDescribe
-			focused := m.WatchedContext
-			return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
+			return m.startDescribe(ref, true)
 		}
 	}
 	return m, nil

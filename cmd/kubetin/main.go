@@ -210,8 +210,10 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 			klog.Infof("describe: revealing Secret/%s in ns/%s on context %s",
 				req.Ref.Name, req.Ref.Namespace, focusedCtx)
 		}
-		fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		fetchCtx, cancel := context.WithTimeout(req.Context, 10*time.Second)
 		defer cancel()
+		stopShutdown := context.AfterFunc(ctx, cancel)
+		defer stopShutdown()
 		res := sup.Describe(fetchCtx, focusedCtx, req.Ref, req.Reveal)
 		return ui.DescribeResultMsg(res)
 	}

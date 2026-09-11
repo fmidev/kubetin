@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"context"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -11,8 +13,9 @@ import (
 // DescribeRequestMsg asks main to fetch a describe for the given ref.
 // (We tunnel through main because the supervisor lives there.)
 type DescribeRequestMsg struct {
-	Ref    cluster.DescribeRef
-	Reveal bool
+	Context context.Context
+	Ref     cluster.DescribeRef
+	Reveal  bool
 }
 
 // DescribeResultMsg is the response — fetched YAML or an error.
@@ -20,6 +23,7 @@ type DescribeResultMsg cluster.DescribeResult
 
 // describeState holds whatever we know about the open describe overlay.
 type describeState struct {
+	request *modalRequest
 	open    bool
 	loading bool
 	scroll  int
@@ -31,6 +35,27 @@ type describeState struct {
 	// fact that they're looking at plaintext credentials. Cleared on
 	// close along with the YAML buffer.
 	revealed bool
+}
+
+func (m Model) startDescribe(ref cluster.DescribeRef, reveal bool) (tea.Model, tea.Cmd) {
+	if m.OnDescribe == nil {
+		return m, nil
+	}
+	m.describe.request.stop()
+	request := newModalRequest(m.focusLife.ctx)
+	m.describe = describeState{
+		request: request, open: true, loading: true, revealed: reveal,
+		result: cluster.DescribeResult{Ref: ref},
+	}
+	req := DescribeRequestMsg{Context: request.ctx, Ref: ref, Reveal: reveal}
+	cb, focused := m.OnDescribe, m.WatchedContext
+	return m, m.modalCmd(request, func() tea.Msg { return cb(req, focused) })
+}
+
+func (m *Model) closeDescribe() {
+	m.describe.request.stop()
+	// Drop any revealed Secret YAML together with the request identity.
+	m.describe = describeState{}
 }
 
 // refForCursor returns the DescribeRef for the currently-selected row

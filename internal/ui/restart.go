@@ -14,6 +14,7 @@ import (
 // than delete: a rolling restart preserves availability, so we use a
 // single Y/Enter confirmation rather than typed-name reauth.
 type restartConfirmState struct {
+	request *modalRequest
 	open    bool
 	ref     cluster.DescribeRef
 	pending bool
@@ -23,6 +24,8 @@ type restartConfirmState struct {
 type RolloutResultMsg cluster.RolloutResult
 
 func (m Model) openRestartConfirm(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
+	m.restartConfirm.request.stop()
+	m.restartConfirm.request = newModalRequest(m.focusLife.ctx)
 	m.restartConfirm.open = true
 	m.restartConfirm.ref = ref
 	m.restartConfirm.pending = false
@@ -34,9 +37,11 @@ func (m Model) handleRestartConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// ctrl+c must still quit even while "rolling…" is on screen.
 		switch k.Type {
 		case tea.KeyEsc:
+			m.restartConfirm.request.stop()
 			m.restartConfirm.open = false
 			m.restartConfirm.pending = false
 		case tea.KeyCtrlC:
+			m.restartConfirm.request.stop()
 			m.quitMsg = "bye"
 			return m, tea.Quit
 		}
@@ -44,8 +49,10 @@ func (m Model) handleRestartConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch k.String() {
 	case "esc", "n", "N":
+		m.restartConfirm.request.stop()
 		m.restartConfirm.open = false
 	case "ctrl+c":
+		m.restartConfirm.request.stop()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case "y", "Y", "enter":
@@ -56,7 +63,7 @@ func (m Model) handleRestartConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.restartConfirm.pending = true
 		cb := m.OnRolloutRestart
 		focused := m.WatchedContext
-		return m, m.focusedCmd(func() tea.Msg { return cb(focused, ref) })
+		return m, m.modalCmd(m.restartConfirm.request, func() tea.Msg { return cb(focused, ref) })
 	}
 	return m, nil
 }
