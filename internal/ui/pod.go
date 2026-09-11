@@ -48,12 +48,11 @@ type podRow struct {
 	ContainerMemBytes map[string]int64 // container name → usage, replaced wholesale each snapshot
 	HasMetrics        bool
 
-	// Filled by NetworkSnapshotMsg. Per-pod rates, sampled from
-	// cAdvisor on the kubelet that hosts the pod. Zeroed (and
-	// HasNetwork=false) until the first successful scrape after
-	// focus-change.
+	// Last cAdvisor reading. HasNetwork marks current availability;
+	// failures and expiry retain the values and time for stale display.
 	NetRXBps   int64
 	NetTXBps   int64
+	NetAt      time.Time
 	HasNetwork bool
 }
 
@@ -379,12 +378,12 @@ func lessBy(a, b podRow, k SortKey) bool {
 			return ap < bp
 		}
 	case SortNetRX:
-		if a.NetRXBps != b.NetRXBps {
-			return a.NetRXBps < b.NetRXBps
+		if av, bv := networkSortValue(a.NetRXBps, a.HasNetwork), networkSortValue(b.NetRXBps, b.HasNetwork); av != bv {
+			return av < bv
 		}
 	case SortNetTX:
-		if a.NetTXBps != b.NetTXBps {
-			return a.NetTXBps < b.NetTXBps
+		if av, bv := networkSortValue(a.NetTXBps, a.HasNetwork), networkSortValue(b.NetTXBps, b.HasNetwork); av != bv {
+			return av < bv
 		}
 	case SortAge:
 		// Older pods first ascending: smaller CreatedAt = "less".

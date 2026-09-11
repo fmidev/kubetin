@@ -215,11 +215,15 @@ type Model struct {
 	syncedServices, syncedIngresses                                        bool
 	syncStartedAt                                                          time.Time
 
-	// Last available network rates. Partial samples carry a coverage
-	// label; until any data arrives the panel stays hidden.
+	// Retained network rates, with availability and sample time tracked
+	// separately. Partial samples carry a coverage label.
 	clusterNetRX, clusterNetTX int64
 	clusterNetOK               bool
+	clusterNetAt               time.Time
+	clusterNetStatus           string
 	clusterNetCoverage         string // empty for a complete sample
+	networkSnapshotAt          time.Time
+	networkExpiresAt           time.Time
 	netHistory                 netRing
 	restartBaseline            map[types.UID]int32 // first-seen restart count per pod, see noteRestartBaseline
 
@@ -697,37 +701,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
-		if !msg.OK && msg.NodesScraped == 0 {
-			// Don't clobber a previously-good reading on a transient
-			// failure — the existing rates remain on screen until the
-			// next successful scrape.
-			return m, nil
-		}
-		netByKey := make(map[string]cluster.PodNetwork, len(msg.Pods))
-		for _, n := range msg.Pods {
-			netByKey[n.Namespace+"/"+n.Name] = n
-		}
-		for uid, row := range m.pods {
-			before := row
-			if n, ok := netByKey[row.Namespace+"/"+row.Name]; ok {
-				row.NetRXBps = n.RXBytesPerSec
-				row.NetTXBps = n.TXBytesPerSec
-				row.HasNetwork = true
-			} else {
-				row.NetRXBps, row.NetTXBps, row.HasNetwork = 0, 0, false
-			}
-			m.pods[uid] = row
-			m.invalidatePodOrder(before, row)
-		}
-		m.clusterNetRX = msg.Cluster.RXBytesPerSec
-		m.clusterNetTX = msg.Cluster.TXBytesPerSec
-		m.clusterNetOK = true
-		m.clusterNetCoverage = ""
-		if msg.OK {
-			m.netHistory.push(msg.Cluster.RXBytesPerSec, msg.Cluster.TXBytesPerSec, msg.At)
-		} else {
-			m.clusterNetCoverage = fmt.Sprintf("partial %d/%d nodes · ", msg.NodesScraped, msg.NodesTotal)
-		}
+		m.applyNetworkSnapshot(msg, time.Now())
 		return m, nil
 
 	case MetricsSnapshotMsg:
@@ -795,6 +769,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ProbeTickMsg:
+		m.expireNetwork(time.Time(msg))
 		m.sampleFleetTrends()
 		// A zero timestamp is immediately due: an offline expansion
 		// has no result, and when the probe later promotes that
@@ -1944,12 +1919,12 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 		verStr = "—"
 	}
 
-	// Network panel: only show when we have a real reading. Hidden
-	// otherwise so users without nodes/proxy RBAC don't see "0 B/s"
-	// that they can't act on.
+	// Show rates only while fresh; failed or expired samples show status.
 	netStr := ""
 	if m.clusterNetOK {
 		netStr = fmt.Sprintf("  ·  %s↓ %s  ↑ %s", m.clusterNetCoverage, formatRate(m.clusterNetRX), formatRate(m.clusterNetTX))
+	} else if m.clusterNetStatus != "" {
+		netStr = "  ·  net " + m.clusterNetStatus
 	}
 
 	// Right-side context strip (net · pods · nodes · version) is
@@ -2153,11 +2128,7 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 		if p, ok := podMemPct(r); ok {
 			memPctCell = m.Theme.loadStyle(p).Render(fmt.Sprintf("%d%%", p))
 		}
-		rxStr, txStr := "—", "—"
-		if r.HasNetwork {
-			rxStr = formatRate(r.NetRXBps)
-			txStr = formatRate(r.NetTXBps)
-		}
+		rxStr, txStr := r.networkDisplay()
 		line := warnGlyph(warnIdx, "Pod", r.Namespace, r.Name, m.Theme) + joinCells(
 			padCol(r.Namespace, w[0], m.Theme.Base),
 			padCol(r.Name, w[1], m.Theme.Base),

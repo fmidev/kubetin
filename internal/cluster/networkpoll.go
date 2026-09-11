@@ -15,8 +15,8 @@
 // "always-on" against many large clusters.
 //
 // RBAC: requires `get` on `nodes/proxy`. A total failure has OK=false
-// and NodesScraped==0, with no usable measurements. Network panels
-// stay hidden until usable data arrives. OK=false with NodesScraped>0
+// and NodesScraped==0, with no usable measurements; the UI marks
+// network data unavailable. OK=false with NodesScraped>0
 // carries partial rates, which the UI displays with a coverage label.
 // No per-pod aggregate is available from less privileged endpoints.
 //
@@ -56,6 +56,7 @@ const (
 
 // PodNetwork is a per-pod rate snapshot.
 type PodNetwork struct {
+	At            time.Time // oldest contributing node sample
 	Namespace     string
 	Name          string
 	RXBytesPerSec int64
@@ -73,8 +74,8 @@ type NetworkSnapshot struct {
 	Context      string
 	Pods         []PodNetwork
 	Cluster      ClusterNetwork
-	At           time.Time
-	OK           bool // true only when every listed node was sampled (or none exist)
+	At           time.Time // oldest included pod sample, or tick time when no samples exist
+	OK           bool      // true only when every listed node was sampled (or none exist)
 	Error        string
 	NodesTotal   int
 	NodesScraped int // positive with OK=false means partial coverage
@@ -187,6 +188,11 @@ func (p *NetworkPoller) tick(parent context.Context, cs *kubernetes.Clientset) {
 
 	p.mu.Lock()
 	snap.Pods, snap.Cluster = networkRates(cur, p.prev)
+	for _, pod := range snap.Pods {
+		if pod.At.Before(snap.At) {
+			snap.At = pod.At
+		}
+	}
 	// Keep missed nodes' last successful samples for recovery, but
 	// never include those old readings in this tick's measurements.
 	for key := range p.prev {
@@ -279,6 +285,9 @@ func networkRates(cur, prev map[nodePodKey]counterSample) ([]PodNetwork, Cluster
 		total.RXBytesPerSec += rx
 		total.TXBytesPerSec += tx
 		pod := byPod[k.podKey]
+		if pod.At.IsZero() || c.at.Before(pod.At) {
+			pod.At = c.at
+		}
 		pod.Namespace, pod.Name = k.ns, k.name
 		pod.RXBytesPerSec += rx
 		pod.TXBytesPerSec += tx
