@@ -114,6 +114,20 @@ func TestNetworkTickCoverage(t *testing.T) {
 			if snap.OK != tc.wantOK || snap.NodesTotal != len(tc.nodes) || snap.NodesScraped != tc.wantScraped || (snap.Error == "") != tc.wantOK {
 				t.Fatalf("unexpected coverage: %+v", snap)
 			}
+			if len(snap.Pods) > 0 {
+				oldest := snap.Pods[0].At
+				for _, pod := range snap.Pods {
+					if pod.At.IsZero() {
+						t.Fatal("pod rate lost its source timestamp")
+					}
+					if pod.At.Before(oldest) {
+						oldest = pod.At
+					}
+				}
+				if snap.At != oldest {
+					t.Fatal("aggregate timestamp must reflect its oldest contributing sample")
+				}
+			}
 		})
 	}
 }
@@ -347,6 +361,9 @@ func TestNetworkRatesUseNodeBaselines(t *testing.T) {
 	prev := map[nodePodKey]counterSample{a: {rx: 100, tx: 400, at: at}, b: {rx: 1000, tx: 2000, at: at}}
 	cur := map[nodePodKey]counterSample{a: {rx: 300, tx: 100, at: at.Add(2 * time.Second)}, b: {rx: 1200, tx: 2400, at: at.Add(4 * time.Second)}}
 	pods, total := networkRates(cur, prev)
+	if len(pods) != 1 || pods[0].At != cur[a].at {
+		t.Fatal("aggregated pod timestamp must reflect its oldest node sample")
+	}
 	if len(pods) != 1 || pods[0].RXBytesPerSec != 150 || pods[0].TXBytesPerSec != 100 || total.RXBytesPerSec != 150 || total.TXBytesPerSec != 100 {
 		t.Fatalf("rates must use per-node intervals and clamp resets before summing: pods=%+v total=%+v", pods, total)
 	}

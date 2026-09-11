@@ -110,6 +110,7 @@ func TestApplyPodEvent_PreservesMetricsAcrossUpdate(t *testing.T) {
 	r.CPUMilli, r.MemBytes, r.HasMetrics = 142, 384<<20, true
 	r.ContainerMemBytes = map[string]int64{"api": 100 << 20}
 	r.NetRXBps, r.NetTXBps, r.HasNetwork = 1200, 840, true
+	r.NetAt = time.Now()
 	m["p1"] = r
 
 	applyPodEvent(m, cluster.PodEvent{
@@ -129,7 +130,7 @@ func TestApplyPodEvent_PreservesMetricsAcrossUpdate(t *testing.T) {
 	if got.MemLimitBytes != 512<<20 {
 		t.Errorf("MemLimitBytes = %d, want 512Mi — informer fields must still update", got.MemLimitBytes)
 	}
-	if !got.HasNetwork || got.NetRXBps != 1200 || got.NetTXBps != 840 {
+	if !got.HasNetwork || got.NetRXBps != 1200 || got.NetTXBps != 840 || got.NetAt != r.NetAt {
 		t.Errorf("network rates lost across informer UPDATE: rx=%d tx=%d has=%v",
 			got.NetRXBps, got.NetTXBps, got.HasNetwork)
 	}

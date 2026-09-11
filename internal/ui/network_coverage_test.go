@@ -16,7 +16,7 @@ import (
 
 func partialNetworkSnapshot() NetworkSnapshotMsg {
 	return NetworkSnapshotMsg{
-		Context: "alpha", At: time.Unix(100, 0),
+		Context: "alpha", At: time.Now(),
 		NodesTotal: 3, NodesScraped: 2,
 		Cluster: cluster.ClusterNetwork{RXBytesPerSec: 2048, TXBytesPerSec: 1024},
 		Pods:    []cluster.PodNetwork{{Namespace: "default", Name: "api", RXBytesPerSec: 2048, TXBytesPerSec: 1024}},
@@ -27,7 +27,7 @@ func TestNetworkPartialCoverageAndRecovery(t *testing.T) {
 	m := New("alpha", model.NewStore(), []string{"alpha", "beta"})
 	m.width, m.height = 240, 20
 	m.pods["api"] = podRow{UID: "api", Namespace: "default", Name: "api"}
-	m.netHistory.push(10000, 5000, time.Unix(90, 0))
+	m.netHistory.push(10000, 5000, time.Now().Add(-15*time.Second))
 	updated, _ := m.Update(partialNetworkSnapshot())
 	m = updated.(Model)
 	if !m.clusterNetOK || m.clusterNetRX != 2048 || !m.pods["api"].HasNetwork || m.pods["api"].NetRXBps != 2048 {
@@ -41,7 +41,7 @@ func TestNetworkPartialCoverageAndRecovery(t *testing.T) {
 	}
 
 	complete := partialNetworkSnapshot()
-	complete.OK, complete.NodesScraped, complete.At = true, 3, time.Unix(110, 0)
+	complete.OK, complete.NodesScraped, complete.At = true, 3, time.Now()
 	updated, _ = m.Update(complete)
 	m = updated.(Model)
 	if m.clusterNetCoverage != "" || strings.Contains(m.renderHeaderMetrics(model.ClusterState{}), "partial") || len(m.netHistory.rx) != 2 {
@@ -78,6 +78,7 @@ func TestNetworkSnapshotClearsAbsentPodRates(t *testing.T) {
 				m.pods["a"] = podRow{UID: "a", Namespace: "ns", Name: "a"}
 				m.pods["b"] = podRow{UID: "b", Namespace: "ns", Name: "b"}
 				complete := NetworkSnapshotMsg{
+					At:      time.Now(),
 					Context: "alpha", OK: true, NodesTotal: 2, NodesScraped: 2,
 					Pods: []cluster.PodNetwork{
 						{Namespace: "ns", Name: "a", RXBytesPerSec: 1000, TXBytesPerSec: 100},

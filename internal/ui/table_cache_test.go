@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"k8s.io/apimachinery/pkg/types"
@@ -243,7 +244,7 @@ func TestNetworkOrderAndPodPhaseInvalidation(t *testing.T) {
 	}
 	m.sortKey = SortNetRX
 	m.visibleUIDs()
-	m = updateTableModel(m, NetworkSnapshotMsg{Context: "alpha", OK: true, Pods: []cluster.PodNetwork{
+	m = updateTableModel(m, NetworkSnapshotMsg{Context: "alpha", At: time.Now(), OK: true, Pods: []cluster.PodNetwork{
 		{Name: "a", RXBytesPerSec: 200}, {Name: "b", RXBytesPerSec: 100},
 	}})
 	order := m.visibleUIDs()
@@ -251,8 +252,8 @@ func TestNetworkOrderAndPodPhaseInvalidation(t *testing.T) {
 		t.Fatalf("network update left stale order: %v", order)
 	}
 	m = updateTableModel(m, NetworkSnapshotMsg{Context: "alpha", OK: false})
-	if next := m.visibleUIDs(); &next[0] != &order[0] {
-		t.Fatal("failed network sample unnecessarily invalidated order")
+	if next := m.visibleUIDs(); !slices.Equal(next, []types.UID{"a", "b"}) {
+		t.Fatalf("failed network sample retained stale rate ordering: %v", next)
 	}
 	m = updateTableModel(m, PodEventMsg{Context: "alpha", UID: "a", Kind: cluster.PodDeleted})
 	if run, pending, failed := m.podPhaseCounts(); run != 0 || pending != 0 || failed != 1 {

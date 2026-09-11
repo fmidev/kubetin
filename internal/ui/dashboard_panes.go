@@ -72,10 +72,11 @@ func (m Model) renderDashPodStatus(r podRow, w, h int) string {
 		dashField("cpu", formatCPU(r.CPUMilli), th.Base, th),
 		memField,
 	}
-	if r.HasNetwork {
+	if r.HasNetwork || !r.NetAt.IsZero() {
+		rx, tx := r.networkDisplay()
 		line2 = append(line2,
-			dashField("↓", formatRate(r.NetRXBps), th.Base, th),
-			dashField("↑", formatRate(r.NetTXBps), th.Base, th))
+			dashField("↓", rx, th.Base, th),
+			dashField("↑", tx, th.Base, th))
 	}
 	if r.ServiceAccount != "" {
 		line2 = append(line2, dashField("sa", r.ServiceAccount, th.Base, th))
