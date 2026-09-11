@@ -12,6 +12,7 @@ import (
 
 // deleteConfirmState holds the typed-name confirm modal's state.
 type deleteConfirmState struct {
+	request *modalRequest
 	open    bool
 	ref     cluster.DescribeRef
 	typed   string
@@ -30,6 +31,8 @@ func expectedConfirmation(name string) string {
 }
 
 func (m Model) openDeleteConfirm(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
+	m.deleteConfirm.request.stop()
+	m.deleteConfirm.request = newModalRequest(m.focusLife.ctx)
 	m.deleteConfirm.open = true
 	m.deleteConfirm.ref = ref
 	m.deleteConfirm.typed = ""
@@ -46,9 +49,11 @@ func (m Model) handleDeleteConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// "deleting…", inconsistent with every other context.
 		switch k.Type {
 		case tea.KeyEsc:
+			m.deleteConfirm.request.stop()
 			m.deleteConfirm.open = false
 			m.deleteConfirm.pending = false
 		case tea.KeyCtrlC:
+			m.deleteConfirm.request.stop()
 			m.quitMsg = "bye"
 			return m, tea.Quit
 		}
@@ -56,9 +61,11 @@ func (m Model) handleDeleteConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch k.Type {
 	case tea.KeyEsc:
+		m.deleteConfirm.request.stop()
 		m.deleteConfirm.open = false
 		return m, nil
 	case tea.KeyCtrlC:
+		m.deleteConfirm.request.stop()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case tea.KeyBackspace:
@@ -72,7 +79,7 @@ func (m Model) handleDeleteConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.deleteConfirm.pending = true
 			cb := m.OnDelete
 			focused := m.WatchedContext
-			return m, m.focusedCmd(func() tea.Msg { return cb(focused, ref) })
+			return m, m.modalCmd(m.deleteConfirm.request, func() tea.Msg { return cb(focused, ref) })
 		}
 		return m, nil
 	case tea.KeyRunes:

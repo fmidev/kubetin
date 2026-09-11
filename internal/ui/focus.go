@@ -84,10 +84,13 @@ func (m *Model) clearFocusedState() {
 	m.drainProgress = drainProgressState{}
 	m.drainConfirm = drainConfirmState{}
 	m.actionMenu = actionMenuState{}
+	m.deleteConfirm.request.stop()
+	m.scaleConfirm.request.stop()
+	m.restartConfirm.request.stop()
+	m.closeDescribe()
 	m.deleteConfirm = deleteConfirmState{}
 	m.scaleConfirm = scaleConfirmState{}
 	m.restartConfirm = restartConfirmState{}
-	m.describe = describeState{}
 	m.exec = execState{}
 	m.nsPickerOpen, m.rbacOpen = false, false
 	m.nsPickerOptions = nil
