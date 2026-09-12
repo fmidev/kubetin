@@ -13,8 +13,8 @@ import (
 
 // Bounded row caps for a fleet-detail fetch — the panel is a triage
 // summary under one cluster's card, not a table view. Lists paginate
-// up to fleetDetailPageCap pages before the worst rows are selected,
-// so a disaster cluster's later pages can't hide its worst pods.
+// up to fleetDetailPageCap pages before the worst observed rows are
+// selected. Unfinished scans are reported in Truncated.
 const (
 	fleetDetailPodCap      = 15
 	fleetDetailDeployCap   = 10
@@ -53,12 +53,13 @@ type FleetEventGroup struct {
 // card in the fleet dashboard. UI receivers must compare Context to
 // the cluster they requested and drop mismatches.
 type FleetDetailResult struct {
-	Context string
-	Pods    []FleetPodIssue
-	Deploys []FleetDeployIssue
-	Events  []FleetEventGroup
-	Err     string
-	At      time.Time
+	Context   string
+	Pods      []FleetPodIssue
+	Deploys   []FleetDeployIssue
+	Events    []FleetEventGroup
+	Truncated []string // resource lists with unvisited pages
+	Err       string
+	At        time.Time
 }
 
 // FleetDetail fetches the problem detail for one cluster: non-green
@@ -95,6 +96,11 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 		}
 		mu.Unlock()
 	}
+	truncated := func(resource string) {
+		mu.Lock()
+		out.Truncated = append(out.Truncated, resource)
+		mu.Unlock()
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -102,7 +108,7 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 		defer wg.Done()
 		var pods []FleetPodIssue
 		opts := metav1.ListOptions{
-			FieldSelector: "status.phase!=Running,status.phase!=Succeeded",
+			FieldSelector: "status.phase!=Succeeded",
 			Limit:         500,
 		}
 		for page := 0; page < fleetDetailPageCap; page++ {
@@ -112,12 +118,18 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 				return
 			}
 			for _, p := range list.Items {
-				pods = append(pods, podIssueOf(p))
+				if p.Status.Phase != corev1.PodSucceeded &&
+					(p.Status.Phase != corev1.PodRunning || runningPodNotReady(p)) {
+					pods = append(pods, podIssueOf(p))
+				}
 			}
 			if list.Continue == "" {
 				break
 			}
 			opts.Continue = list.Continue
+			if page == fleetDetailPageCap-1 {
+				truncated("pods")
+			}
 		}
 		sort.Slice(pods, func(i, j int) bool {
 			pi, pj := podPhaseRank(pods[i].Phase), podPhaseRank(pods[j].Phase)
@@ -163,6 +175,9 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 				break
 			}
 			opts.Continue = list.Continue
+			if page == fleetDetailPageCap-1 {
+				truncated("deployments")
+			}
 		}
 		sort.Slice(deps, func(i, j int) bool {
 			ri := float64(deps[i].Ready) / float64(deps[i].Desired)
@@ -197,6 +212,9 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 				break
 			}
 			opts.Continue = list.Continue
+			if page == fleetDetailPageCap-1 {
+				truncated("events")
+			}
 		}
 		for _, e := range items {
 			last := e.LastTimestamp.Time
@@ -242,7 +260,17 @@ func (s *Supervisor) FleetDetail(ctx context.Context, ctxName string) FleetDetai
 		mu.Unlock()
 	}()
 	wg.Wait()
+	sort.Strings(out.Truncated)
 	return out
+}
+
+func runningPodNotReady(p corev1.Pod) bool {
+	for _, c := range p.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status != corev1.ConditionTrue
+		}
+	}
+	return true
 }
 
 // podIssueOf projects one non-green pod into a detail row. Init
@@ -283,6 +311,9 @@ func podIssueOf(p corev1.Pod) FleetPodIssue {
 	if issue.Reason == "" && p.Status.Reason != "" {
 		issue.Reason = p.Status.Reason
 	}
+	if issue.Reason == "" && p.Status.Phase == corev1.PodRunning && runningPodNotReady(p) {
+		issue.Reason = "NotReady"
+	}
 	return issue
 }
 
@@ -294,8 +325,10 @@ func podPhaseRank(phase string) int {
 		return 0
 	case string(corev1.PodUnknown):
 		return 1
-	case string(corev1.PodPending):
+	case string(corev1.PodRunning):
 		return 2
+	case string(corev1.PodPending):
+		return 3
 	}
-	return 3
+	return 4
 }

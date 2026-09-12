@@ -113,6 +113,9 @@ func clusterAlerts(st model.ClusterState) []clusterAlert {
 	if st.PodsFailed > 0 {
 		add(sevWarn, plural(st.PodsFailed, "pod")+" Failed")
 	}
+	if st.PodsNotReady > 0 {
+		add(sevWarn, plural(st.PodsNotReady, "pod")+" Running but NotReady")
+	}
 	if st.PodsUnknownPhase > 0 {
 		add(sevWarn, plural(st.PodsUnknownPhase, "pod")+" in Unknown phase")
 	}
@@ -246,7 +249,7 @@ type fleetPulse struct {
 	Nodes      int
 	NodesBad   int // NotReady
 	Pods       int
-	PodsBad    int // Pending + Failed + Unknown
+	PodsBad    int // Pending + Failed + Unknown + Running but NotReady
 	// AllPodsKnown is false when any reachable cluster's total is a
 	// -1 sentinel; the pulse then renders "N+ pods" instead of
 	// claiming a fleet total it doesn't have.
@@ -275,7 +278,7 @@ func derivePulse(g fleetGroups) fleetPulse {
 			} else {
 				p.AllPodsKnown = false
 			}
-			for _, n := range []int{st.PodsPending, st.PodsFailed, st.PodsUnknownPhase} {
+			for _, n := range []int{st.PodsPending, st.PodsFailed, st.PodsUnknownPhase, st.PodsNotReady} {
 				if n > 0 {
 					p.PodsBad += n
 				}

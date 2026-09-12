@@ -474,7 +474,8 @@ func (h *healthSrv) handler() http.HandlerFunc {
 					`{"metadata":{"name":"p1","namespace":"a"},"status":{"phase":"Pending"}},`+
 					`{"metadata":{"name":"p2","namespace":"a"},"status":{"phase":"Pending"}},`+
 					`{"metadata":{"name":"p3","namespace":"a"},"status":{"phase":"Failed"}},`+
-					`{"metadata":{"name":"p4","namespace":"a"},"status":{"phase":"Unknown"}}]}`)
+					`{"metadata":{"name":"p4","namespace":"a"},"status":{"phase":"Unknown"}},`+
+					`{"metadata":{"name":"p5","namespace":"a"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"False"}]}}]}`)
 				return
 			}
 			if q.Get("resourceVersion") == "" {
@@ -548,6 +549,9 @@ func TestProbeOnceCollectsHealthSignals(t *testing.T) {
 	if st.PodsTotal != 42 {
 		t.Errorf("PodsTotal = %d, want 42 (1 item + 41 remaining)", st.PodsTotal)
 	}
+	if st.PodsNotReady != 1 {
+		t.Errorf("PodsNotReady = %d, want 1", st.PodsNotReady)
+	}
 	if st.DeploysTotal != 4 || st.DeploysDegraded != 2 || st.DeploysZeroReady != 1 {
 		t.Errorf("deploys = total %d degraded %d zeroReady %d, want 4/2/1",
 			st.DeploysTotal, st.DeploysDegraded, st.DeploysZeroReady)
@@ -560,7 +564,7 @@ func TestProbeOnceCollectsHealthSignals(t *testing.T) {
 	if st.WarnEvents15m != 2 {
 		t.Errorf("WarnEvents15m = %d, want 2 (recent lastTimestamp + eventTime-only)", st.WarnEvents15m)
 	}
-	if fs, _ := hs.podFS.Load().(string); fs != "status.phase!=Running,status.phase!=Succeeded" {
+	if fs, _ := hs.podFS.Load().(string); fs != "status.phase!=Succeeded" {
 		t.Errorf("pod list fieldSelector = %q", fs)
 	}
 	if fs, _ := hs.eventFS.Load().(string); fs != "type=Warning" {
@@ -591,6 +595,9 @@ func TestProbeOnceHealthDenialsLeaveUnknownAndReachAlone(t *testing.T) {
 	if st.DeploysTotal != -1 || st.WarnEvents15m != -1 {
 		t.Errorf("deploys %d / warnEvents %d, want -1 sentinels on denial",
 			st.DeploysTotal, st.WarnEvents15m)
+	}
+	if st.PodsNotReady != -1 {
+		t.Errorf("PodsNotReady = %d, want unknown on denial", st.PodsNotReady)
 	}
 	if st.PodsTotal != 42 {
 		t.Errorf("PodsTotal = %d, want 42 — the summary call is not a health list", st.PodsTotal)
@@ -632,6 +639,9 @@ func TestProbeOnceHealthTimeoutCarriesForward(t *testing.T) {
 	if st.WarnEvents15m != 2 {
 		t.Errorf("WarnEvents15m = %d, want the last known 2 carried", st.WarnEvents15m)
 	}
+	if st.PodsNotReady != 1 {
+		t.Errorf("PodsNotReady = %d, want the last known 1 carried", st.PodsNotReady)
+	}
 }
 
 // With nothing to carry, a first-round health timeout reports unknown.
@@ -659,6 +669,9 @@ func TestProbeOnceFirstRoundHealthTimeoutReportsUnknown(t *testing.T) {
 		t.Errorf("health = pods %d deploys %d events %d, want -1 unknowns, not fabricated zeros",
 			st.PodsPending, st.DeploysTotal, st.WarnEvents15m)
 	}
+	if st.PodsNotReady != -1 {
+		t.Errorf("PodsNotReady = %d, want unknown on first timeout", st.PodsNotReady)
+	}
 }
 
 // An empty healthy cluster measures zeros — which are findings, not
@@ -677,5 +690,8 @@ func TestProbeOnceHealthZerosAreMeasurements(t *testing.T) {
 	}
 	if st.PodsTotal != 0 {
 		t.Errorf("PodsTotal = %d, want an exact 0 from a complete list", st.PodsTotal)
+	}
+	if st.PodsNotReady != 0 {
+		t.Errorf("PodsNotReady = %d, want measured zero", st.PodsNotReady)
 	}
 }

@@ -97,6 +97,7 @@ type ClusterState struct {
 	PodsPending         int
 	PodsFailed          int
 	PodsUnknownPhase    int
+	PodsNotReady        int // Running pods that are not Ready
 	DeploysTotal        int
 	DeploysDegraded     int      // ready < desired
 	DeploysZeroReady    int      // degraded deployments with zero ready replicas
@@ -173,6 +174,7 @@ type ProbeFields struct {
 	PodsPending         int
 	PodsFailed          int
 	PodsUnknownPhase    int
+	PodsNotReady        int
 	DeploysTotal        int
 	DeploysDegraded     int
 	DeploysZeroReady    int
@@ -196,6 +198,7 @@ func NewProbeFields() ProbeFields {
 		PodsPending:        -1,
 		PodsFailed:         -1,
 		PodsUnknownPhase:   -1,
+		PodsNotReady:       -1,
 		DeploysTotal:       -1,
 		DeploysDegraded:    -1,
 		DeploysZeroReady:   -1,
@@ -240,6 +243,7 @@ func (s *Store) ApplyProbe(ctx string, p ProbeFields) {
 	st.PodsPending = p.PodsPending
 	st.PodsFailed = p.PodsFailed
 	st.PodsUnknownPhase = p.PodsUnknownPhase
+	st.PodsNotReady = p.PodsNotReady
 	st.DeploysTotal = p.DeploysTotal
 	st.DeploysDegraded = p.DeploysDegraded
 	st.DeploysZeroReady = p.DeploysZeroReady
