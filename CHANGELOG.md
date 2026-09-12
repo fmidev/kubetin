@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.10.0](https://github.com/fmidev/kubetin/compare/v1.9.0...v1.10.0) (2026-09-12)
+
+
+### Features
+
+* **ui:** add a per-cluster dashboard on F3 ([#81](https://github.com/fmidev/kubetin/issues/81)) ([2f491ac](https://github.com/fmidev/kubetin/commit/2f491ac234a996386b7fd581facaa4194e60944d))
+* **ui:** collect the history the cluster dashboard needs ([#80](https://github.com/fmidev/kubetin/issues/80)) ([3f130b5](https://github.com/fmidev/kubetin/commit/3f130b59a5630341d4e3e818c9e9df9018bea627))
+
+
+### Bug Fixes
+
+* address F1 fleet dashboard review findings ([#110](https://github.com/fmidev/kubetin/issues/110)) ([df14efd](https://github.com/fmidev/kubetin/commit/df14efded764791e943266e8928cdf15788b1994))
+* address pod and deployment dashboard review findings ([#112](https://github.com/fmidev/kubetin/issues/112)) ([b98e9d3](https://github.com/fmidev/kubetin/commit/b98e9d38050ce508aaa813f95a3f36bb87441a00))
+* address startup and pod-view review findings ([#111](https://github.com/fmidev/kubetin/issues/111)) ([054e1d6](https://github.com/fmidev/kubetin/commit/054e1d6f146d1312e5faee7feb174249f11edc0d))
+* bound network scrapes and report partial coverage ([#103](https://github.com/fmidev/kubetin/issues/103)) ([cff60a1](https://github.com/fmidev/kubetin/commit/cff60a1c79becb276b8623dde3a5c420ba823802))
+* coalesce watcher events without losing resource state ([#98](https://github.com/fmidev/kubetin/issues/98)) ([b150dab](https://github.com/fmidev/kubetin/commit/b150dab271baeb14a51177271962bd49e22f5058))
+* expire stale network measurements ([#104](https://github.com/fmidev/kubetin/issues/104)) ([832c748](https://github.com/fmidev/kubetin/commit/832c7489d092217ee97b27d8e22ea2c0a932fa7e))
+* isolate drain operations across startup and progress ([#109](https://github.com/fmidev/kubetin/issues/109)) ([9c40376](https://github.com/fmidev/kubetin/commit/9c40376f41bec33866df8f5b36d98f3d10bcb787))
+* keep kubeconfig context identities distinct ([#100](https://github.com/fmidev/kubetin/issues/100)) ([1f47b6f](https://github.com/fmidev/kubetin/commit/1f47b6ffc7a6ece4ce1883d805b7b4827c614d8d))
+* prevent retained logs from replaying on reconnect ([#105](https://github.com/fmidev/kubetin/issues/105)) ([6f4b84a](https://github.com/fmidev/kubetin/commit/6f4b84af2be36d4b48cbe3348c128d88421b7413))
+* refuse unsafe pods before draining a node ([#96](https://github.com/fmidev/kubetin/issues/96)) ([74cbcad](https://github.com/fmidev/kubetin/commit/74cbcadfa16cd96db34b8102cdef47bbf61343cf))
+* reject stale modal request results ([#108](https://github.com/fmidev/kubetin/issues/108)) ([0feecf2](https://github.com/fmidev/kubetin/commit/0feecf2914f1878651eb08d30f9979d6f935ec86))
+* resolve deployment logs with the full label selector ([#106](https://github.com/fmidev/kubetin/issues/106)) ([f225835](https://github.com/fmidev/kubetin/commit/f225835cede5afb294b1d8181ed1d3e20026be48))
+* synchronize cluster focus with watcher generations ([#99](https://github.com/fmidev/kubetin/issues/99)) ([5035e5b](https://github.com/fmidev/kubetin/commit/5035e5b8a59bbb99bfd8057ea908acd273041b3e))
+* **ui:** keep the pinned version visible in the dashboard IMAGE column ([#77](https://github.com/fmidev/kubetin/issues/77)) ([d9c121e](https://github.com/fmidev/kubetin/commit/d9c121e602420e6e634fdecf88f384163540acfb))
+* wait for pod termination before completing drain ([#97](https://github.com/fmidev/kubetin/issues/97)) ([85df735](https://github.com/fmidev/kubetin/commit/85df7358a7e0fb4d1abff649df1ba1ca3a97c774))
+
+
+### Performance Improvements
+
+* cache table ordering and skip hidden panes ([#101](https://github.com/fmidev/kubetin/issues/101)) ([80dc26f](https://github.com/fmidev/kubetin/commit/80dc26f057a4115d567e784592c4e4f53dac25f9))
+* index streamed log search incrementally ([#102](https://github.com/fmidev/kubetin/issues/102)) ([2adbaed](https://github.com/fmidev/kubetin/commit/2adbaed4805ec976a3af755e06d8bce0d68d15a1))
+
 ## [1.9.0](https://github.com/fmidev/kubetin/compare/v1.8.1...v1.9.0) (2026-09-01)
 
 
