@@ -415,10 +415,12 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 		pf.PodsPending = wh.pods.pending
 		pf.PodsFailed = wh.pods.failed
 		pf.PodsUnknownPhase = wh.pods.unknown
+		pf.PodsNotReady = wh.pods.notReady
 	case signalTimeout:
 		pf.PodsPending = prev.PodsPending
 		pf.PodsFailed = prev.PodsFailed
 		pf.PodsUnknownPhase = prev.PodsUnknownPhase
+		pf.PodsNotReady = prev.PodsNotReady
 	}
 	switch wh.deploys.outcome {
 	case signalOK:
@@ -670,8 +672,8 @@ type workloadHealth struct {
 }
 
 type podPhaseSignal struct {
-	outcome                  signalOutcome
-	pending, failed, unknown int
+	outcome                            signalOutcome
+	pending, failed, unknown, notReady int
 }
 
 type deploySignal struct {
@@ -691,8 +693,8 @@ const warnEventWindow = 15 * time.Minute
 
 // probeWorkloadHealth gathers the fleet-dashboard workload signals —
 // non-green pods, degraded deployments, recent warning events — with
-// one field-selected list each, run concurrently so the round grows by
-// at most one ProbeTimeout of wall clock.
+// concurrent lists, with pod pages sharing one deadline so the round
+// grows by at most one ProbeTimeout of wall clock.
 func (s *Supervisor) probeWorkloadHealth(parent context.Context, ns string, cs *kubernetes.Clientset) workloadHealth {
 	var wh workloadHealth
 	var wg sync.WaitGroup
@@ -719,6 +721,7 @@ func carryHealth(pf *model.ProbeFields, prev model.ClusterState) {
 	pf.PodsPending = prev.PodsPending
 	pf.PodsFailed = prev.PodsFailed
 	pf.PodsUnknownPhase = prev.PodsUnknownPhase
+	pf.PodsNotReady = prev.PodsNotReady
 	pf.DeploysTotal = prev.DeploysTotal
 	pf.DeploysDegraded = prev.DeploysDegraded
 	pf.DeploysZeroReady = prev.DeploysZeroReady
@@ -739,45 +742,48 @@ func healthErrOutcome(what string, err error) signalOutcome {
 	return signalUnknown
 }
 
-// probeNonGreenPods counts pods stuck outside Running/Succeeded. The
-// field selector keeps the response proportional to how broken the
-// cluster is rather than how big. Blind spot: a crash-looping pod
-// usually reports Phase=Running and is invisible here — deployment
-// readiness and warning events cover that side.
+// probeNonGreenPods includes Running pods: phase alone does not reveal
+// crash loops or failing readiness probes. Aggregate one page at a time
+// to bound memory, under the same deadline as the other health checks.
 func probeNonGreenPods(parent context.Context, ns string, cs *kubernetes.Clientset) podPhaseSignal {
 	ctx, cancel := context.WithTimeout(parent, ProbeTimeout)
 	defer cancel()
-	type result struct {
-		list *corev1.PodList
-		err  error
-	}
-	ch := make(chan result, 1)
+	ch := make(chan podPhaseSignal, 1)
 	go func() {
-		list, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
-			FieldSelector:   "status.phase!=Running,status.phase!=Succeeded",
-			Limit:           500,
-			ResourceVersion: "0",
-		})
-		ch <- result{list: list, err: err}
+		sig := podPhaseSignal{outcome: signalOK}
+		opts := metav1.ListOptions{FieldSelector: "status.phase!=Succeeded", Limit: 500}
+		for {
+			list, err := cs.CoreV1().Pods(ns).List(ctx, opts)
+			if err != nil {
+				ch <- podPhaseSignal{outcome: healthErrOutcome("pods", err)}
+				return
+			}
+			for _, p := range list.Items {
+				switch p.Status.Phase {
+				case corev1.PodPending:
+					sig.pending++
+				case corev1.PodFailed:
+					sig.failed++
+				case corev1.PodRunning:
+					if runningPodNotReady(p) {
+						sig.notReady++
+					}
+				case corev1.PodSucceeded:
+				default:
+					sig.unknown++
+				}
+			}
+			if list.Continue == "" {
+				break
+			}
+			opts.Continue = list.Continue
+		}
+		ch <- sig
 	}()
 	select {
 	case <-ctx.Done():
 		return podPhaseSignal{outcome: signalTimeout}
-	case r := <-ch:
-		if r.err != nil {
-			return podPhaseSignal{outcome: healthErrOutcome("pods", r.err)}
-		}
-		sig := podPhaseSignal{outcome: signalOK}
-		for _, p := range r.list.Items {
-			switch p.Status.Phase {
-			case corev1.PodPending:
-				sig.pending++
-			case corev1.PodFailed:
-				sig.failed++
-			default:
-				sig.unknown++
-			}
-		}
+	case sig := <-ch:
 		return sig
 	}
 }

@@ -13,11 +13,11 @@ import (
 	"github.com/fmidev/kubetin/internal/model"
 )
 
-// fleetState is the F1 fleet dashboard's view state. Scroll position
-// is derived from the cursor at render time (windowed like the
-// tables), so the cursor is the only navigation state.
+// fleetState is the F1 fleet dashboard's view state.
 type fleetState struct {
 	cursorCtx  string
+	scrollCtx  string
+	scroll     int    // rows into an oversized selected card
 	expanded   string // context with the detail panel open; "" = none
 	returnView View   // restored on Esc / F1
 	// savedFilter parks the resource views' filter while the fleet
@@ -49,6 +49,7 @@ func (m *Model) leaveFleet(to View) {
 	// otherwise revive as a forever-loading panel with both manual
 	// and automatic refresh disabled.
 	m.fleet.expanded = ""
+	m.fleet.scroll = 0
 	m.fleet.detail = fleetDetailState{}
 	m.view = to
 }
@@ -134,7 +135,7 @@ func (m *Model) moveFleetCursor(delta int) {
 	}
 	idx := 0
 	for i, c := range order {
-		if c == m.fleetCursor() {
+		if c == m.fleet.cursorCtx {
 			idx = i
 			break
 		}
@@ -147,10 +148,35 @@ func (m *Model) moveFleetCursor(delta int) {
 		idx = len(order) - 1
 	}
 	m.fleet.cursorCtx = order[idx]
+	m.fleet.scroll = 0
+}
+
+func (m *Model) scrollFleetCard(direction int) {
+	cursor := m.fleetCursor()
+	headerH, footerH := m.chromeHeights()
+	regionH := max(1, m.height-headerH-footerH-1)
+	for _, b := range m.fleetBlocks(m.fleetGroupsFiltered(), m.width) {
+		if b.ctx != "" && b.ctx == cursor {
+			limit := max(0, len(b.lines)-regionH)
+			offset := 0
+			if m.fleet.scrollCtx == cursor {
+				offset = min(m.fleet.scroll, limit)
+			}
+			m.fleet.scrollCtx = cursor
+			m.fleet.scroll = max(0, min(limit, offset+direction*max(1, regionH/2)))
+			return
+		}
+	}
 }
 
 func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
+	case "pgdown", "ctrl+d":
+		m.scrollFleetCard(1)
+		return m, nil
+	case "pgup", "ctrl+u":
+		m.scrollFleetCard(-1)
+		return m, nil
 	case "j", "down":
 		m.moveFleetCursor(+1)
 		return m, nil
@@ -158,16 +184,19 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.moveFleetCursor(-1)
 		return m, nil
 	case "g", "home":
+		m.fleet.scroll = 0
 		if order := m.fleetOrder(); len(order) > 0 {
 			m.fleet.cursorCtx = order[0]
 		}
 		return m, nil
 	case "G", "end":
+		m.fleet.scroll = 0
 		if order := m.fleetOrder(); len(order) > 0 {
 			m.fleet.cursorCtx = order[len(order)-1]
 		}
 		return m, nil
 	case "enter":
+		m.fleet.scroll = 0
 		ctx := m.fleetCursor()
 		if ctx == "" {
 			return m, nil
@@ -224,6 +253,7 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filterFocused = true
 		return m, nil
 	case "esc":
+		m.fleet.scroll = 0
 		if m.fleet.expanded != "" {
 			m.fleet.expanded = ""
 			return m, nil
@@ -312,13 +342,12 @@ func (m Model) renderFleet(height, width int) string {
 	}
 
 	if len(lines) > regionH {
-		// Centre the cursor block when it fits; anchor an oversized
-		// block at its first line so the title and the worst-first
-		// alerts stay visible rather than the card's tail.
 		blockLen := cursorEnd - cursorStart + 1
 		start := cursorStart
 		if blockLen < regionH {
 			start = cursorStart - (regionH-blockLen)/2
+		} else if m.fleet.scrollCtx == cursor {
+			start += min(m.fleet.scroll, blockLen-regionH)
 		}
 		if start < 0 {
 			start = 0
@@ -489,7 +518,7 @@ func (m Model) renderFleetCard(e fleetEntry, width int) []string {
 		case sevWarn:
 			glyph, style = "⚠", th.StatusWrn
 		}
-		lines = append(lines, spine+"   "+style.Render(glyph)+" "+truncate(a.Text, width-7))
+		lines = append(lines, spine+"   "+style.Render(glyph)+" "+truncate(cleanDetail(a.Text), width-7))
 	}
 	return lines
 }
@@ -502,7 +531,7 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 	// Offline rows: name plus the reason, nothing else pretends to be
 	// known.
 	if st.Reach == model.ReachUnreachable || st.Reach == model.ReachAuthFailed {
-		name := st.Context
+		name := cleanDetail(st.Context)
 		nameW := width / 3
 		if nameW > 24 {
 			nameW = 24
@@ -512,7 +541,7 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 		}
 		spine := th.StatusDim.Render("▏")
 		glyph := th.styleForReach(st.Reach).Render(st.Reach.Glyph())
-		msg := truncate(withErr(st.Reach.String(), st.LastError), width-nameW-7)
+		msg := truncate(cleanDetail(withErr(st.Reach.String(), st.LastError)), width-nameW-7)
 		return spine + " " + glyph + " " + padCol(truncate(name, nameW), nameW, th.Base) +
 			"  " + th.Dim.Render(msg)
 	}
@@ -526,7 +555,7 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 func (m Model) fleetRow(st model.ClusterState, spine, badges string, width int) string {
 	th := m.Theme
 
-	name := st.Context
+	name := cleanDetail(st.Context)
 	badgesW := lipgloss.Width(badges)
 
 	type cell struct {
@@ -537,7 +566,7 @@ func (m Model) fleetRow(st model.ClusterState, spine, badges string, width int) 
 	add := func(s string, w int) { cells = append(cells, cell{padCellANSI(s, w), w}) }
 	addRight := func(s string, w int) { cells = append(cells, cell{padCellANSIRight(s, w), w}) }
 
-	if v := shortVersion(st.ServerVersion); v != "" {
+	if v := shortVersion(cleanDetail(st.ServerVersion)); v != "" {
 		add(th.Dim.Render(v), 8)
 	} else if st.Reach == model.ReachConnecting || st.Reach == model.ReachUnknown {
 		add(th.Dim.Render(st.Reach.String()+"…"), 12)
@@ -655,6 +684,10 @@ func (m Model) renderFleetDetail(spine string, width int) []string {
 		lines = append(lines, pad+th.StatusBad.Render("✗ ")+
 			truncate("detail fetch: "+cleanDetail(r.Err), width-10))
 	}
+	if len(r.Truncated) > 0 {
+		lines = append(lines, pad+th.StatusWrn.Render(truncate(
+			"partial detail: "+cleanDetail(strings.Join(r.Truncated, ", "))+" scan limit reached; more resources remain", width-6)))
+	}
 	half := width / 2
 	if half < 20 {
 		half = 20
@@ -685,7 +718,7 @@ func (m Model) renderFleetDetail(spine string, width int) []string {
 		}
 		lines = append(lines, head)
 	}
-	if r.Err == "" && len(r.Pods)+len(r.Deploys)+len(r.Events) == 0 {
+	if r.Err == "" && len(r.Truncated) == 0 && len(r.Pods)+len(r.Deploys)+len(r.Events) == 0 {
 		lines = append(lines, pad+th.Dim.Render("no problem detail — pods, deployments and events look clean"))
 	}
 	status := fmt.Sprintf("fetched %s ago · r to refresh · Enter to collapse", formatAge(r.At))

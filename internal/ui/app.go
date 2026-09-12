@@ -1988,7 +1988,7 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 func (m Model) renderFooter() string {
 	hint := " ?:help  F1:fleet  1:pods  2:deploy  3:svc  4:ing  5:nodes  6:ns  e:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
 	if m.view == ViewFleet && !m.dashboard.open {
-		hint = " j/k:cluster  Enter:details  o:open  r:refresh  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
+		hint = " j/k:cluster  Enter:details  PgUp/Dn:scroll  o:open  r:refresh  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
 	}
 	if m.view == ViewCluster && !m.dashboard.open {
 		hint = " Tab:cluster  n:ns  0:all-ns  1-6:tables  F1:fleet  Esc/F3:back  ?:help  q:quit "
