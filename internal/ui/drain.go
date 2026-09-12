@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -26,18 +27,36 @@ type drainConfirmState struct {
 // so the user can see exactly what's stuck rather than just a count;
 // successfully-evicted pods just bump the Done counter.
 type drainProgressState struct {
-	open      bool
-	context   string // origin cluster, for the Tab-away guard
-	node      string
-	current   string // pod currently being evicted
-	done      int
-	total     int
-	blocked   []string // ns/name and error for pods whose eviction failed
-	remaining []string
-	phase     string // mirrors cluster.DrainProgress.Phase
-	err       string
-	cancel    func()
-	started   time.Time
+	session      uint64
+	request      *modalRequest
+	acknowledged bool
+	finished     bool
+	open         bool
+	context      string // origin cluster, for the Tab-away guard
+	node         string
+	current      string // pod currently being evicted
+	done         int
+	total        int
+	blocked      []string // ns/name and error for pods whose eviction failed
+	remaining    []string
+	phase        string // mirrors cluster.DrainProgress.Phase
+	err          string
+	cancel       func()
+	started      time.Time
+}
+
+// DrainRequest allocates cancellation and identity before startup is queued.
+type DrainRequest struct {
+	Context context.Context
+	Focus   FocusTarget
+	Session uint64
+	Node    string
+}
+
+// DrainMsg binds every event, including the startup acknowledgement, to one drain.
+type DrainMsg struct {
+	Session uint64
+	Msg     tea.Msg
 }
 
 // DrainStartMsg / DrainProgressMsg / DrainDoneMsg are the lifecycle
@@ -67,10 +86,25 @@ type DrainDoneMsg struct {
 // openDrainConfirm shows the y/N modal for the given node. The
 // actual drain doesn't start until the user confirms.
 func (m Model) openDrainConfirm(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
+	m.stopDrain()
 	m.drainConfirm.open = true
 	m.drainConfirm.node = ref.Name
 	m.drainConfirm.pending = false
 	return m, nil
+}
+
+func (m *Model) cancelDrain() {
+	m.drainProgress.request.stop()
+	if m.drainProgress.cancel != nil {
+		m.drainProgress.cancel()
+		m.drainProgress.cancel = nil
+	}
+}
+
+func (m *Model) stopDrain() {
+	m.cancelDrain()
+	m.drainProgress = drainProgressState{}
+	m.drainConfirm = drainConfirmState{}
 }
 
 // handleDrainConfirmKey routes input while the confirm modal is open.
@@ -78,17 +112,22 @@ func (m Model) handleDrainConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.drainConfirm.pending {
 		// In-flight: ignore everything except Esc (still allow
 		// cancelling before the supervisor accepts).
-		if k.String() == "esc" || k.String() == "q" {
-			m.drainConfirm.open = false
-			m.drainConfirm.pending = false
+		switch k.String() {
+		case "esc", "q":
+			m.stopDrain()
+		case "ctrl+c":
+			m.stopDrain()
+			m.quitMsg = "bye"
+			return m, tea.Quit
 		}
 		return m, nil
 	}
 	switch k.String() {
 	case "esc", "q", "n", "N":
-		m.drainConfirm.open = false
+		m.stopDrain()
 		return m, nil
 	case "ctrl+c":
+		m.stopDrain()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case "y", "Y", "enter":
@@ -99,8 +138,19 @@ func (m Model) handleDrainConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.drainConfirm.pending = true
 		cb := m.OnDrainStart
 		node := m.drainConfirm.node
-		focused := m.Focus()
-		return m, m.focusedCmd(func() tea.Msg { return cb(focused, node) })
+		m.drainSession++
+		request := newModalRequest(m.focusLife.ctx)
+		m.drainProgress = drainProgressState{
+			session: m.drainSession, request: request,
+			context: m.WatchedContext, node: node, phase: "starting", started: time.Now(),
+		}
+		req := DrainRequest{Context: request.ctx, Focus: m.Focus(), Session: m.drainSession, Node: node}
+		return m, m.focusedCmd(func() tea.Msg {
+			if req.Context.Err() != nil {
+				return nil
+			}
+			return DrainMsg{Session: req.Session, Msg: cb(req)}
+		})
 	}
 	return m, nil
 }
@@ -112,15 +162,16 @@ func (m Model) handleDrainConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleDrainProgressKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "esc", "q":
-		if m.drainProgress.phase == "done" || m.drainProgress.phase == "error" {
-			m.drainProgress.open = false
+		if m.drainProgress.finished {
+			m.stopDrain()
 			return m, nil
 		}
-		if m.drainProgress.cancel != nil {
-			m.drainProgress.cancel()
-		}
+		// Keep the identity until the terminal summary arrives, including
+		// confirmation of pods whose eviction was already accepted.
+		m.cancelDrain()
 		return m, nil
 	case "ctrl+c":
+		m.stopDrain()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	}
@@ -131,23 +182,31 @@ func (m Model) handleDrainProgressKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 // opens the progress modal and remembers the cancel function. On
 // failure it surfaces a toast and closes the confirm modal.
 func (m Model) applyDrainStart(msg DrainStartMsg) (tea.Model, tea.Cmd) {
-	if msg.Context != m.WatchedContext {
+	if msg.Context != m.WatchedContext || msg.Node != m.drainProgress.node {
+		discardFocusedMessage(msg)
 		return m, nil
 	}
+	if m.drainProgress.acknowledged {
+		return m, nil
+	}
+	m.drainProgress.acknowledged = true
 	m.drainConfirm.open = false
 	m.drainConfirm.pending = false
 	if msg.Err != "" {
+		discardFocusedMessage(msg)
+		m.cancelDrain()
+		m.drainProgress.finished = true
+		m.drainProgress.open = false
 		m.toast = "✕ Drain: " + cleanDetail(msg.Err)
 		m.toastUntil = time.Now().Add(5 * time.Second)
 		return m, tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
 	}
-	m.drainProgress = drainProgressState{
-		open:    true,
-		context: msg.Context,
-		node:    msg.Node,
-		cancel:  msg.Cancel,
-		started: time.Now(),
-		phase:   "starting",
+	// Progress may already have arrived. Attach the handle without
+	// replacing counters or the phase established by the forwarder.
+	m.drainProgress.open = true
+	m.drainProgress.cancel = msg.Cancel
+	if m.drainProgress.request != nil && m.drainProgress.request.ctx.Err() != nil {
+		m.cancelDrain()
 	}
 	return m, nil
 }
@@ -155,9 +214,11 @@ func (m Model) applyDrainStart(msg DrainStartMsg) (tea.Model, tea.Cmd) {
 // applyDrainProgress folds one DrainProgressMsg into drainProgressState.
 // Out-of-context messages are dropped (cluster Tab guard pattern).
 func (m Model) applyDrainProgress(msg DrainProgressMsg) (tea.Model, tea.Cmd) {
-	if msg.Context != m.drainProgress.context {
+	if msg.Context != m.drainProgress.context || msg.Node != m.drainProgress.node {
 		return m, nil
 	}
+	m.drainConfirm.open, m.drainConfirm.pending = false, false
+	m.drainProgress.open = true
 	m.drainProgress.phase = msg.Phase
 	if msg.Total > 0 {
 		m.drainProgress.total = msg.Total
@@ -177,18 +238,19 @@ func (m Model) applyDrainProgress(msg DrainProgressMsg) (tea.Model, tea.Cmd) {
 
 // applyDrainDone retains incomplete results until the user dismisses them.
 func (m Model) applyDrainDone(msg DrainDoneMsg) (tea.Model, tea.Cmd) {
-	if msg.Context != m.WatchedContext {
+	if msg.Context != m.WatchedContext || msg.Node != m.drainProgress.node {
 		return m, nil
 	}
+	m.drainConfirm.open, m.drainConfirm.pending = false, false
+	m.cancelDrain()
+	m.drainProgress.finished = true
 	m.drainProgress.open = false
-	m.drainProgress.cancel = nil
+	m.drainProgress.phase = "done"
+	m.drainProgress.done = msg.Done
+	m.drainProgress.total = msg.Total
+	m.drainProgress.err = cleanDetail(msg.Err)
 	if msg.Total > msg.Done {
 		m.drainProgress.open = true
-		m.drainProgress.node = msg.Node
-		m.drainProgress.phase = "done"
-		m.drainProgress.done = msg.Done
-		m.drainProgress.total = msg.Total
-		m.drainProgress.err = cleanDetail(msg.Err)
 		blockedDetails := make(map[string]string, len(msg.Blocked))
 		for _, detail := range msg.Blocked {
 			pod, _, _ := strings.Cut(detail, " (")
@@ -305,7 +367,7 @@ func (m Model) renderDrainProgress(canvasWidth, canvasHeight int) string {
 	}
 
 	b.WriteString("\n")
-	if m.drainProgress.phase == "done" || m.drainProgress.phase == "error" {
+	if m.drainProgress.finished {
 		b.WriteString(m.Theme.Footer.Render(" esc to close  (node remains cordoned)"))
 	} else {
 		b.WriteString(m.Theme.Footer.Render(" esc to cancel  (accepted evictions continue)"))

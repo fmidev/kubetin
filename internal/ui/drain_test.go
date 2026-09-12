@@ -22,8 +22,8 @@ func TestDrainErrorsStripTerminalControls(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := New("alpha", model.NewStore(), []string{"alpha"})
-			m.drainProgress = drainProgressState{open: true, context: "alpha", node: "worker"}
-			updated, _ := m.Update(tc.msg)
+			m.drainProgress = drainProgressState{session: 1, open: true, context: "alpha", node: "worker"}
+			updated, _ := m.Update(DrainMsg{Session: 1, Msg: tc.msg})
 			m = updated.(Model)
 			got := m.toast
 			if tc.name == "blocked" {
