@@ -100,6 +100,14 @@ func TestAllWatchersConvergeAfterOverflow(t *testing.T) {
 			return watcherObservation{uid: ev.UID, context: ev.Context, value: ev.Name, deleted: int(ev.Kind) == 2}
 		})
 	})
+	t.Run("replicasets", func(t *testing.T) {
+		w := NewReplicaSetWatcher("alpha", 256)
+		checkWatcherBurst(t, w.eventDelivery, func(kind int, meta metav1.ObjectMeta) {
+			w.emit(ReplicaSetEventKind(kind), &appsv1.ReplicaSet{ObjectMeta: meta})
+		}, func(ev ReplicaSetEvent) watcherObservation {
+			return watcherObservation{uid: ev.UID, context: ev.Context, value: ev.Name, deleted: ev.Kind == ReplicaSetDeleted}
+		})
+	})
 	t.Run("deployments", func(t *testing.T) {
 		w := NewDeployWatcher("alpha", 256)
 		checkWatcherBurst(t, w.eventDelivery, func(kind int, meta metav1.ObjectMeta) {

@@ -82,18 +82,25 @@ func (m Model) deploymentPods(d deploymentRow) []podRow {
 	if err != nil || sel.Empty() {
 		return nil
 	}
-	out := make([]podRow, 0, 8)
-	for _, p := range m.pods {
+	// Sort identities before copying rows, avoiding repeated growth of a large row slice.
+	ids := make([]types.UID, 0, 8)
+	for uid, p := range m.pods {
 		if p.Namespace == d.Namespace && sel.Matches(labels.Set(p.Labels)) {
-			out = append(out, p)
+			ids = append(ids, uid)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Name != out[j].Name {
-			return out[i].Name < out[j].Name
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := m.pods[ids[i]], m.pods[ids[j]]
+		if a.Name != b.Name {
+			return a.Name < b.Name
 		}
-		return out[i].UID < out[j].UID
+		return ids[i] < ids[j]
 	})
+	out := make([]podRow, len(ids))
+	for i, uid := range ids {
+		out[i] = m.pods[uid]
+	}
+
 	return out
 }
 

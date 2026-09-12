@@ -35,7 +35,7 @@ func checkWatchSync[T any](t *testing.T, resource, kind string, count int, out <
 			}})
 		}
 		version := "v1"
-		if resource == "deployments" {
+		if resource == "deployments" || resource == "replicasets" {
 			version = "apps/v1"
 		}
 		if r.URL.Query().Get("watch") == "true" {
@@ -102,6 +102,12 @@ func TestWatchSyncIncludesEmptyListsAndQueuedInitialObjects(t *testing.T) {
 						t.Errorf("lost effective namespace: %q", ev.WatchNamespace)
 					}
 					return ev.UID, ev.Context, ev.Kind == PodSynced
+				})
+			})
+			t.Run("replicasets", func(t *testing.T) {
+				w := NewReplicaSetWatcher("slow", 1)
+				checkWatchSync(t, "replicasets", "ReplicaSet", count, w.Out, w.Run, func(ev ReplicaSetEvent) (types.UID, string, bool) {
+					return ev.UID, ev.Context, ev.Kind == ReplicaSetSynced
 				})
 			})
 			t.Run("deployments", func(t *testing.T) {

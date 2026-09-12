@@ -59,6 +59,9 @@ type logsState struct {
 	// while set, instead of the misleading "● live".
 	reconnecting bool
 
+	// Only a failed initial request made before its container started is eligible.
+	retryWhenStarted bool
+
 	// session is the active log-stream identifier. It's incremented
 	// on every startLogs and stamped into LogStartMsg so the
 	// forwarder in main can echo it back on every line/EOS/Err. The
@@ -106,8 +109,9 @@ type LogLinesMsg struct {
 
 // LogErrorMsg carries a stream-level error.
 type LogErrorMsg struct {
-	Session uint64
-	Err     string
+	Session          uint64
+	Err              string
+	retryWhenStarted bool
 }
 
 // LogEOSMsg signals the streamer's End-of-Stream.
@@ -189,6 +193,7 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	m.logs.cancel = cancel
 	m.logs.session++
 	m.logs.streaming = true
+	m.logs.retryWhenStarted = false
 	m.logs.tail = tail
 	m.logs.full = tail < 0
 	m.logs.ref = ref
@@ -214,11 +219,17 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	cb := m.OnLogsStart
 	focused := m.WatchedContext
 	req := LogStartMsg{Context: streamCtx, Session: m.logs.session, Ref: ref, Container: container, Tail: tail}
+	waiting := !m.logContainerStarted(ref, container)
 	return m.focusedCmd(func() tea.Msg {
 		if streamCtx.Err() != nil {
 			return nil
 		}
-		return cb(focused, req)
+		result := cb(focused, req)
+		if failure, ok := result.(LogErrorMsg); ok {
+			failure.retryWhenStarted = waiting
+			return failure
+		}
+		return result
 	})
 }
 

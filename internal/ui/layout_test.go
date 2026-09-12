@@ -734,6 +734,7 @@ func dashDeploySetup(extra func(*Model)) func(*Model) {
 			LastSeen:     now.Add(-9 * time.Minute),
 			InvolvedKind: "Deployment", InvolvedName: "payments-api", InvolvedNs: "default",
 		}
+		m.replicaSets["rs-uid"] = cluster.ReplicaSetEvent{UID: "rs-uid", Name: "payments-api-7f9c8", Namespace: "default", DeploymentUID: "dep-uid"}
 		m.events["rs-evt"] = eventRow{
 			UID: "rs-evt", Namespace: "default", Type: "Normal", Reason: "SuccessfulCreate",
 			Message: "Created pod: payments-api-7f9c8-x2k4l", Count: 1,

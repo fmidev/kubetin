@@ -174,26 +174,70 @@ func podRefFor(p podRow) cluster.DescribeRef {
 // pods/log — firing a request we know the apiserver will refuse just
 // trades a live pane for an error pane.
 func (m *Model) startDashboardLogs() tea.Cmd {
+	return m.startDashboardLogsTail(m.logTail())
+}
+
+func (m *Model) startDashboardLogsTail(tail int) tea.Cmd {
 	ref := m.dashboard.logRef
 	if ref.Name == "" {
-		m.stopDashboardLogs()
-		m.logs.session++ // Reject messages already queued by the canceled stream.
-		m.logs.lineBase += len(m.logs.lines)
-		m.logs.lines = nil
-		m.recomputeLogsMatches()
-		m.logs.err = "no pod available to stream logs from"
+		m.resetDashboardLogs("no pod available to stream logs from")
 		return nil
 	}
 	if st, ok := m.permissions[cluster.PermissionKey(m.WatchedContext, "get", "", "pods/log", ref.Namespace)]; ok && !st.Allowed {
-		m.logs.err = "no permission to read pod logs (get pods/log)"
-		m.logs.streaming = false
+		m.resetDashboardLogs("no permission to read pod logs (get pods/log)")
 		return nil
 	}
 	container := ""
 	if m.dashboard.containerI < len(m.dashboard.containers) {
 		container = m.dashboard.containers[m.dashboard.containerI]
 	}
-	return m.beginLogStream(ref, container)
+	return m.beginLogStreamTail(ref, container, tail)
+}
+
+func (m *Model) resetDashboardLogs(err string) {
+	m.stopDashboardLogs()
+	m.logs = logsState{
+		session: m.logs.session, err: err, cap: m.logs.cap, follow: true,
+		lineBase: m.logs.lineBase + len(m.logs.lines), searchTerm: m.logs.searchTerm,
+	}
+	m.recomputeLogsMatches()
+}
+
+// Retry a failed initial request only when its selected container has started.
+// Established streams and their replica selection remain unchanged.
+func (m *Model) recoverDashboardLogs() tea.Cmd {
+	if !m.dashboard.open {
+		return nil
+	}
+	if m.dashboard.logRef.Name != "" {
+		if !m.logs.retryWhenStarted || !m.logContainerStarted(m.logs.ref, m.logs.container) {
+			return nil
+		}
+		return m.startDashboardLogsTail(m.logs.tailOrDefault())
+	}
+	target, ok := m.dashboard.target()
+	if !ok || target.Ref.Kind != "Deployment" {
+		return nil
+	}
+	m.prepareLogTarget(target)
+	if m.dashboard.logRef.Name == "" {
+		return nil
+	}
+	return m.startDashboardLogs()
+}
+
+func (m Model) logContainerStarted(ref cluster.DescribeRef, container string) bool {
+	pod, ok := m.pods[ref.UID]
+	if !ok {
+		return false
+	}
+	for _, ci := range pod.ContainerInfo {
+		if ci.Name != container {
+			continue
+		}
+		return ci.Running || ci.State == cluster.ContainerReady || ci.State == cluster.ContainerTerminated || ci.ExitCode != 0
+	}
+	return false
 }
 
 // closeDashboard tears down the whole stack and stops the stream.
@@ -218,7 +262,9 @@ func (m Model) popDashboard() (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) stopDashboardLogs() tea.Cmd {
+	m.logs.session++
 	m.logs.streaming = false
+	m.logs.retryWhenStarted = false
 	if m.logs.cancel != nil {
 		m.logs.cancel()
 		m.logs.cancel = nil
@@ -584,6 +630,13 @@ func (m Model) renderDashStatus(sub dashSubject, w, h int) string {
 	return m.renderDashPodStatus(sub.Pod, w, h)
 }
 
+func (m Model) dashMainLineCount(sub dashSubject, w int) int {
+	if sub.isDeploy() {
+		return max(1, len(sub.Pods))
+	}
+	return lineCount(m.renderDashMain(sub, w, 0))
+}
+
 func (m Model) renderDashMain(sub dashSubject, w, h int) string {
 	if sub.isDeploy() {
 		return m.renderDashPods(sub.Pods, w, h, m.dashboard.podCursor)
@@ -633,7 +686,7 @@ func (m Model) renderDashboardWide(sub dashSubject, t dashboardTarget, lay dashL
 func (m Model) stackedPaneHeights(sub dashSubject, w, h int) (status, main, events, logs int) {
 	inner := stackedInnerWidth(w)
 	return resolveStackedHeights(sub.statusHeight(),
-		lineCount(m.renderDashMain(sub, inner, 0)),
+		m.dashMainLineCount(sub, inner),
 		dashEventLineCount(m.dashEventRows(sub)), h)
 }
 
@@ -682,21 +735,12 @@ type stackedGeom struct {
 	status, main, events, logs int
 }
 
-// stackedLayout builds the single-column form and reports the geometry
-// it used.
-//
-// One pass on purpose. The variable panes are rendered once at natural
-// height, measured, then windowed down — previously they were rendered
-// to measure and rendered again to display, and the canvas offset
-// derived the whole thing a third time. Each of those passes filters
-// and sorts the cluster-wide event map, and informer updates trigger a
-// redraw, so a busy cluster paid it on every event.
+// stackedLayout sizes panes before formatting their visible rows.
 func (m Model) stackedLayout(sub dashSubject, w, h int) stackedGeom {
 	th := m.Theme
 	t, _ := m.dashboard.target()
 	inner := stackedInnerWidth(w)
 
-	naturalMain := m.renderDashMain(sub, inner, 0)
 	// Scoped once, then counted and formatted from the same slice: the
 	// events pane formats only its visible rows, so measuring it by
 	// rendering it at natural height would cost more than the render.
@@ -704,13 +748,8 @@ func (m Model) stackedLayout(sub dashSubject, w, h int) stackedGeom {
 
 	g := stackedGeom{}
 	g.status, g.main, g.events, g.logs = resolveStackedHeights(
-		sub.statusHeight(), lineCount(naturalMain), dashEventLineCount(eventRows), h)
+		sub.statusHeight(), m.dashMainLineCount(sub, inner), dashEventLineCount(eventRows), h)
 
-	// Rendered again at the resolved height rather than trimmed from
-	// naturalMain: the containers pane pins its header above the
-	// scroll window and the owned-pod list windows around its cursor,
-	// neither of which trimming can reproduce. Both renders are cheap
-	// — the pane the one-pass discipline exists for is events.
 	sizedMain := m.renderDashMain(sub, inner, g.main)
 
 	g.body = strings.Join([]string{
@@ -808,18 +847,7 @@ func (m Model) dashBottomLabel(sub dashSubject) string {
 // bypassing refForCursor — inside the dashboard the subject is the
 // target on the stack, which may be a pod the table cursor isn't on.
 func (m Model) openDescribeFor(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
-	if m.OnDescribe == nil {
-		return m, nil
-	}
-	m.describe.open = true
-	m.describe.loading = true
-	m.describe.revealed = false
-	m.describe.result = cluster.DescribeResult{}
-	m.describe.scroll = 0
-	cb := m.OnDescribe
-	focused := m.WatchedContext
-	req := DescribeRequestMsg{Ref: ref}
-	return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
+	return m.startDescribe(ref, false)
 }
 
 // drillIntoSelectedPod pushes the pod under the PODS-pane cursor onto

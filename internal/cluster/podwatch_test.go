@@ -261,3 +261,13 @@ func TestPodMemLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestContainerProjectionDistinguishesRunningFromWaiting(t *testing.T) {
+	got := projectContainerInfo([]corev1.ContainerStatus{
+		{Name: "running", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+		{Name: "waiting", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{}}},
+	}, nil)
+	if !got[0].Running || got[0].Ready || got[1].Running {
+		t.Fatalf("lost running state for unready container: %+v", got)
+	}
+}

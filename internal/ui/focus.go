@@ -6,6 +6,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/fmidev/kubetin/internal/cluster"
 )
 
 // FocusTarget identifies one UI focus intent, including repeat visits to a cluster.
@@ -60,6 +62,7 @@ func (m *Model) clearFocusedState() {
 	m.pods = make(map[types.UID]podRow)
 	m.nodes = make(map[types.UID]nodeRow)
 	m.deployments = make(map[types.UID]deploymentRow)
+	m.replicaSets = make(map[types.UID]cluster.ReplicaSetEvent)
 	m.events = make(map[types.UID]eventRow)
 	m.namespaces = make(map[types.UID]nsRow)
 	m.services = make(map[types.UID]serviceRow)
