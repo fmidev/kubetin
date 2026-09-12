@@ -389,64 +389,8 @@ func runTUI(ctx context.Context, store *model.Store, sup *cluster.Supervisor, co
 		}
 		return ui.NodeOpResultMsg(res)
 	}
-	m.OnDrainStart = func(focus ui.FocusTarget, node string) tea.Msg {
-		focusedCtx := focus.Context
-		klog.Infof("drain: %s on %s requested", node, focusedCtx)
-		// Drain context is detached from the per-request timeout —
-		// the UI cancels via the function we return on the
-		// DrainStartMsg. The supervisor also enforces a drain deadline;
-		// an outer process shutdown still aborts.
-		drainCtx, cancel := context.WithCancel(ctx)
-		progress := make(chan cluster.DrainProgress, 64)
-
-		go sup.Drain(drainCtx, focusedCtx, node, progress)
-
-		// Forwarder goroutine — drains the channel into the
-		// bubbletea program. We collect "blocked" pods locally so
-		// we can hand the final list to DrainDoneMsg without making
-		// the UI re-walk its own append-only list.
-		go func() {
-			var blocked []string
-			var finalDone, finalTotal int
-			var finalErr string
-			var remaining []string
-			for ev := range progress {
-				prog.Send(ui.FocusedMsg{Focus: focus, Msg: ui.DrainProgressMsg(ev)})
-				if ev.Total > finalTotal {
-					finalTotal = ev.Total
-				}
-				if ev.Done > finalDone {
-					finalDone = ev.Done
-				}
-				if ev.Phase == "blocked" {
-					blocked = append(blocked, ev.Pod+" ("+ev.Err+")")
-				}
-				if ev.Phase == "error" {
-					finalErr = ev.Err
-				}
-				if ev.Phase == "error" || ev.Phase == "done" {
-					remaining = ev.Remaining
-				}
-			}
-			klog.Infof("drain: %s on %s ended done=%d/%d err=%q blocked=%d",
-				node, focusedCtx, finalDone, finalTotal, finalErr, len(blocked))
-			prog.Send(ui.FocusedMsg{Focus: focus, Msg: ui.DrainDoneMsg{
-				Context:   focusedCtx,
-				Node:      node,
-				Done:      finalDone,
-				Total:     finalTotal,
-				Err:       finalErr,
-				Blocked:   blocked,
-				Remaining: remaining,
-			}})
-			cancel() // releases the drain context once the stream is fully drained
-		}()
-
-		return ui.DrainStartMsg{
-			Context: focusedCtx,
-			Node:    node,
-			Cancel:  cancel,
-		}
+	m.OnDrainStart = func(req ui.DrainRequest) tea.Msg {
+		return startDrain(ctx, req, sup.Drain, prog.Send)
 	}
 
 	// No mouse capture: kubetin does not use mouse events yet, and

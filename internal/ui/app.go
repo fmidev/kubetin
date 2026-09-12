@@ -182,10 +182,9 @@ type Model struct {
 	// OnDrainStart begins an async drain. It returns DrainStartMsg
 	// synchronously to confirm the supervisor accepted the request
 	// (or surface a setup error); subsequent DrainProgressMsg /
-	// DrainDoneMsg events flow asynchronously over the program's
-	// channel — main.go spawns a forwarder goroutine for the same
-	// reason logs do.
-	OnDrainStart func(focus FocusTarget, node string) tea.Msg
+	// DrainDoneMsg events flow through DrainMsg envelopes carrying
+	// req.Session, inside the existing FocusedMsg envelope.
+	OnDrainStart func(req DrainRequest) tea.Msg
 
 	pods        map[types.UID]podRow
 	nodes       map[types.UID]nodeRow
@@ -250,6 +249,7 @@ type Model struct {
 	restartConfirm      restartConfirmState
 	drainConfirm        drainConfirmState
 	drainProgress       drainProgressState
+	drainSession        uint64
 	logs                logsState
 	eventsLens          eventsLensState
 	exec                execState
@@ -321,7 +321,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case ResourceBatchMsg, PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
 			SvcEventMsg, IngEventMsg, EndpointSliceEventMsg, MetricsSnapshotMsg, NetworkSnapshotMsg,
 			modalResultMsg, DescribeResultMsg, PermissionResultMsg, DeleteResultMsg, ScaleResultMsg, RolloutResultMsg,
-			NodeOpResultMsg, DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
+			NodeOpResultMsg, DrainMsg, DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
+			discardFocusedMessage(msg)
+			return m, nil
+		}
+	}
+	if drain, ok := msg.(DrainMsg); ok {
+		if drain.Session == 0 || drain.Session != m.drainProgress.session || m.drainProgress.finished {
+			discardFocusedMessage(drain.Msg)
+			return m, nil
+		}
+		msg = drain.Msg
+	} else {
+		switch msg.(type) {
+		case DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
 			discardFocusedMessage(msg)
 			return m, nil
 		}

@@ -35,6 +35,9 @@ func (m Model) Focus() FocusTarget {
 }
 
 func discardFocusedMessage(msg tea.Msg) {
+	if drain, ok := msg.(DrainMsg); ok {
+		msg = drain.Msg
+	}
 	// A drain can start before its acknowledgement reaches Update. If
 	// focus changed in between, release that operation's cancel handle.
 	if start, ok := msg.(DrainStartMsg); ok && start.Cancel != nil {
@@ -78,11 +81,7 @@ func (m *Model) clearFocusedState() {
 	m.dashboard = dashboardState{}
 	m.stopDashboardLogs()
 	m.logs = logsState{session: m.logs.session + 1}
-	if m.drainProgress.cancel != nil {
-		m.drainProgress.cancel()
-	}
-	m.drainProgress = drainProgressState{}
-	m.drainConfirm = drainConfirmState{}
+	m.stopDrain()
 	m.actionMenu = actionMenuState{}
 	m.deleteConfirm.request.stop()
 	m.scaleConfirm.request.stop()
