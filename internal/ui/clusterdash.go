@@ -106,7 +106,7 @@ type clusterStats struct {
 	deploysTotal, deploysReady, degraded, zeroReady int
 	warnEvents, warnObjects                         int
 	warnGroups                                      []eventGroup
-	topCPU, topMem                                  []podRow
+	topCPU, topMem                                  []types.UID
 	unhealthy                                       []workloadIssue
 	nodes                                           []nodeRow
 	podsByNode                                      map[string]int
@@ -148,12 +148,6 @@ func (m Model) clusterStats() clusterStats {
 		s.contReady += r
 		s.contTotal += t
 		s.restarts += p.Restarts
-		if p.HasMetrics {
-			s.topCPU = append(s.topCPU, p)
-			s.topMem = append(s.topMem, p)
-		}
-
-		name := p.Namespace + "/" + p.Name
 		reason := ""
 		errored := false
 		for _, containers := range [][]cluster.ContainerInfo{p.ContainerInfo, p.InitContainerInfo} {
@@ -175,28 +169,27 @@ func (m Model) clusterStats() clusterStats {
 		}
 		switch {
 		case p.Phase == corev1.PodFailed || p.Phase == corev1.PodUnknown:
-			broken = append(broken, workloadIssue{true, fmt.Sprintf("%s %s", name, p.Phase)})
+			broken = append(broken, workloadIssue{true, fmt.Sprintf("%s/%s %s", p.Namespace, p.Name, p.Phase)})
 		case errored:
-			broken = append(broken, workloadIssue{true, fmt.Sprintf("%s %s ↺%d", name, reason, p.Restarts)})
+			broken = append(broken, workloadIssue{true, fmt.Sprintf("%s/%s %s ↺%d", p.Namespace, p.Name, reason, p.Restarts)})
+		case p.Phase == corev1.PodRunning:
+			condition, blocked := podBlockingCondition(p)
+			if blocked || r < t {
+				text := fmt.Sprintf("%s/%s NotReady", p.Namespace, p.Name)
+				if blocked {
+					text += " " + condition.Type
+					if condition.Reason != "" {
+						text += ": " + condition.Reason
+					}
+				}
+				broken = append(broken, workloadIssue{false, text})
+			}
 		case p.Phase == corev1.PodPending && !p.CreatedAt.IsZero() && now.Sub(p.CreatedAt) > clusterDashPendingGrace:
 			pending = append(pending, pendingPod{p, reason})
 		}
 	}
 	s.restartsDelta = restartDelta(m.pods, m.restartBaseline, m.dashboardNamespace())
-	sort.Slice(s.topCPU, func(i, j int) bool {
-		if s.topCPU[i].CPUMilli != s.topCPU[j].CPUMilli {
-			return s.topCPU[i].CPUMilli > s.topCPU[j].CPUMilli
-		}
-		a, b := s.topCPU[i], s.topCPU[j]
-		return dashboardNameLess(a.Namespace, a.Name, a.UID, b.Namespace, b.Name, b.UID)
-	})
-	sort.Slice(s.topMem, func(i, j int) bool {
-		if s.topMem[i].MemBytes != s.topMem[j].MemBytes {
-			return s.topMem[i].MemBytes > s.topMem[j].MemBytes
-		}
-		a, b := s.topMem[i], s.topMem[j]
-		return dashboardNameLess(a.Namespace, a.Name, a.UID, b.Namespace, b.Name, b.UID)
-	})
+	s.topCPU, s.topMem = m.dashboardPodOrder()
 
 	type degradedDeploy struct {
 		deploymentRow
@@ -231,7 +224,12 @@ func (m Model) clusterStats() clusterStats {
 			text: fmt.Sprintf("%s/%s %d/%d ready", d.Namespace, d.Name, d.Ready, d.Replicas),
 		})
 	}
-	sort.Slice(broken, func(i, j int) bool { return broken[i].text < broken[j].text })
+	sort.Slice(broken, func(i, j int) bool {
+		if broken[i].bad != broken[j].bad {
+			return broken[i].bad
+		}
+		return broken[i].text < broken[j].text
+	})
 	s.unhealthy = append(s.unhealthy, broken...)
 	sort.Slice(pending, func(i, j int) bool {
 		a, b := pending[i], pending[j]
@@ -502,18 +500,25 @@ func (m Model) gaugeLines(label string, st model.ClusterState, used, alloc int64
 	th := m.Theme
 	if m.dashboardNamespace() != "" {
 		fm := m.focusedMetrics
+		measured, total := m.scopedMetricCoverage()
 		switch {
 		case !m.syncedPods || !fm.seen:
 			return []string{padCol(label+" waiting for first metrics sample", w, th.Dim)}
 		case !fm.ok:
 			return []string{padCol(label+" metrics unavailable", w, th.Dim)}
+		case total > 0 && measured == 0:
+			return []string{padCol(label+" waiting for pod metrics", w, th.Dim)}
 		case time.Since(fm.at) > clusterDashMetricsStale:
 			return []string{padCellANSI(th.Dim.Render(label+" ")+th.StatusWrn.Render("stale")+
 				th.Dim.Render(" Σ pods "+format(scopedSum)), w)}
 		}
+		coverage := padCol("no allocatable for a namespace", w, th.Dim)
+		if measured < total {
+			coverage = padCol(fmt.Sprintf("partial metrics: %d/%d pods", measured, total), w, th.StatusWrn)
+		}
 		return []string{
 			padCellANSI(th.Dim.Render(label+" ")+th.Header.Render("Σ pods "+format(scopedSum)), w),
-			padCol("no allocatable for a namespace", w, th.Dim),
+			coverage,
 		}
 	}
 	if !st.MetricsAvailable || alloc <= 0 {
@@ -533,7 +538,7 @@ func (m Model) gaugeLines(label string, st model.ClusterState, used, alloc int64
 	}
 	lines := []string{padCellANSI(bar, w)}
 	if sl := spanLabel(span); sl != "" && w >= 12 {
-		spark := sparkline(hist, w-len(sl)-2)
+		spark := historySparkline(hist, w-len(sl)-2)
 		lines = append(lines, padCellANSI(th.Dim.Render(spark+"  "+sl), w))
 	}
 	return lines
@@ -555,8 +560,8 @@ func (m Model) netLines(w int) []string {
 	}
 	if sl := spanLabel(m.netHistory.span()); sl != "" && w >= 16 {
 		each := (w - len(sl) - 3) / 2
-		rx := sparkline(scaleSpark(m.netHistory.rx), each)
-		tx := sparkline(scaleSpark(m.netHistory.tx), each)
+		rx := historySparkline(scaleSpark(m.netHistory.rx), each)
+		tx := historySparkline(scaleSpark(m.netHistory.tx), each)
 		lines = append(lines, padCellANSI(th.Dim.Render(rx+" "+tx+"  "+sl), w))
 	}
 	return lines
@@ -589,9 +594,21 @@ func (m Model) scopedUsage() (cpu, mem int64) {
 	return cpu, mem
 }
 
+func (m Model) scopedMetricCoverage() (measured, total int) {
+	for _, p := range m.pods {
+		if m.inScope(p.Namespace) {
+			total++
+			if p.HasMetrics {
+				measured++
+			}
+		}
+	}
+	return measured, total
+}
+
 // ---- list panes ------------------------------------------------------
 
-func (m Model) topPodLines(pods []podRow, w, h int) []string {
+func (m Model) topPodLines(pods []types.UID, w, h int) []string {
 	th := m.Theme
 	if h < 1 {
 		return nil
@@ -619,10 +636,11 @@ func (m Model) topPodLines(pods []podRow, w, h int) []string {
 		showPct = false
 	}
 	var out []string
-	for _, p := range pods {
+	for _, uid := range pods {
 		if len(out) >= h {
 			break
 		}
+		p := m.pods[uid]
 		line := padCol(cleanDetail(p.Namespace+"/"+p.Name), nameW, th.Base) +
 			" " + padColRight(formatCPU(p.CPUMilli), 6, th.Base) +
 			" " + padColRight(formatMem(p.MemBytes), 7, th.Base)

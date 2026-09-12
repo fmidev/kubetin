@@ -89,9 +89,9 @@ func TestClusterDashboardTieOrdering(t *testing.T) {
 	}
 	for range 100 {
 		s := m.clusterStats()
-		for _, rows := range [][]podRow{s.topCPU, s.topMem} {
+		for _, rows := range [][]types.UID{s.topCPU, s.topMem} {
 			for i, row := range rows {
-				if row.UID != types.UID(fmt.Sprint(i+1)) {
+				if row != types.UID(fmt.Sprint(i+1)) {
 					t.Fatalf("unstable pod tie: %+v", rows)
 				}
 			}

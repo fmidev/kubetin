@@ -6,6 +6,23 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// Preserve the full time window named by the adjacent span label. Each
+// cell averages a contiguous bucket when there are more samples than cells.
+func historySparkline(values []int, width int) string {
+	if width <= 0 || len(values) <= width {
+		return sparkline(values, width)
+	}
+	buckets := make([]int, width)
+	for i := range buckets {
+		start, end := i*len(values)/width, (i+1)*len(values)/width
+		for _, v := range values[start:end] {
+			buckets[i] += v
+		}
+		buckets[i] /= end - start
+	}
+	return sparkline(buckets, width)
+}
+
 // netHistoryCap bounds the focused cluster's network-rate history:
 // 60 samples at the poller's 15s cadence is 15 minutes.
 const netHistoryCap = 60

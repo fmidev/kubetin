@@ -27,12 +27,13 @@ type tableOrder struct {
 // Bubble Tea calls Update and View serially. Only derived data is shared
 // through this pointer so value-receiver renders can retain their caches.
 type tableCache struct {
-	orders       [ViewFleet]tableOrder
-	phasesValid  bool
-	phaseSize    int
-	phases       [3]int
-	nsCounts     map[string]nsCount
-	nsCountSizes [3]int
+	dashboardPods dashboardPodOrder
+	orders        [ViewFleet]tableOrder
+	phasesValid   bool
+	phaseSize     int
+	phases        [3]int
+	nsCounts      map[string]nsCount
+	nsCountSizes  [3]int
 }
 
 func (m Model) invalidateTables(views ...View) {
@@ -42,6 +43,10 @@ func (m Model) invalidateTables(views ...View) {
 }
 
 func (m Model) invalidatePodOrder(before, after podRow) {
+	if before.UID != after.UID || before.Namespace != after.Namespace || before.Name != after.Name ||
+		before.HasMetrics != after.HasMetrics || before.CPUMilli != after.CPUMilli || before.MemBytes != after.MemBytes {
+		m.tables.dashboardPods = dashboardPodOrder{}
+	}
 	entry := &m.tables.orders[ViewPods]
 	if before.UID != after.UID || before.Namespace != after.Namespace || before.Name != after.Name {
 		*entry = tableOrder{}

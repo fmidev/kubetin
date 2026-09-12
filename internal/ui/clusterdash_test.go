@@ -52,7 +52,7 @@ func TestClusterStatsDerivations(t *testing.T) {
 	if s.warnGroups[0].Reason != "FailedScheduling" {
 		t.Errorf("warnings should be newest first, got %s", s.warnGroups[0].Reason)
 	}
-	if len(s.topCPU) != 4 || s.topCPU[0].Name != "worker-5d4b-9qz7p" || s.topMem[0].Name != "worker-5d4b-9qz7p" {
+	if len(s.topCPU) != 4 || m.pods[s.topCPU[0]].Name != "worker-5d4b-9qz7p" || m.pods[s.topMem[0]].Name != "worker-5d4b-9qz7p" {
 		t.Errorf("top pods wrong: cpu %v", s.topCPU)
 	}
 	want := []string{
