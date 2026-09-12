@@ -16,6 +16,8 @@ import (
 	"github.com/fmidev/kubetin/internal/model"
 )
 
+type ReplicaSetEventMsg cluster.ReplicaSetEvent
+
 // PodEventMsg wraps a cluster.PodEvent for tea.Program.Send.
 type PodEventMsg cluster.PodEvent
 
@@ -190,6 +192,7 @@ type Model struct {
 	pods        map[types.UID]podRow
 	nodes       map[types.UID]nodeRow
 	deployments map[types.UID]deploymentRow
+	replicaSets map[types.UID]cluster.ReplicaSetEvent
 	events      map[types.UID]eventRow
 	namespaces  map[types.UID]nsRow
 	services    map[types.UID]serviceRow
@@ -289,6 +292,7 @@ func New(context string, store *model.Store, contexts []string) Model {
 		pods:                make(map[types.UID]podRow),
 		nodes:               make(map[types.UID]nodeRow),
 		deployments:         make(map[types.UID]deploymentRow),
+		replicaSets:         make(map[types.UID]cluster.ReplicaSetEvent),
 		events:              make(map[types.UID]eventRow),
 		namespaces:          make(map[types.UID]nsRow),
 		services:            make(map[types.UID]serviceRow),
@@ -324,7 +328,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Once focus has changed, untagged cluster work cannot identify
 		// which visit produced it, even when its context name matches.
 		switch msg.(type) {
-		case ResourceBatchMsg, PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
+		case ResourceBatchMsg, ReplicaSetEventMsg, PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
 			SvcEventMsg, IngEventMsg, EndpointSliceEventMsg, MetricsSnapshotMsg, NetworkSnapshotMsg,
 			modalResultMsg, DescribeResultMsg, PermissionResultMsg, DeleteResultMsg, ScaleResultMsg, RolloutResultMsg,
 			NodeOpResultMsg, DrainMsg, DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
@@ -363,6 +367,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cmd)
 			}
 		}
+		cmds = append(cmds, m.recoverDashboardLogs())
 		return m, tea.Batch(cmds...)
 
 	case tea.WindowSizeMsg:
@@ -425,7 +430,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case PodEventMsg:
 		m.updatePod(msg)
-		return m, nil
+		cmd := m.recoverDashboardLogs()
+		return m, cmd
 
 	case NodeEventMsg:
 		if msg.Context != m.WatchedContext {
@@ -452,6 +458,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tables.nsCounts = nil
 		if _, ok := m.deployments[m.cursor]; !ok && m.view == ViewDeployments {
 			m.cursor = ""
+		}
+		cmd := m.recoverDashboardLogs()
+		return m, cmd
+
+	case ReplicaSetEventMsg:
+		if msg.Context != m.WatchedContext || msg.Kind == cluster.ReplicaSetSynced {
+			return m, nil
+		}
+		if msg.Kind == cluster.ReplicaSetDeleted {
+			delete(m.replicaSets, msg.UID)
+		} else {
+			m.replicaSets[msg.UID] = cluster.ReplicaSetEvent(msg)
 		}
 		return m, nil
 

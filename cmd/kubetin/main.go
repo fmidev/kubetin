@@ -589,6 +589,14 @@ func (c *watchCoordinator) spawnWatchers(child context.Context, focus ui.FocusTa
 		}
 	}()
 
+	rw := cluster.NewReplicaSetWatcher(target, 256)
+	go forwardReplicaSetEvents(child, rw, c.prog, focus)
+	go func() {
+		if err := rw.Run(child, c.sup); err != nil {
+			klog.Errorf("replicaset watcher (%s) exited: %v", target, err)
+		}
+	}()
+
 	ew := cluster.NewEventWatcher(target, 512)
 	go forwardEvtEvents(child, ew, c.prog, focus)
 	go func() {
@@ -700,6 +708,10 @@ func forwardNodeEvents(ctx context.Context, w *cluster.NodeWatcher, p watchMessa
 
 func forwardDeployEvents(ctx context.Context, w *cluster.DeployWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.DeployEvent) tea.Msg { return ui.DeployEventMsg(ev) })
+}
+
+func forwardReplicaSetEvents(ctx context.Context, w *cluster.ReplicaSetWatcher, p watchMessageSender, focus ui.FocusTarget) {
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.ReplicaSetEvent) tea.Msg { return ui.ReplicaSetEventMsg(ev) })
 }
 
 func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p watchMessageSender, focus ui.FocusTarget) {

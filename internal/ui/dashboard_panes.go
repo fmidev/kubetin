@@ -2,11 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
 )
@@ -64,13 +66,17 @@ func (m Model) renderDashPodStatus(r podRow, w, h int) string {
 		line1 = append(line1, dashField("qos", r.QOSClass, th.Base, th))
 	}
 
-	memField := dashField("mem", formatMem(r.MemBytes), th.Base, th)
+	cpu, mem := "—", "—"
+	if r.HasMetrics {
+		cpu, mem = formatCPU(r.CPUMilli), formatMem(r.MemBytes)
+	}
+	memField := dashField("mem", mem, th.Base, th)
 	if p, ok := podMemPct(r); ok {
 		memField = dashField("mem", formatMem(r.MemBytes)+" / "+formatMem(r.MemLimitBytes), th.Base, th) +
 			" " + bar(p, 10, th) + " " + th.loadStyle(p).Render(fmt.Sprintf("%d%%", p))
 	}
 	line2 := []string{
-		dashField("cpu", formatCPU(r.CPUMilli), th.Base, th),
+		dashField("cpu", cpu, th.Base, th),
 		memField,
 	}
 	if r.HasNetwork || !r.NetAt.IsZero() {
@@ -99,13 +105,13 @@ func (m Model) renderDashPodStatus(r podRow, w, h int) string {
 // renderCondition formats a non-True condition as "⚠ Reason · Message",
 // falling back to the type when kubelet gave no reason.
 func renderCondition(c cluster.PodCondition, w int, th Theme) string {
-	label := c.Reason
+	label := cleanDetail(c.Reason)
 	if label == "" {
-		label = c.Type + "=" + c.Status
+		label = cleanDetail(c.Type + "=" + c.Status)
 	}
 	text := label
 	if c.Message != "" {
-		text += " · " + oneLine(c.Message)
+		text += " · " + cleanDetail(c.Message)
 	}
 	return th.StatusWrn.Render("⚠ ") + th.StatusWrn.Render(truncate(text, w-2))
 }
@@ -135,15 +141,16 @@ func joinFields(fields []string, w int) string {
 }
 
 func containerReadyCount(r podRow) (ready, total int) {
+	total = len(r.Containers)
+	if total == 0 {
+		total = len(r.ContainerInfo)
+	}
 	for _, ci := range r.ContainerInfo {
-		total++
-		if ci.Ready {
+		if ci.Ready && (len(r.Containers) == 0 || slices.Contains(r.Containers, ci.Name)) {
 			ready++
 		}
 	}
-	if total == 0 {
-		total = len(r.Containers)
-	}
+
 	return ready, total
 }
 
@@ -199,7 +206,7 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 			state:         state,
 			restarts:      fmt.Sprintf("%d", ci.Restarts),
 			mem:           containerMemCell(ci, r, th),
-			image:         shortImage(ci.Image),
+			image:         shortImage(cleanDetail(ci.Image)),
 			detail:        containerDetail(ci),
 			stateStyle:    style,
 			restartsStyle: restartStyle(ci.Restarts, th),
@@ -212,56 +219,55 @@ func (m Model) renderDashContainers(r podRow, w, h, scroll int) string {
 		add(ci, false)
 	}
 
-	var cw []int
-	var lines []string
+	for _, name := range r.Containers {
+		found := false
+		for _, ci := range r.ContainerInfo {
+			if ci.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			add(cluster.ContainerInfo{Name: name, State: cluster.ContainerWaiting, Reason: "pending"}, false)
+		}
+	}
 	if len(rows) == 0 {
-		// Before kubelet reports any status the pod still has spec
-		// container names — show those rather than an empty pane, so
-		// a freshly-scheduled pod doesn't look broken.
-		if len(r.Containers) == 0 {
-			return dashPaneBody([]string{" " + th.Dim.Render("no containers reported")}, w, h, 0)
-		}
-		cw = fitColumns(dashContainerColumns, w-1)
-		for _, name := range r.Containers {
-			lines = append(lines, " "+joinCells(
-				padCol(name, cw[0], th.Base),
-				padCol("pending", cw[1], th.Dim),
-			))
-		}
-	} else {
-		// fitColumns grows every column toward its max round-robin,
-		// so NAME and STATE would spend the pane's spare width on
-		// blank padding whenever their content is short, while IMAGE
-		// — the one column that routinely overflows — stays starved.
-		// Clamp each max to the widest actual cell first; the width
-		// those columns don't need flows to IMAGE.
-		var nameW, stateW, restartsW, memW int
-		for _, rw := range rows {
-			nameW = max(nameW, lipgloss.Width(rw.name))
-			stateW = max(stateW, lipgloss.Width(rw.state))
-			restartsW = max(restartsW, lipgloss.Width(rw.restarts))
-			memW = max(memW, lipgloss.Width(rw.mem))
-		}
-		cols := append([]column(nil), dashContainerColumns...)
-		for i, want := range []int{nameW, stateW, restartsW, memW} {
-			if want = max(want, cols[i].min); want < cols[i].max {
-				cols[i].max = want
-			}
-		}
-		cw = fitColumns(cols, w-1)
+		return dashPaneBody([]string{" " + th.Dim.Render("no containers reported")}, w, h, 0)
+	}
+	var lines []string
 
-		for _, rw := range rows {
-			lines = append(lines, " "+joinCells(
-				padCol(rw.name, cw[0], th.Base),
-				padCol(rw.state, cw[1], rw.stateStyle),
-				padColRight(rw.restarts, cw[2], rw.restartsStyle),
-				padCellANSIRight(rw.mem, cw[3]),
-				padCol(truncateHead(rw.image, cw[4]), cw[4], th.Dim),
-			))
-			if rw.detail != "" {
-				lines = append(lines, " "+th.Dim.Render("  └ ")+
-					th.StatusBad.Render(truncate(rw.detail, w-5)))
-			}
+	// fitColumns grows every column toward its max round-robin,
+	// so NAME and STATE would spend the pane's spare width on
+	// blank padding whenever their content is short, while IMAGE
+	// — the one column that routinely overflows — stays starved.
+	// Clamp each max to the widest actual cell first; the width
+	// those columns don't need flows to IMAGE.
+	var nameW, stateW, restartsW, memW int
+	for _, rw := range rows {
+		nameW = max(nameW, lipgloss.Width(rw.name))
+		stateW = max(stateW, lipgloss.Width(rw.state))
+		restartsW = max(restartsW, lipgloss.Width(rw.restarts))
+		memW = max(memW, lipgloss.Width(rw.mem))
+	}
+	cols := append([]column(nil), dashContainerColumns...)
+	for i, want := range []int{nameW, stateW, restartsW, memW} {
+		if want = max(want, cols[i].min); want < cols[i].max {
+			cols[i].max = want
+		}
+	}
+	cw := fitColumns(cols, w-1)
+
+	for _, rw := range rows {
+		lines = append(lines, " "+joinCells(
+			padCol(rw.name, cw[0], th.Base),
+			padCol(rw.state, cw[1], rw.stateStyle),
+			padColRight(rw.restarts, cw[2], rw.restartsStyle),
+			padCellANSIRight(rw.mem, cw[3]),
+			padCol(truncateHead(rw.image, cw[4]), cw[4], th.Dim),
+		))
+		if rw.detail != "" {
+			lines = append(lines, " "+th.Dim.Render("  └ ")+
+				th.StatusBad.Render(truncate(rw.detail, w-5)))
 		}
 	}
 
@@ -313,17 +319,17 @@ func containerStateLabel(ci cluster.ContainerInfo, th Theme) (string, lipgloss.S
 		return "Running", th.StatusOK
 	case cluster.ContainerError:
 		if ci.Reason != "" {
-			return ci.Reason, th.StatusBad
+			return cleanDetail(ci.Reason), th.StatusBad
 		}
 		return "Error", th.StatusBad
 	case cluster.ContainerTerminated:
 		if ci.Reason != "" {
-			return ci.Reason, th.StatusDim
+			return cleanDetail(ci.Reason), th.StatusDim
 		}
 		return "Terminated", th.StatusDim
 	}
 	if ci.Reason != "" {
-		return ci.Reason, th.StatusWrn
+		return cleanDetail(ci.Reason), th.StatusWrn
 	}
 	return "Waiting", th.StatusWrn
 }
@@ -414,14 +420,14 @@ func (m Model) renderDashEvents(events []eventRow, w, h, scroll int, withObject 
 		}
 		cells := []string{
 			padCol(formatAge(e.LastSeen), cw[0], th.Dim),
-			padCol(shortEventType(e.Type), cw[1], typeStyle),
+			padCol(shortEventType(cleanDetail(e.Type)), cw[1], typeStyle),
 		}
 		if withObject {
-			cells = append(cells, padCol(e.InvolvedName, cw[2], th.Dim))
+			cells = append(cells, padCol(cleanDetail(e.InvolvedName), cw[2], th.Dim))
 		}
 		cells = append(cells,
-			padCol(e.Reason+count, cw[len(cw)-2], msgStyle),
-			padCol(oneLine(e.Message), cw[len(cw)-1], th.Base),
+			padCol(cleanDetail(e.Reason)+count, cw[len(cw)-2], msgStyle),
+			padCol(cleanDetail(e.Message), cw[len(cw)-1], th.Base),
 		)
 		lines = append(lines, " "+joinCells(cells...))
 	}
@@ -674,8 +680,14 @@ func (m Model) renderDashPods(pods []podRow, w, h, cursor int) string {
 	}
 	cw := fitColumns(dashPodColumns, w-1)
 
-	lines := make([]string, 0, len(pods))
-	for i, p := range pods {
+	start, end := 0, len(pods)
+	if h > 0 && h < end {
+		start = min(max(0, cursor-h/2), end-h)
+		end = start + h
+	}
+	lines := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		p := pods[i]
 		ready, total := containerReadyCount(p)
 		line := " " + joinCells(
 			padCol(p.Name, cw[0], th.Base),
@@ -694,23 +706,7 @@ func (m Model) renderDashPods(pods []podRow, w, h, cursor int) string {
 	if h <= 0 {
 		return strings.Join(lines, "\n")
 	}
-	return clampCanvas(strings.Join(windowAround(lines, cursor, h), "\n"), w, h)
-}
-
-// windowAround returns the h-row slice of lines that keeps index
-// cursor visible, centred where possible and clamped at both ends.
-func windowAround(lines []string, cursor, h int) []string {
-	if h >= len(lines) {
-		return lines
-	}
-	start := cursor - h/2
-	if start < 0 {
-		start = 0
-	}
-	if start+h > len(lines) {
-		start = len(lines) - h
-	}
-	return lines[start : start+h]
+	return clampCanvas(strings.Join(lines, "\n"), w, h)
 }
 
 // dashDeployEvents gathers the three event sources that matter for a
@@ -722,7 +718,12 @@ func (m Model) dashDeployEvents(d deploymentRow, owned []podRow) []eventRow {
 	for _, p := range owned {
 		podNames[p.Name] = struct{}{}
 	}
-	rsPrefix := d.Name + "-"
+	replicaSets := make(map[string]types.UID)
+	for _, rs := range m.replicaSets {
+		if rs.Namespace == d.Namespace && rs.DeploymentUID == d.UID {
+			replicaSets[rs.Name] = rs.UID
+		}
+	}
 
 	out := make([]eventRow, 0, 16)
 	for _, e := range m.events {
@@ -735,7 +736,7 @@ func (m Model) dashDeployEvents(d deploymentRow, owned []podRow) []eventRow {
 				out = append(out, e)
 			}
 		case "ReplicaSet":
-			if strings.HasPrefix(e.InvolvedName, rsPrefix) {
+			if uid, ok := replicaSets[e.InvolvedName]; ok && (e.InvolvedUID == "" || e.InvolvedUID == uid) {
 				out = append(out, e)
 			}
 		case "Pod":

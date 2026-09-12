@@ -44,6 +44,7 @@ type eventRow struct {
 	Count        int32
 	FirstSeen    time.Time
 	LastSeen     time.Time
+	InvolvedUID  types.UID
 	InvolvedKind string
 	InvolvedName string
 	InvolvedNs   string
@@ -92,6 +93,7 @@ func applyEvtEvent(m map[types.UID]eventRow, ev cluster.EventEvent) {
 			Count:        ev.Count,
 			FirstSeen:    ev.FirstSeen,
 			LastSeen:     ev.LastSeen,
+			InvolvedUID:  ev.InvolvedUID,
 			InvolvedKind: ev.InvolvedKind,
 			InvolvedName: ev.InvolvedName,
 			InvolvedNs:   ev.InvolvedNs,

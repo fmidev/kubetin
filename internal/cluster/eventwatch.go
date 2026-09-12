@@ -36,6 +36,7 @@ type EventEvent struct {
 	Count        int32
 	FirstSeen    time.Time
 	LastSeen     time.Time
+	InvolvedUID  types.UID
 	InvolvedKind string
 	InvolvedName string
 	InvolvedNs   string
@@ -136,6 +137,7 @@ func (w *EventWatcher) emit(kind EvtKind, obj any) {
 		Count:        count,
 		FirstSeen:    first,
 		LastSeen:     last,
+		InvolvedUID:  e.InvolvedObject.UID,
 		InvolvedKind: e.InvolvedObject.Kind,
 		InvolvedName: e.InvolvedObject.Name,
 		InvolvedNs:   e.InvolvedObject.Namespace,

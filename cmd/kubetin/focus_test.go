@@ -120,6 +120,11 @@ func TestWatchForwardersCarryFocusGeneration(t *testing.T) {
 			w.Out <- cluster.DeployEvent{Context: "alpha"}
 			forwardDeployEvents(ctx, w, sender, focus)
 		}},
+		{"replicasets", func(ctx context.Context, sender watchMessageSender) {
+			w := cluster.NewReplicaSetWatcher("alpha", 1)
+			w.Out <- cluster.ReplicaSetEvent{Context: "alpha"}
+			forwardReplicaSetEvents(ctx, w, sender, focus)
+		}},
 		{"events", func(ctx context.Context, sender watchMessageSender) {
 			w := cluster.NewEventWatcher("alpha", 1)
 			w.Out <- cluster.EventEvent{Context: "alpha"}
