@@ -20,6 +20,7 @@ const FocusedInterval = 15 * time.Second
 // PodMetric is the per-pod resource snapshot the UI renders.
 type PodMetric struct {
 	UID        types.UID
+	At         time.Time // metrics-server sample time, used to reject pre-creation samples
 	Namespace  string
 	Name       string
 	CPUMilli   int64 // sum of container usage.cpu (millicores)
@@ -140,6 +141,7 @@ func (p *FocusedMetricsPoller) tick(parent context.Context, mc *metricsclientset
 		}
 		snap.Pods = append(snap.Pods, PodMetric{
 			UID:        pm.UID,
+			At:         pm.Timestamp.Time,
 			Namespace:  pm.Namespace,
 			Name:       pm.Name,
 			CPUMilli:   cpu,

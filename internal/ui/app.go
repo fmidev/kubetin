@@ -212,6 +212,7 @@ type Model struct {
 	// "still syncing" from "synced with zero rows" — otherwise a Tab to
 	// a cluster with no pods looks identical to a stuck informer.
 	syncedPods, syncedNodes, syncedDeploys, syncedEvents, syncedNamespaces bool
+	podSyncDelayed                                                         bool
 	syncedServices, syncedIngresses                                        bool
 	syncStartedAt                                                          time.Time
 
@@ -226,6 +227,7 @@ type Model struct {
 	networkExpiresAt           time.Time
 	netHistory                 netRing
 	focusedMetrics             focusedMetricsState
+	podMetricCache             map[string]cluster.PodMetric
 	watchNamespace             string
 	restartBaseline            map[types.UID]int32 // first-seen restart count per pod, see noteRestartBaseline
 
@@ -351,6 +353,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ResourceBatchMsg:
 		var cmds []tea.Cmd
 		for _, event := range msg {
+			if pod, ok := event.(PodEventMsg); ok {
+				m.updatePod(pod)
+				continue
+			}
 			updated, cmd := m.Update(FocusedMsg{Focus: m.Focus(), Msg: event})
 			m = updated.(Model)
 			if cmd != nil {
@@ -418,38 +424,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case PodEventMsg:
-		// Drop events from a context the user isn't focused on. Old
-		// watchers can keep flushing buffered events past their cancel
-		// (forwarder select is pseudo-random, 256-cap channels), and
-		// without this guard the new cluster's m.pods inherits foreign
-		// UIDs that never receive a matching DELETE.
-		if msg.Context != m.WatchedContext {
-			return m, nil
-		}
-		if msg.Kind == cluster.PodSynced {
-			m.syncedPods = true
-			m.watchNamespace = msg.WatchNamespace
-			return m, nil
-		}
-		noteRestartBaseline(m.restartBaseline, msg.UID, msg.Restarts, msg.Kind == cluster.PodDeleted)
-		before, existed := m.pods[msg.UID]
-		applyPodEvent(m.pods, cluster.PodEvent(msg))
-		after, exists := m.pods[msg.UID]
-		m.invalidatePodOrder(before, after)
-		if existed != exists || before.Phase != after.Phase {
-			m.tables.phasesValid = false
-		}
-		if existed != exists || before.Namespace != after.Namespace {
-			m.invalidateTables(ViewNamespaces)
-			m.tables.nsCounts = nil
-		}
-		// Guard cursor wipe to ViewPods only — non-pod views park the
-		// cursor on a non-pod UID that will never appear in m.pods,
-		// and without the view guard every pod event nukes the cursor
-		// (and the action menu surface alongside it).
-		if _, ok := m.pods[m.cursor]; !ok && m.view == ViewPods {
-			m.cursor = ""
-		}
+		m.updatePod(msg)
 		return m, nil
 
 	case NodeEventMsg:
@@ -761,10 +736,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for uid, row := range m.pods {
 			before := row
 			if pm, ok := pmByKey[row.Namespace+"/"+row.Name]; ok {
-				row.CPUMilli = pm.CPUMilli
-				row.MemBytes = pm.MemBytes
-				row.ContainerMemBytes = containerMemByName(pm.Containers)
-				row.HasMetrics = true
+				setPodMetric(&row, pm)
 			} else {
 				row.HasMetrics = false
 				row.ContainerMemBytes = nil
@@ -772,6 +744,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pods[uid] = row
 			m.invalidatePodOrder(before, row)
 		}
+		m.podMetricCache = pmByKey
 		nmByName := make(map[string]cluster.NodeMetric, len(msg.Nodes))
 		for _, nm := range msg.Nodes {
 			nmByName[nm.Name] = nm
@@ -816,6 +789,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickCmd()
 	}
 	return m, nil
+}
+
+func (m *Model) updatePod(msg PodEventMsg) {
+	// Drop events from a context the user isn't focused on. Old
+	// watchers can keep flushing buffered events past their cancel
+	// (forwarder select is pseudo-random, 256-cap channels), and
+	// without this guard the new cluster's m.pods inherits foreign
+	// UIDs that never receive a matching DELETE.
+	if msg.Context != m.WatchedContext {
+		return
+	}
+	if msg.Kind == cluster.PodSynced {
+		m.syncedPods = true
+		m.podSyncDelayed = false
+		m.watchNamespace = msg.WatchNamespace
+		return
+	}
+	if msg.Kind == cluster.PodSyncDelayed {
+		m.podSyncDelayed = true
+		return
+	}
+	noteRestartBaseline(m.restartBaseline, msg.UID, msg.Restarts, msg.Kind == cluster.PodDeleted)
+	before, existed := m.pods[msg.UID]
+	applyPodEvent(m.pods, cluster.PodEvent(msg))
+	after, exists := m.pods[msg.UID]
+	if exists && !existed {
+		m.applyPendingPodMetric(&after)
+		m.pods[msg.UID] = after
+	}
+	if !exists {
+		delete(m.podMetricCache, before.Namespace+"/"+before.Name)
+	}
+	m.invalidatePodOrder(before, after)
+	if existed != exists || before.Phase != after.Phase {
+		m.tables.phasesValid = false
+	}
+	if existed != exists || before.Namespace != after.Namespace {
+		m.invalidateTables(ViewNamespaces)
+		m.tables.nsCounts = nil
+	}
+	// Guard cursor wipe to ViewPods only — non-pod views park the
+	// cursor on a non-pod UID that will never appear in m.pods,
+	// and without the view guard every pod event nukes the cursor
+	// (and the action menu surface alongside it).
+	if _, ok := m.pods[m.cursor]; !ok && m.view == ViewPods {
+		m.cursor = ""
+	}
 }
 
 func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1803,26 +1823,7 @@ func (m Model) buildTableUIDs(view View) []types.UID {
 		return out
 
 	}
-	rows := m.visibleRows()
-	out := make([]types.UID, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.UID)
-	}
-	return out
-}
-
-// visibleRows applies the active namespace + text filter to the
-// sorted pod rows. Text filter matches namespace and name (case-insensitive).
-func (m Model) visibleRows() []podRow {
-	rows := sortedRows(m.pods, m.sortKey, m.sortDesc)
-	needle := strings.ToLower(m.filterText)
-	out := make([]podRow, 0, len(rows))
-	for _, r := range rows {
-		if matchesNames(r.Namespace, r.Name, m.namespace, needle) {
-			out = append(out, r)
-		}
-	}
-	return out
+	return sortedPodUIDs(m.pods, m.sortKey, m.sortDesc, m.namespace, needle)
 }
 
 func (m Model) renderHeader() string {
@@ -1879,7 +1880,7 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 		total = len(m.ingresses)
 	}
 	title := m.Theme.Title.Render(
-		fmt.Sprintf(" kubetin %s · ns:%s · %s ", strings.TrimSpace(display), ns, viewLabel),
+		fmt.Sprintf(" kubetin %s · ns:%s · %s ", cleanDetail(display), cleanDetail(ns), viewLabel),
 	)
 
 	visible, _ := m.filterCounts()
@@ -1927,7 +1928,7 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 			nodeStr = fmt.Sprintf("nodes %d", st.NodeCount)
 		}
 	}
-	verStr := shortVersion(st.ServerVersion)
+	verStr := shortVersion(cleanDetail(st.ServerVersion))
 	if verStr == "" {
 		verStr = "—"
 	}
@@ -2087,6 +2088,9 @@ var podColumns = []column{
 }
 
 func (m Model) renderTable(maxRows int, maxWidth int) string {
+	if m.podSyncDelayed {
+		maxRows--
+	}
 	rows := rowsForUIDs(m.pods, m.windowUIDs(ViewPods, maxRows))
 
 	// maxWidth-1: the warn-glyph column prefixes every line.
@@ -2129,9 +2133,15 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteByte('\n')
+	if m.podSyncDelayed {
+		b.WriteString(m.Theme.StatusWrn.Render(" initial pod sync delayed; retrying…"))
+		b.WriteByte('\n')
+	}
 
 	if m.tableCount(ViewPods) == 0 {
-		b.WriteString(m.emptyPlaceholder(m.syncedPods, "pods"))
+		if !m.podSyncDelayed {
+			b.WriteString(m.emptyPlaceholder(m.syncedPods, "pods"))
+		}
 		return b.String()
 	}
 

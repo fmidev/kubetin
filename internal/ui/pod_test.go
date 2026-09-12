@@ -23,6 +23,10 @@ func makePods() map[types.UID]podRow {
 	}
 }
 
+func sortedRows(pods map[types.UID]podRow, key SortKey, desc bool) []podRow {
+	return rowsForUIDs(pods, sortedPodUIDs(pods, key, desc, "", ""))
+}
+
 // TestSortedRows_Stable ensures the sort yields identical ordering
 // across repeated calls regardless of map iteration order. We run
 // it many times to make accidental shuffles surface.

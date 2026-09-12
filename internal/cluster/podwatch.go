@@ -20,7 +20,10 @@ const (
 	PodUpdated
 	PodDeleted
 	PodSynced
+	PodSyncDelayed
 )
+
+var podSyncTimeout = 30 * time.Second
 
 // ContainerState is a coarse-grained classification of a single
 // container's status, mapped to one of four colours in the UI. We
@@ -204,23 +207,38 @@ func (w *PodWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	// Bound the wait so a stuck list-watch (RBAC, network) is
 	// surfaced quickly instead of hanging the watcher silently for
 	// the default 5 minutes.
-	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer syncCancel()
+	syncCtx, syncCancel := context.WithTimeout(ctx, podSyncTimeout)
 	synced := cache.WaitForCacheSync(syncCtx.Done(), handler.HasSynced)
+	syncCancel()
 	if !synced {
 		if ctx.Err() != nil {
 			return nil
 		}
-		klog.Errorf("podwatch[%s]: cache sync timed out after 30s", w.Context)
-		return fmt.Errorf("pod cache sync timed out (30s) — RBAC or network")
+		klog.Warningf("podwatch[%s]: initial cache sync delayed; retrying", w.Context)
+		w.emitSync(PodSyncDelayed, scope)
+		// The reflector already retries with backoff. Keep it alive so
+		// a temporary startup failure can recover without a focus switch.
+		if !cache.WaitForCacheSync(ctx.Done(), handler.HasSynced) {
+			return nil
+		}
 	}
 	klog.Infof("podwatch[%s]: synced, %d initial pods", w.Context, len(informer.GetStore().List()))
 
 	// The empty UID is reserved for this ordered cache-completion marker.
-	w.publish("", PodEvent{Kind: PodSynced, Context: w.Context, WatchNamespace: scope}, false)
+	w.emitSync(PodSynced, scope)
 
 	<-ctx.Done()
 	return nil
+}
+
+func (w *PodWatcher) emitSync(kind PodEventKind, scope string) {
+	key := types.UID("")
+	if kind == PodSyncDelayed {
+		// Coalescing this with completion could move PodSynced ahead
+		// of queued initial pod events.
+		key = "\x00pod-sync-delayed"
+	}
+	w.publish(key, PodEvent{Kind: kind, Context: w.Context, WatchNamespace: scope}, false)
 }
 
 func (w *PodWatcher) emit(kind PodEventKind, obj any) {
