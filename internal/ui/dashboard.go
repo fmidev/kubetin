@@ -174,6 +174,10 @@ func podRefFor(p podRow) cluster.DescribeRef {
 // pods/log — firing a request we know the apiserver will refuse just
 // trades a live pane for an error pane.
 func (m *Model) startDashboardLogs() tea.Cmd {
+	return m.startDashboardLogsTail(m.logTail())
+}
+
+func (m *Model) startDashboardLogsTail(tail int) tea.Cmd {
 	ref := m.dashboard.logRef
 	if ref.Name == "" {
 		m.resetDashboardLogs("no pod available to stream logs from")
@@ -187,7 +191,7 @@ func (m *Model) startDashboardLogs() tea.Cmd {
 	if m.dashboard.containerI < len(m.dashboard.containers) {
 		container = m.dashboard.containers[m.dashboard.containerI]
 	}
-	return m.beginLogStream(ref, container)
+	return m.beginLogStreamTail(ref, container, tail)
 }
 
 func (m *Model) resetDashboardLogs(err string) {
@@ -199,10 +203,17 @@ func (m *Model) resetDashboardLogs(err string) {
 	m.recomputeLogsMatches()
 }
 
-// Resolve only an empty target: new replicas must not interrupt a selected stream.
+// Retry a failed initial request only when its selected container has started.
+// Established streams and their replica selection remain unchanged.
 func (m *Model) recoverDashboardLogs() tea.Cmd {
-	if !m.dashboard.open || m.dashboard.logRef.Name != "" {
+	if !m.dashboard.open {
 		return nil
+	}
+	if m.dashboard.logRef.Name != "" {
+		if !m.logs.retryWhenStarted || !m.logContainerStarted(m.logs.ref, m.logs.container) {
+			return nil
+		}
+		return m.startDashboardLogsTail(m.logs.tailOrDefault())
 	}
 	target, ok := m.dashboard.target()
 	if !ok || target.Ref.Kind != "Deployment" {
@@ -213,6 +224,20 @@ func (m *Model) recoverDashboardLogs() tea.Cmd {
 		return nil
 	}
 	return m.startDashboardLogs()
+}
+
+func (m Model) logContainerStarted(ref cluster.DescribeRef, container string) bool {
+	pod, ok := m.pods[ref.UID]
+	if !ok {
+		return false
+	}
+	for _, ci := range pod.ContainerInfo {
+		if ci.Name != container {
+			continue
+		}
+		return ci.Running || ci.State == cluster.ContainerReady || ci.State == cluster.ContainerTerminated || ci.ExitCode != 0
+	}
+	return false
 }
 
 // closeDashboard tears down the whole stack and stops the stream.
@@ -239,6 +264,7 @@ func (m Model) popDashboard() (tea.Model, tea.Cmd) {
 func (m *Model) stopDashboardLogs() tea.Cmd {
 	m.logs.session++
 	m.logs.streaming = false
+	m.logs.retryWhenStarted = false
 	if m.logs.cancel != nil {
 		m.logs.cancel()
 		m.logs.cancel = nil

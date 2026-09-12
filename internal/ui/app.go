@@ -706,7 +706,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.logs.err = msg.Err
 		m.logs.reconnecting = false
-		return m, nil
+		m.logs.retryWhenStarted = msg.retryWhenStarted
+		cmd := m.recoverDashboardLogs()
+		return m, cmd
 	case LogEOSMsg:
 		if msg.Session != m.logs.session {
 			return m, nil

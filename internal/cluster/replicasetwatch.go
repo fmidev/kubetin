@@ -13,6 +13,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+var replicaSetSyncTimeout = 30 * time.Second
+
 // ReplicaSetEventKind classifies a ReplicaSet cache event.
 type ReplicaSetEventKind uint8
 
@@ -79,14 +81,18 @@ func (w *ReplicaSetWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	klog.Infof("replicasetwatch[%s]: starting", w.Context)
 	factory.Start(ctx.Done())
 
-	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer syncCancel()
-	if !cache.WaitForCacheSync(syncCtx.Done(), handler.HasSynced) {
+	syncCtx, syncCancel := context.WithTimeout(ctx, replicaSetSyncTimeout)
+	synced := cache.WaitForCacheSync(syncCtx.Done(), handler.HasSynced)
+	syncCancel()
+	if !synced {
 		if ctx.Err() != nil {
 			return nil
 		}
-		klog.Errorf("replicasetwatch[%s]: cache sync timed out after 30s", w.Context)
-		return fmt.Errorf("replicaset cache sync timed out (30s)")
+		klog.Warningf("replicasetwatch[%s]: initial cache sync delayed; retrying", w.Context)
+		// Let the reflector's backoff recover without canceling its watch context.
+		if !cache.WaitForCacheSync(ctx.Done(), handler.HasSynced) {
+			return nil
+		}
 	}
 	klog.Infof("replicasetwatch[%s]: synced, %d initial replicasets", w.Context, len(informer.GetStore().List()))
 

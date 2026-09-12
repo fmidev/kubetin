@@ -57,6 +57,7 @@ type ContainerInfo struct {
 	Name     string
 	Image    string
 	Ready    bool
+	Running  bool
 	State    ContainerState
 	Restarts int32
 	// Reason is kubelet's waiting/terminated reason
@@ -302,6 +303,7 @@ func projectContainerInfo(statuses []corev1.ContainerStatus, memLimits map[strin
 			Name:          cs.Name,
 			Image:         cs.Image,
 			Ready:         cs.Ready,
+			Running:       cs.State.Running != nil,
 			State:         projectContainerState(cs),
 			Restarts:      cs.RestartCount,
 			MemLimitBytes: memLimits[cs.Name],
