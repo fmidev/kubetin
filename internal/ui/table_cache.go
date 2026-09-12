@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +20,7 @@ type tableOrder struct {
 	key        tableKey
 	valid      bool
 	uids       []types.UID
+	dirty      map[types.UID]struct{}
 	countKey   tableKey
 	countValid bool
 	count      int
@@ -48,15 +50,21 @@ func (m Model) invalidatePodOrder(before, after podRow) {
 		m.tables.dashboardPods = dashboardPodOrder{}
 	}
 	entry := &m.tables.orders[ViewPods]
-	if before.UID != after.UID || before.Namespace != after.Namespace || before.Name != after.Name {
-		*entry = tableOrder{}
-		return
+	identityChanged := before.UID != after.UID || before.Namespace != after.Namespace || before.Name != after.Name
+	if identityChanged {
+		entry.countValid = false
 	}
 	if entry.valid {
 		key := SortKey(entry.key.sort)
-		if lessBy(before, after, key) || lessBy(after, before, key) {
-			entry.valid = false
-			entry.uids = nil
+		if identityChanged || lessBy(before, after, key) || lessBy(after, before, key) {
+			if entry.dirty == nil {
+				entry.dirty = make(map[types.UID]struct{})
+			}
+			for _, uid := range []types.UID{before.UID, after.UID} {
+				if uid != "" {
+					entry.dirty[uid] = struct{}{}
+				}
+			}
 		}
 	}
 }
@@ -85,12 +93,46 @@ func (m Model) tableKey(view View) tableKey {
 func (m Model) tableUIDs(view View) []types.UID {
 	entry := &m.tables.orders[view]
 	key := m.tableKey(view)
-	if !entry.valid || entry.key != key {
-		entry.uids = m.buildTableUIDs(view)
+	if !entry.valid || entry.key != key || len(entry.dirty) > 0 {
+		oldKey := entry.key
+		oldKey.size = key.size
+		if view == ViewPods && entry.valid && oldKey == key && len(entry.dirty) > 0 {
+			entry.uids = m.mergePodOrder(entry, key)
+		} else {
+			entry.uids = m.buildTableUIDs(view)
+		}
+		entry.dirty = nil
 		entry.key, entry.valid = key, true
 		entry.countKey, entry.countValid, entry.count = key, true, len(entry.uids)
 	}
 	return entry.uids
+}
+
+// Only changed IDs need sorting after a watch batch. Merge them into
+// the unchanged order rather than sorting every pod again during startup.
+func (m Model) mergePodOrder(entry *tableOrder, key tableKey) []types.UID {
+	changed := make([]types.UID, 0, len(entry.dirty))
+	needle := strings.ToLower(key.filter)
+	for uid := range entry.dirty {
+		if p, ok := m.pods[uid]; ok && matchesNames(p.Namespace, p.Name, key.namespace, needle) {
+			changed = append(changed, uid)
+		}
+	}
+	less := func(a, b types.UID) bool { return lessPodUID(m.pods, a, b, SortKey(key.sort), key.desc) }
+	sort.Slice(changed, func(i, j int) bool { return less(changed[i], changed[j]) })
+	out := make([]types.UID, 0, len(entry.uids)+len(changed))
+	j := 0
+	for _, uid := range entry.uids {
+		if _, dirty := entry.dirty[uid]; dirty {
+			continue
+		}
+		for j < len(changed) && less(changed[j], uid) {
+			out = append(out, changed[j])
+			j++
+		}
+		out = append(out, uid)
+	}
+	return append(out, changed[j:]...)
 }
 
 // Counts in the header must not sort a hidden table when an overlay is open.
@@ -148,7 +190,7 @@ func rowsForUIDs[T any](rows map[types.UID]T, ids []types.UID) []T {
 }
 
 func (m Model) windowUIDs(view View, maxRows int) []types.UID {
-	if maxRows == 1 {
+	if maxRows <= 1 {
 		return nil
 	}
 	return windowRows(m.tableUIDs(view), m.cursor, maxRows, func(id types.UID) types.UID { return id })

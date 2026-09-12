@@ -215,6 +215,37 @@ func containerMemByName(cms []cluster.ContainerMetric) map[string]int64 {
 	return out
 }
 
+func setPodMetric(row *podRow, metric cluster.PodMetric) {
+	row.CPUMilli, row.MemBytes = metric.CPUMilli, metric.MemBytes
+	row.ContainerMemBytes = containerMemByName(metric.Containers)
+	row.HasMetrics = true
+}
+
+func (m Model) applyPendingPodMetric(row *podRow) {
+	key := row.Namespace + "/" + row.Name
+	metric, ok := m.podMetricCache[key]
+	delete(m.podMetricCache, key)
+	if !ok || m.focusedMetrics.at.IsZero() || time.Since(m.focusedMetrics.at) > 2*cluster.FocusedInterval {
+		return
+	}
+	if !metric.At.IsZero() && time.Since(metric.At) > 2*cluster.FocusedInterval {
+		return
+	}
+	// A name may now refer to a replacement pod. Metrics resource UIDs
+	// do not identify source pods, so never replay a pre-creation sample.
+	if !row.CreatedAt.IsZero() && (metric.At.IsZero() || metric.At.Before(row.CreatedAt)) {
+		return
+	}
+	setPodMetric(row, metric)
+}
+
+func podMetricSortValue(value int64, available bool) int64 {
+	if !available {
+		return -1
+	}
+	return value
+}
+
 // podContainerDots draws one square dot per container with a single
 // blank cell between them so each container reads as a distinct box,
 // the way Lens renders the column. Order is preserved (apiserver
@@ -327,21 +358,24 @@ func formatAge(t time.Time) string {
 	}
 }
 
-// sortedRows returns rows ordered by key, reversed if desc. lessBy
-// always produces a strict total order (UID as final tiebreaker), so
-// rows never shuffle just because the informer fired an UPDATE.
-func sortedRows(m map[types.UID]podRow, key SortKey, desc bool) []podRow {
-	out := make([]podRow, 0, len(m))
-	for _, r := range m {
-		out = append(out, r)
+func sortedPodUIDs(rows map[types.UID]podRow, key SortKey, desc bool, namespace, needle string) []types.UID {
+	out := make([]types.UID, 0, len(rows))
+	for uid, r := range rows {
+		if matchesNames(r.Namespace, r.Name, namespace, needle) {
+			out = append(out, uid)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if desc {
-			return lessBy(out[j], out[i], key)
-		}
-		return lessBy(out[i], out[j], key)
+		return lessPodUID(rows, out[i], out[j], key, desc)
 	})
 	return out
+}
+
+func lessPodUID(rows map[types.UID]podRow, a, b types.UID, key SortKey, desc bool) bool {
+	if desc {
+		a, b = b, a
+	}
+	return lessBy(rows[a], rows[b], key)
 }
 
 // lessBy compares two pods by the active sort key, then falls
@@ -366,12 +400,12 @@ func lessBy(a, b podRow, k SortKey) bool {
 			return a.Restarts < b.Restarts
 		}
 	case SortCPU:
-		if a.CPUMilli != b.CPUMilli {
-			return a.CPUMilli < b.CPUMilli
+		if av, bv := podMetricSortValue(a.CPUMilli, a.HasMetrics), podMetricSortValue(b.CPUMilli, b.HasMetrics); av != bv {
+			return av < bv
 		}
 	case SortMem:
-		if a.MemBytes != b.MemBytes {
-			return a.MemBytes < b.MemBytes
+		if av, bv := podMetricSortValue(a.MemBytes, a.HasMetrics), podMetricSortValue(b.MemBytes, b.HasMetrics); av != bv {
+			return av < bv
 		}
 	case SortMemPct:
 		if ap, bp := memPctSortValue(a), memPctSortValue(b); ap != bp {

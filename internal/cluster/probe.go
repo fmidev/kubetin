@@ -67,10 +67,20 @@ type Supervisor struct {
 	// the user is namespace-restricted and watchers must scope there.
 	// Resolved lazily by ResolveScope and reused by every watcher and
 	// the probe itself.
-	scopes sync.Map // ctxName -> string
-	// scopeMu serialises concurrent ResolveScope calls per context so
-	// six watchers spinning up at once don't all fire the same probe.
-	scopeMu sync.Map // ctxName -> *sync.Mutex
+	scopes     sync.Map // ctxName -> string
+	scopeCalls sync.Map // ctxName -> *scopeCall
+}
+
+type scopeCall struct {
+	done chan struct{}
+	ns   string
+}
+
+func (s *Supervisor) scopeHint(ctxName string) string {
+	if src, ok := s.sourceFor(ctxName); ok {
+		return src.Namespace
+	}
+	return ""
 }
 
 // contextSource pairs a kubeconfig file with the raw context name to
@@ -124,28 +134,42 @@ func (s *Supervisor) ResolveScope(ctx context.Context, ctxName string, cs *kuber
 	if v, ok := s.scopes.Load(ctxName); ok {
 		return v.(string)
 	}
-	muV, _ := s.scopeMu.LoadOrStore(ctxName, &sync.Mutex{})
-	mu := muV.(*sync.Mutex)
-	mu.Lock()
-	defer mu.Unlock()
-	if v, ok := s.scopes.Load(ctxName); ok {
-		return v.(string)
+	if ctx.Err() != nil {
+		return s.scopeHint(ctxName)
 	}
-	ns, definitive := s.resolveScopeNow(ctx, ctxName, cs)
-	if definitive {
-		s.scopes.Store(ctxName, ns)
+	candidate := &scopeCall{done: make(chan struct{})}
+	actual, loaded := s.scopeCalls.LoadOrStore(ctxName, candidate)
+	call := actual.(*scopeCall)
+	if !loaded {
+		// One caller leaving must not cancel the check for other watchers.
+		// The shared request has its own deadline; callers can stop waiting.
+		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ProbeTimeout)
+		go func() {
+			defer cancel()
+			if v, ok := s.scopes.Load(ctxName); ok {
+				call.ns = v.(string)
+			} else {
+				var definitive bool
+				call.ns, definitive = s.resolveScopeNow(probeCtx, ctxName, cs)
+				if definitive {
+					s.scopes.Store(ctxName, call.ns)
+				}
+			}
+			s.scopeCalls.Delete(ctxName)
+			close(call.done)
+		}()
 	}
-	return ns
+	select {
+	case <-ctx.Done():
+		return s.scopeHint(ctxName)
+	case <-call.done:
+		return call.ns
+	}
 }
 
-func (s *Supervisor) resolveScopeNow(parent context.Context, ctxName string, cs *kubernetes.Clientset) (string, bool) {
-	hint := ""
-	if src, ok := s.sourceFor(ctxName); ok {
-		hint = src.Namespace
-	}
-	probeCtx, cancel := context.WithTimeout(parent, ProbeTimeout)
-	defer cancel()
-	_, err := cs.CoreV1().Pods("").List(probeCtx, metav1.ListOptions{Limit: 1, ResourceVersion: "0"})
+func (s *Supervisor) resolveScopeNow(ctx context.Context, ctxName string, cs *kubernetes.Clientset) (string, bool) {
+	hint := s.scopeHint(ctxName)
+	_, err := cs.CoreV1().Pods("").List(ctx, metav1.ListOptions{Limit: 1, ResourceVersion: "0"})
 	if err == nil {
 		return "", true
 	}
@@ -334,7 +358,7 @@ func (s *Supervisor) probeOnce(parent context.Context, ctxName string) {
 	// this before deciding to skip the node probe — the kubeconfig's
 	// namespace hint alone is unreliable (microk8s pins "default"
 	// even for cluster-admins).
-	// No wrapper deadline: resolveScopeNow applies its own ProbeTimeout,
+	// No wrapper deadline: ResolveScope applies its own ProbeTimeout,
 	// which is what every watcher already relies on.
 	scopedNS := s.ResolveScope(parent, ctxName, clientset)
 	var res nodeProbeResult

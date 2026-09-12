@@ -1009,7 +1009,7 @@ func consumePodEvents(ctx context.Context, w *cluster.PodWatcher, count *atomic.
 		case <-ctx.Done():
 			return
 		case ev := <-w.Out:
-			if ev.Kind == cluster.PodSynced {
+			if ev.Kind == cluster.PodSynced || ev.Kind == cluster.PodSyncDelayed {
 				continue
 			}
 			if ev.Kind == cluster.PodDeleted {

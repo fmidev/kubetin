@@ -68,6 +68,7 @@ func (m *Model) clearFocusedState() {
 	m.cursor = ""
 	m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents, m.syncedNamespaces = false, false, false, false, false
 	m.syncedServices, m.syncedIngresses = false, false
+	m.podSyncDelayed = false
 	m.syncStartedAt = time.Now()
 	m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
 	m.clusterNetCoverage = ""
@@ -75,6 +76,7 @@ func (m *Model) clearFocusedState() {
 	m.clusterNetStatus = ""
 	m.netHistory = netRing{}
 	m.focusedMetrics = focusedMetricsState{}
+	m.podMetricCache = nil
 	m.watchNamespace = ""
 	m.restartBaseline = make(map[types.UID]int32)
 	m.permissions = make(map[string]permState)

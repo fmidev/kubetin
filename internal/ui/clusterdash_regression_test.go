@@ -69,8 +69,8 @@ func TestDashboardRankingsFollowMetricsAndIdentity(t *testing.T) {
 func TestScopedGaugeDistinguishesMissingPartialAndZero(t *testing.T) {
 	m := New("alpha", model.NewStore(), nil)
 	apply := func(msg tea.Msg) { next, _ := m.Update(msg); m = next.(Model) }
-	// The poller can beat the informer's first object to the UI.
-	apply(MetricsSnapshotMsg{Context: "alpha", OK: true, At: time.Now(), Pods: []cluster.PodMetric{{Namespace: "prod", Name: "api", CPUMilli: 500}}})
+	// A successful snapshot need not contain a reading for this pod.
+	apply(MetricsSnapshotMsg{Context: "alpha", OK: true, At: time.Now(), Pods: []cluster.PodMetric{{Namespace: "prod", Name: "unrelated", CPUMilli: 500}}})
 	apply(PodEventMsg{Context: "alpha", UID: "p", Namespace: "prod", Name: "api"})
 	apply(PodEventMsg{Context: "alpha", Kind: cluster.PodSynced, WatchNamespace: "prod"})
 	gauge := func() string {
