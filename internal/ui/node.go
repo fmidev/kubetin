@@ -218,21 +218,9 @@ var nodeColumns = []column{
 	{min: 22, max: 22, prio: 11}, // CONTAINER-RUNTIME
 }
 
-// renderNodeTable mirrors renderTable() for nodes. Nodes have lower
-// cardinality than pods (typically 1–50) so we don't bother with the
-// windowing logic — just clip to maxRows.
+// renderNodeTable mirrors renderTable() for nodes.
 func (m Model) renderNodeTable(maxRows, maxWidth int) string {
-	// Apply the same text filter visibleUIDs uses for the cursor —
-	// otherwise rows the cursor can't reach still appear.
-	all := sortedNodeRows(m.nodes)
-	needle := strings.ToLower(m.filterText)
-	rows := make([]nodeRow, 0, len(all))
-	for _, r := range all {
-		if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
-			continue
-		}
-		rows = append(rows, r)
-	}
+	rows := rowsForUIDs(m.nodes, m.windowUIDs(ViewNodes, maxRows))
 
 	w := fitColumns(nodeColumns, maxWidth-1)
 
@@ -256,41 +244,9 @@ func (m Model) renderNodeTable(maxRows, maxWidth int) string {
 	b.WriteString(header)
 	b.WriteByte('\n')
 
-	if len(rows) == 0 {
+	if m.tableCount(ViewNodes) == 0 {
 		b.WriteString(m.emptyPlaceholder(m.syncedNodes, "nodes"))
 		return b.String()
-	}
-
-	// Cursor-centred windowing — same shape as the pod and deploy
-	// tables. The original "nodes are 1-50, just clip" shortcut was
-	// wrong about its own threshold (default 24-row terminals fit
-	// ~18 rows after header/footer/sidebar) so cursor on a row past
-	// row 18 of a 25-node cluster was unreachable.
-	if maxRows > 0 && len(rows) > maxRows-1 {
-		idx := -1
-		for i, r := range rows {
-			if r.UID == m.cursor {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			idx = 0
-		}
-		half := (maxRows - 1) / 2
-		start := idx - half
-		if start < 0 {
-			start = 0
-		}
-		end := start + (maxRows - 1)
-		if end > len(rows) {
-			end = len(rows)
-			start = end - (maxRows - 1)
-			if start < 0 {
-				start = 0
-			}
-		}
-		rows = rows[start:end]
 	}
 
 	warnIdx := recentWarningIndex(m.events)

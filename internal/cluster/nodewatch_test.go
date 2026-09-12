@@ -9,7 +9,7 @@ import (
 )
 
 func TestNodeEmitProjectsAllocatable(t *testing.T) {
-	w := &NodeWatcher{Context: "alpha", Out: make(chan NodeEvent, 1)}
+	w := NewNodeWatcher("alpha", 1)
 	w.emit(NodeAdded, &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "n1", UID: "u1"},
 		Status: corev1.NodeStatus{

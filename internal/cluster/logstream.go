@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -43,9 +44,9 @@ type LogStreamer struct {
 }
 
 // maxConsecutiveStreamFailures bounds reconnect attempts. After this
-// many failures with no successful line read in between, the streamer
-// gives up and emits a fatal LogLine{Err}. Five attempts × ~1–5s
-// backoff ≈ 15s before falling back to "stream failed".
+// many failures with no new timestamped line read in between, the streamer
+// gives up and emits a fatal LogLine{Err}. Five retries add 15s of
+// backoff, excluding API request time.
 const maxConsecutiveStreamFailures = 5
 
 // StreamLogs starts a follow=true log stream against pod/container,
@@ -108,7 +109,8 @@ func runStream(parent context.Context, cs *kubernetes.Clientset, ls *LogStreamer
 		ls.Context, namespace, pod, container, tailLines)
 
 	stream := initial
-	sinceTime := time.Time{}
+	finishing := false
+	cursor := logCursor{}
 	consec := 0
 
 	defer func() {
@@ -122,6 +124,7 @@ func runStream(parent context.Context, cs *kubernetes.Clientset, ls *LogStreamer
 	}()
 
 	for {
+		cursor.beginStream()
 		// Watchdog: close the active stream if parent cancels mid-read.
 		// Per-loop watchdog rather than one-shot so a reconnected
 		// stream is also covered.
@@ -148,11 +151,12 @@ func runStream(parent context.Context, cs *kubernetes.Clientset, ls *LogStreamer
 				}
 				line := sc.Text()
 				if t, ok := parseLogTimestamp(line); ok {
-					// +1ns prevents replaying the same line on reconnect.
-					sinceTime = t.Add(time.Nanosecond)
+					if !cursor.accept(t, line) {
+						continue
+					}
+					gotLine = true
 				}
 				ls.send(LogLine{Line: line})
-				gotLine = true
 			}
 			scanErr = sc.Err()
 			_ = stream.Close()
@@ -161,6 +165,17 @@ func runStream(parent context.Context, cs *kubernetes.Clientset, ls *LogStreamer
 
 		if parent.Err() != nil {
 			return
+		}
+		if stream != nil && scanErr == nil {
+			if finishing {
+				return
+			}
+			// Confirm completion before opening one final stream, so writes
+			// between this EOF and the status response are drained as well.
+			finishing = logsComplete(parent, cs, namespace, pod, container)
+			if finishing {
+				consec = 0
+			}
 		}
 
 		if gotLine {
@@ -172,7 +187,7 @@ func runStream(parent context.Context, cs *kubernetes.Clientset, ls *LogStreamer
 			if scanErr != nil && scanErr != io.EOF {
 				cause = scanErr.Error()
 			}
-			ls.send(LogLine{Err: cause})
+			ls.sendBlocking(parent, LogLine{Err: cause})
 			return
 		}
 
@@ -198,17 +213,17 @@ func runStream(parent context.Context, cs *kubernetes.Clientset, ls *LogStreamer
 		}
 
 		// Reopen with SinceTime so we don't replay all the lines we
-		// already showed. If sinceTime is zero (never received a
+		// already showed. If the cursor is zero (never received a
 		// timestamped line — unusual since we set Timestamps:true),
 		// fall back to a 5s window.
-		since := sinceTime
+		since := cursor.at
 		if since.IsZero() {
 			since = time.Now().Add(-5 * time.Second)
 		}
 		next, openErr := openStream(parent, cs, namespace, pod, container, nil, since)
 		if openErr != nil {
 			if isFatalStreamErr(openErr) {
-				ls.send(LogLine{Err: openErr.Error()})
+				ls.sendBlocking(parent, LogLine{Err: openErr.Error()})
 				return
 			}
 			// Treat as transient: another loop iteration. Stream is
@@ -232,16 +247,109 @@ func openStream(parent context.Context, cs *kubernetes.Clientset, namespace, pod
 	if tail != nil {
 		opts.TailLines = tail
 	}
-	if !since.IsZero() {
-		t := metav1.NewTime(since)
-		opts.SinceTime = &t
-	}
 	req := cs.CoreV1().Pods(namespace).GetLogs(pod, opts)
+	if !since.IsZero() {
+		// metav1.Time serializes query parameters at whole-second precision.
+		// The API server may truncate again when forwarding to the kubelet,
+		// so the reader must still discard overlap.
+		req.Param("sinceTime", since.UTC().Format(time.RFC3339Nano))
+	}
 	stream, err := req.Stream(parent)
 	if err != nil {
 		return nil, fmt.Errorf("stream: %w", err)
 	}
 	return stream, nil
+}
+
+// The inclusive cursor retains occurrence counts at the latest timestamp.
+// Counts from earlier streams consume replay without hiding additional,
+// identical lines produced at that same timestamp.
+type logCursor struct {
+	at      time.Time
+	seen    map[string]int
+	overlap map[string]int
+}
+
+func (c *logCursor) beginStream() {
+	c.overlap = maps.Clone(c.seen)
+}
+
+func (c *logCursor) accept(at time.Time, line string) bool {
+	if at.Before(c.at) {
+		return false
+	}
+	if c.seen == nil || at.After(c.at) {
+		c.at = at
+		if c.seen == nil {
+			c.seen = make(map[string]int)
+		} else {
+			clear(c.seen)
+		}
+		c.overlap = nil
+	}
+	if c.overlap[line] > 0 {
+		c.overlap[line]--
+		return false
+	}
+	c.seen[line]++
+	return true
+}
+
+func logsComplete(parent context.Context, cs *kubernetes.Clientset, namespace, pod, container string) bool {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	p, err := cs.CoreV1().Pods(namespace).Get(ctx, pod, metav1.GetOptions{})
+	if err != nil {
+		// Logs permission need not include permission to read pod status.
+		return false
+	}
+	return containerLogsComplete(p, container)
+}
+
+func containerLogsComplete(p *corev1.Pod, name string) bool {
+	if p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed {
+		return true
+	}
+	// Restart rules can restart other containers too. Leave that decision
+	// to the kubelet and retain bounded retries until the pod is terminal.
+	for _, containers := range [][]corev1.Container{p.Spec.Containers, p.Spec.InitContainers} {
+		for _, c := range containers {
+			if len(c.RestartPolicyRules) > 0 {
+				return false
+			}
+		}
+	}
+	for _, status := range p.Status.EphemeralContainerStatuses {
+		if status.Name == name && status.State.Terminated != nil {
+			return true
+		}
+	}
+	for i, statuses := range [][]corev1.ContainerStatus{p.Status.ContainerStatuses, p.Status.InitContainerStatuses} {
+		containers := p.Spec.Containers
+		if i == 1 {
+			containers = p.Spec.InitContainers
+		}
+		for _, status := range statuses {
+			if status.Name != name || status.State.Terminated == nil {
+				continue
+			}
+			for _, c := range containers {
+				if c.Name != name {
+					continue
+				}
+				policy := p.Spec.RestartPolicy
+				if c.RestartPolicy != nil {
+					policy = corev1.RestartPolicy(*c.RestartPolicy)
+				}
+				if i == 1 && c.RestartPolicy == nil && status.State.Terminated.ExitCode == 0 {
+					return true
+				}
+				return policy == corev1.RestartPolicyNever ||
+					(policy == corev1.RestartPolicyOnFailure && status.State.Terminated.ExitCode == 0)
+			}
+		}
+	}
+	return false
 }
 
 // isFatalStreamErr returns true for errors where reconnect won't help:

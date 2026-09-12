@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -59,16 +58,15 @@ type NodeEvent struct {
 
 // NodeWatcher mirrors PodWatcher.
 type NodeWatcher struct {
-	Context       string
-	Out           chan NodeEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[NodeEvent]
 }
 
 // NewNodeWatcher returns a watcher with a buffered channel of cap.
 func NewNodeWatcher(ctxName string, cap int) *NodeWatcher {
 	return &NodeWatcher{
-		Context: ctxName,
-		Out:     make(chan NodeEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[NodeEvent](cap),
 	}
 }
 
@@ -80,6 +78,8 @@ func NewNodeWatcher(ctxName string, cap int) *NodeWatcher {
 // microk8s pins `namespace: default` for users who are nonetheless
 // cluster-admins.
 func (w *NodeWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -158,11 +158,7 @@ func (w *NodeWatcher) emit(kind NodeEventKind, obj any) {
 	if mem, ok := n.Status.Allocatable[corev1.ResourceMemory]; ok {
 		ev.AllocMemBytes = mem.Value()
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == NodeDeleted)
 }
 
 func isNodeReady(n *corev1.Node) bool {

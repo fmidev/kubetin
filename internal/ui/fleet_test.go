@@ -91,7 +91,7 @@ func TestFleetFilterNarrowsAndSnapsCursor(t *testing.T) {
 
 func TestFleetOpenSwitchesClusterAndView(t *testing.T) {
 	m := fleetTestModel()
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 	m.fleet.cursorCtx = "bad"
 
 	m, cmd := fleetPress(t, m, key("o"))
@@ -108,7 +108,7 @@ func TestFleetOpenSwitchesClusterAndView(t *testing.T) {
 
 func TestFleetOpenOnWatchedClusterJustSwitchesView(t *testing.T) {
 	m := fleetTestModel()
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 	m.fleet.cursorCtx = "fine" // already watched
 
 	m, cmd := fleetPress(t, m, key("o"))
@@ -272,7 +272,7 @@ func TestFleetOpenRestoresResourceFilter(t *testing.T) {
 	m.filterText = "payments"
 	res, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyF1})
 	m = res.(Model)
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 	m.fleet.cursorCtx = "bad"
 	m.filterText = "ba" // fleet filter
 
@@ -431,7 +431,7 @@ func TestLeavingFleetInvalidatesPendingDetail(t *testing.T) {
 	m.OnFleetDetail = func(ctx string) cluster.FleetDetailResult {
 		return cluster.FleetDetailResult{Context: ctx, At: time.Now()}
 	}
-	m.OnFocusChange = func(string) {}
+	m.OnFocusChange = func(FocusTarget) {}
 	m.fleet.cursorCtx = "bad"
 
 	m, cmd := fleetPress(t, m, key("enter")) // fetch in flight

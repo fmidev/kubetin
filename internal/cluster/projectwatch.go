@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -51,15 +50,14 @@ func projectsPreferred(ctx context.Context, sup *Supervisor, ctxName string, res
 // client-go core). Emits the same NamespaceEvent shape; the
 // ResourceKind / DisplayName fields tell the UI it's a Project.
 type ProjectWatcher struct {
-	Context       string
-	Out           chan NamespaceEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[NamespaceEvent]
 }
 
 func NewProjectWatcher(ctxName string, cap int) *ProjectWatcher {
 	return &ProjectWatcher{
-		Context: ctxName,
-		Out:     make(chan NamespaceEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[NamespaceEvent](cap),
 	}
 }
 
@@ -68,6 +66,8 @@ func NewProjectWatcher(ctxName string, cap int) *ProjectWatcher {
 // list projects, so it's safe to spawn unconditionally alongside
 // NamespaceWatcher — exactly one of the two will actually emit.
 func (w *ProjectWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -158,9 +158,5 @@ func (w *ProjectWatcher) emit(kind NsEventKind, obj any) {
 		ResourceKind: "Project",
 		DisplayName:  displayName,
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == NsDeleted)
 }

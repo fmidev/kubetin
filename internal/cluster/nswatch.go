@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -49,19 +48,17 @@ type NamespaceEvent struct {
 }
 
 // NamespaceWatcher mirrors NodeWatcher: a cluster-scoped informer
-// forwarding events to a bounded channel. Drops on consumer back-
-// pressure rather than blocking the informer.
+// forwarding coalesced state changes through eventDelivery.
 type NamespaceWatcher struct {
-	Context       string
-	Out           chan NamespaceEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[NamespaceEvent]
 }
 
 // NewNamespaceWatcher returns a watcher with the given channel cap.
 func NewNamespaceWatcher(ctxName string, cap int) *NamespaceWatcher {
 	return &NamespaceWatcher{
-		Context: ctxName,
-		Out:     make(chan NamespaceEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[NamespaceEvent](cap),
 	}
 }
 
@@ -78,6 +75,8 @@ func NewNamespaceWatcher(ctxName string, cap int) *NamespaceWatcher {
 // the user can list projects: that's the case where the ProjectWatcher
 // is the source of truth, and running both would double-emit rows.
 func (w *NamespaceWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -156,9 +155,5 @@ func (w *NamespaceWatcher) emit(kind NsEventKind, obj any) {
 		Labels:       labels,
 		ResourceKind: "Namespace",
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == NsDeleted)
 }

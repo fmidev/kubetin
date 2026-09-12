@@ -3,10 +3,10 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -20,6 +20,7 @@ const (
 	DeployAdded DeployEventKind = iota
 	DeployUpdated
 	DeployDeleted
+	DeploySynced
 )
 
 // DeployCondition projects one entry of deployment.Status.Conditions.
@@ -49,12 +50,7 @@ type DeployEvent struct {
 	CreatedAt    time.Time
 	StrategyType string // RollingUpdate | Recreate
 
-	// Selector backs the dashboard's owned-pod lookup. Only
-	// MatchLabels is projected — MatchExpressions is legal in the API
-	// but Deployments created by any normal path use MatchLabels, and
-	// the dashboard falls back to the name-prefix heuristic when this
-	// is empty.
-	Selector map[string]string
+	Selector *metav1.LabelSelector
 
 	MaxSurge       string
 	MaxUnavailable string
@@ -64,19 +60,20 @@ type DeployEvent struct {
 
 // DeployWatcher mirrors PodWatcher / NodeWatcher.
 type DeployWatcher struct {
-	Context       string
-	Out           chan DeployEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[DeployEvent]
 }
 
 func NewDeployWatcher(ctxName string, cap int) *DeployWatcher {
 	return &DeployWatcher{
-		Context: ctxName,
-		Out:     make(chan DeployEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[DeployEvent](cap),
 	}
 }
 
 func (w *DeployWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -86,10 +83,11 @@ func (w *DeployWatcher) Run(ctx context.Context, sup *Supervisor) error {
 		return fmt.Errorf("clientset: %w", err)
 	}
 
-	factory := newScopedFactory(clientset, sup.ResolveScope(ctx, w.Context, clientset))
+	scope := sup.ResolveScope(ctx, w.Context, clientset)
+	factory := newScopedFactory(clientset, scope)
 	informer := factory.Apps().V1().Deployments().Informer()
 
-	_, err = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	handler, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { w.emit(DeployAdded, obj) },
 		UpdateFunc: func(_, obj any) { w.emit(DeployUpdated, obj) },
 		DeleteFunc: func(obj any) {
@@ -108,7 +106,7 @@ func (w *DeployWatcher) Run(ctx context.Context, sup *Supervisor) error {
 
 	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer syncCancel()
-	if !cache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced) {
+	if !cache.WaitForCacheSync(syncCtx.Done(), handler.HasSynced) {
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -116,6 +114,9 @@ func (w *DeployWatcher) Run(ctx context.Context, sup *Supervisor) error {
 		return fmt.Errorf("deployment cache sync timed out (30s)")
 	}
 	klog.Infof("deploywatch[%s]: synced, %d initial deployments", w.Context, len(informer.GetStore().List()))
+
+	// The empty UID is reserved for this ordered cache-completion marker.
+	w.publish("", DeployEvent{Kind: DeploySynced, Context: w.Context}, false)
 
 	<-ctx.Done()
 	return nil
@@ -129,10 +130,6 @@ func (w *DeployWatcher) emit(kind DeployEventKind, obj any) {
 	desired := int32(0)
 	if d.Spec.Replicas != nil {
 		desired = *d.Spec.Replicas
-	}
-	var selector map[string]string
-	if d.Spec.Selector != nil {
-		selector = copyLabels(d.Spec.Selector.MatchLabels)
 	}
 	maxSurge, maxUnavail := "", ""
 	if ru := d.Spec.Strategy.RollingUpdate; ru != nil {
@@ -156,16 +153,12 @@ func (w *DeployWatcher) emit(kind DeployEventKind, obj any) {
 		Unavailable:    d.Status.UnavailableReplicas,
 		CreatedAt:      d.CreationTimestamp.Time,
 		StrategyType:   string(d.Spec.Strategy.Type),
-		Selector:       selector,
+		Selector:       d.Spec.Selector.DeepCopy(),
 		MaxSurge:       maxSurge,
 		MaxUnavailable: maxUnavail,
 		Conditions:     projectDeployConditions(d.Status.Conditions),
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == DeployDeleted)
 }
 
 func projectDeployConditions(conds []appsv1.DeploymentCondition) []DeployCondition {

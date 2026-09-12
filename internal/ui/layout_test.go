@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -89,7 +90,7 @@ func TestViewFitsCanvas(t *testing.T) {
 		{"fleet/very-narrow", 60, 20, ViewFleet, fleetLayoutFixture(nil)},
 		{"fleet/tiny", 40, 12, ViewFleet, fleetLayoutFixture(nil)},
 		{"fleet/cursor-on-card", 120, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
-			m.fleet.cursorCtx = "beta"
+			m.fleet.cursorCtx = fleetCJKContext
 		})},
 		{"fleet/cursor-windowed", 100, 14, ViewFleet, fleetLayoutFixture(func(m *Model) {
 			m.fleet.cursorCtx = "gamma"
@@ -117,10 +118,10 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.filterText = "zzz"
 		})},
 		{"fleet/expanded", 120, 30, ViewFleet, fleetLayoutFixture(func(m *Model) {
-			m.fleet.cursorCtx = "beta"
-			m.fleet.expanded = "beta"
+			m.fleet.cursorCtx = fleetCJKContext
+			m.fleet.expanded = fleetCJKContext
 			m.fleet.detail = fleetDetailState{result: cluster.FleetDetailResult{
-				Context: "beta",
+				Context: fleetCJKContext,
 				Pods: []cluster.FleetPodIssue{
 					{Namespace: "prod", Name: "smartmet-server-7f9c8-x2k4l", Phase: "Pending", Reason: "ImagePullBackOff", Restarts: 3},
 					{Namespace: "デフォルト", Name: strings.Repeat("名前", 40), Phase: "Failed", Reason: strings.Repeat("R", 80)},
@@ -298,6 +299,14 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.drainConfirm.open = true
 			m.drainConfirm.node = "node-1"
 		}},
+		{"drain-confirm/narrow", 80, 24, ViewNodes, func(m *Model) {
+			m.drainConfirm.open = true
+			m.drainConfirm.node = "node-1"
+		}},
+		{"drain-confirm/tiny", 60, 20, ViewNodes, func(m *Model) {
+			m.drainConfirm.open = true
+			m.drainConfirm.node = "node-1"
+		}},
 		{"drain-progress", 120, 40, ViewNodes, func(m *Model) {
 			m.drainProgress.open = true
 			m.drainProgress.node = "node-1"
@@ -307,6 +316,16 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.drainProgress.total = 10
 			m.drainProgress.blocked = []string{
 				"kube-system/etcd-0 (PDB blocked after 5 retries)",
+			}
+		}},
+		{"drain-waiting/narrow", 80, 24, ViewNodes, func(m *Model) {
+			m.drainProgress = drainProgressState{open: true, node: "worker", phase: "waiting", current: "default/terminating", done: 1, total: 3}
+		}},
+		{"drain-incomplete/tiny", 60, 20, ViewNodes, func(m *Model) {
+			m.drainProgress = drainProgressState{
+				open: true, node: "worker", phase: "done", done: 1, total: 7,
+				err:       "context deadline exceeded",
+				remaining: []string{"default/a", "default/b", "default/c", "default/d", "default/e", "default/f"},
 			}
 		}},
 		{"ns-picker", 120, 40, ViewPods, func(m *Model) {
@@ -348,6 +367,16 @@ func TestViewFitsCanvas(t *testing.T) {
 			m.logs.searchTerm = "matchme"
 			m.logs.searchMatches = []int{1, 3}
 			m.logs.searchIdx = 0
+		}},
+		{"logs-search-evicted", 120, 40, ViewPods, func(m *Model) {
+			m.logs.open = true
+			m.logs.cap = 100
+			m.logs.follow = true
+			m.logs.searchTerm = "match"
+			for i := 0; i < 150; i++ {
+				m.applyLogLine("\x1b[31mMATCH\x1b[0m after eviction")
+			}
+			m.logs.searchIdx = 75
 		}},
 		{"logs-search-focused", 120, 40, ViewPods, func(m *Model) {
 			m.logs.open = true
@@ -696,7 +725,7 @@ func dashDeploySetup(extra func(*Model)) func(*Model) {
 			Replicas: 3, Ready: 2, UpToDate: 3, Available: 2, Unavailable: 1,
 			CreatedAt:    now.Add(-12 * 24 * time.Hour),
 			StrategyType: "RollingUpdate", MaxSurge: "25%", MaxUnavailable: "25%",
-			Selector:   sel,
+			Selector:   &metav1.LabelSelector{MatchLabels: sel},
 			Conditions: []cluster.DeployCondition{{Type: "Available", Status: "True"}},
 		}
 		m.events["dep-evt"] = eventRow{
@@ -893,6 +922,8 @@ func truncForErr(s string) string {
 	return s
 }
 
+const fleetCJKContext = "本番環境クラスタ北 (a/.kube/config)"
+
 // fleetLayoutFixture swaps m.Store for a per-case store — the shared
 // store must stay empty for every other case — seeded with a mixed
 // fleet: a healthy cluster with metrics, an alert-heavy degraded one
@@ -905,7 +936,7 @@ func fleetLayoutFixture(extra func(*Model)) func(*Model) {
 			UsageCPUMilli: 4000, UsageMemBytes: 60 << 20,
 			MetricsAvailable: true, MetricsAt: time.Now(),
 		})
-		seedFleetCluster(store, "beta", func(pf *model.ProbeFields) {
+		seedFleetCluster(store, fleetCJKContext, func(pf *model.ProbeFields) {
 			pf.RawName = "本番環境クラスタ北"
 			pf.Reach = model.ReachDegraded
 			pf.NodeCount, pf.NodeReady = 5, 3
@@ -919,7 +950,7 @@ func fleetLayoutFixture(extra func(*Model)) func(*Model) {
 			pf.WarnEvents15m = 42
 			pf.PodsTotal = 240
 		})
-		store.ApplyMetrics("beta", model.MetricsFields{
+		store.ApplyMetrics(fleetCJKContext, model.MetricsFields{
 			UsageCPUMilli: 11000, UsageMemBytes: 95 << 20,
 			MetricsAvailable: true, MetricsAt: time.Now(),
 		})
@@ -931,6 +962,7 @@ func fleetLayoutFixture(extra func(*Model)) func(*Model) {
 			pf.LastError = strings.Repeat("dial tcp 10.0.0.1:6443: i/o timeout ", 4)
 		})
 		m.Store = store
+		m.Contexts = []string{"alpha", fleetCJKContext, "gamma"}
 		if extra != nil {
 			extra(m)
 		}
@@ -970,6 +1002,7 @@ func clusterDashFixture(extra func(*Model)) func(*Model) {
 			m.netHistory.push(int64(1000*(i+1)), int64(400*(20-i)), now.Add(time.Duration(i-20)*15*time.Second))
 		}
 		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 20000, 400, true
+		m.clusterNetAt = now
 		m.focusedMetrics = focusedMetricsState{seen: true, ok: true, at: now}
 
 		pod := func(uid, ns, name, node string, phase corev1.PodPhase, cpu, mem int64, restarts int32) podRow {

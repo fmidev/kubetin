@@ -74,24 +74,42 @@ func (m Model) handleClusterDashKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m.handleKey(k)
 }
 
+func (m Model) dashboardNamespace() string {
+	if m.namespace != "" {
+		return m.namespace
+	}
+	return m.watchNamespace
+}
+
+func dashboardNameLess(nsA, nameA string, uidA types.UID, nsB, nameB string, uidB types.UID) bool {
+	if nameA != nameB {
+		return nameA < nameB
+	}
+	if nsA != nsB {
+		return nsA < nsB
+	}
+	return uidA < uidB
+}
+
 // inScope applies the namespace picker to a cluster-sourced object.
 func (m Model) inScope(ns string) bool {
-	return m.namespace == "" || ns == m.namespace
+	scope := m.dashboardNamespace()
+	return scope == "" || ns == scope
 }
 
 // clusterStats is everything the panes derive from the watched
 // cluster's caches, computed once per render so tiles and panes agree.
 type clusterStats struct {
-	podsTotal, running, pending, failed, unknown int
-	contReady, contTotal, crashloop              int
-	restarts, restartsDelta                      int32
-	deploysTotal, deploysReady, degraded         int
-	warnEvents, warnObjects                      int
-	warnGroups                                   []eventGroup
-	topCPU, topMem                               []podRow
-	unhealthy                                    []workloadIssue
-	nodes                                        []nodeRow
-	podsByNode                                   map[string]int
+	podsTotal, running, pending, failed, unknown    int
+	contReady, contTotal, crashloop                 int
+	restarts, restartsDelta                         int32
+	deploysTotal, deploysReady, degraded, zeroReady int
+	warnEvents, warnObjects                         int
+	warnGroups                                      []eventGroup
+	topCPU, topMem                                  []podRow
+	unhealthy                                       []workloadIssue
+	nodes                                           []nodeRow
+	podsByNode                                      map[string]int
 }
 
 type workloadIssue struct {
@@ -138,19 +156,21 @@ func (m Model) clusterStats() clusterStats {
 		name := p.Namespace + "/" + p.Name
 		reason := ""
 		errored := false
-		for _, c := range p.ContainerInfo {
-			if c.Reason == "CrashLoopBackOff" {
-				s.crashloop++
-			}
-			if c.State == cluster.ContainerError && reason == "" {
-				errored = true
-				reason = c.Reason
-				if reason == "" {
-					reason = "error"
+		for _, containers := range [][]cluster.ContainerInfo{p.ContainerInfo, p.InitContainerInfo} {
+			for _, c := range containers {
+				if c.Reason == "CrashLoopBackOff" {
+					s.crashloop++
 				}
-			}
-			if reason == "" && c.Reason != "" && c.Reason != "Completed" {
-				reason = c.Reason
+				if c.State == cluster.ContainerError && !errored {
+					errored = true
+					reason = c.Reason
+					if reason == "" {
+						reason = "error"
+					}
+				}
+				if reason == "" && c.Reason != "" && c.Reason != "Completed" {
+					reason = c.Reason
+				}
 			}
 		}
 		switch {
@@ -162,18 +182,20 @@ func (m Model) clusterStats() clusterStats {
 			pending = append(pending, pendingPod{p, reason})
 		}
 	}
-	s.restartsDelta = restartDelta(m.pods, m.restartBaseline, m.namespace)
+	s.restartsDelta = restartDelta(m.pods, m.restartBaseline, m.dashboardNamespace())
 	sort.Slice(s.topCPU, func(i, j int) bool {
 		if s.topCPU[i].CPUMilli != s.topCPU[j].CPUMilli {
 			return s.topCPU[i].CPUMilli > s.topCPU[j].CPUMilli
 		}
-		return s.topCPU[i].Name < s.topCPU[j].Name
+		a, b := s.topCPU[i], s.topCPU[j]
+		return dashboardNameLess(a.Namespace, a.Name, a.UID, b.Namespace, b.Name, b.UID)
 	})
 	sort.Slice(s.topMem, func(i, j int) bool {
 		if s.topMem[i].MemBytes != s.topMem[j].MemBytes {
 			return s.topMem[i].MemBytes > s.topMem[j].MemBytes
 		}
-		return s.topMem[i].Name < s.topMem[j].Name
+		a, b := s.topMem[i], s.topMem[j]
+		return dashboardNameLess(a.Namespace, a.Name, a.UID, b.Namespace, b.Name, b.UID)
 	})
 
 	type degradedDeploy struct {
@@ -191,13 +213,17 @@ func (m Model) clusterStats() clusterStats {
 			continue
 		}
 		s.degraded++
-		degraded = append(degraded, degradedDeploy{d, int(d.Ready * 100 / d.Replicas)})
+		if d.Ready == 0 {
+			s.zeroReady++
+		}
+		degraded = append(degraded, degradedDeploy{d, int(int64(d.Ready) * 100 / int64(d.Replicas))})
 	}
 	sort.Slice(degraded, func(i, j int) bool {
 		if degraded[i].ratio != degraded[j].ratio {
 			return degraded[i].ratio < degraded[j].ratio
 		}
-		return degraded[i].Name < degraded[j].Name
+		a, b := degraded[i], degraded[j]
+		return dashboardNameLess(a.Namespace, a.Name, a.UID, b.Namespace, b.Name, b.UID)
 	})
 	for _, d := range degraded {
 		s.unhealthy = append(s.unhealthy, workloadIssue{
@@ -207,7 +233,13 @@ func (m Model) clusterStats() clusterStats {
 	}
 	sort.Slice(broken, func(i, j int) bool { return broken[i].text < broken[j].text })
 	s.unhealthy = append(s.unhealthy, broken...)
-	sort.Slice(pending, func(i, j int) bool { return pending[i].CreatedAt.Before(pending[j].CreatedAt) })
+	sort.Slice(pending, func(i, j int) bool {
+		a, b := pending[i], pending[j]
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.Before(b.CreatedAt)
+		}
+		return dashboardNameLess(a.Namespace, a.Name, a.UID, b.Namespace, b.Name, b.UID)
+	})
 	for _, p := range pending {
 		text := fmt.Sprintf("%s/%s Pending %s", p.Namespace, p.Name, formatAge(p.CreatedAt))
 		if p.reason != "" {
@@ -255,7 +287,7 @@ func (m Model) clusterTiles(st model.ClusterState, s clusterStats) []dashTile {
 
 	switch {
 	case !reachable || st.NodeCount < 0:
-		sub := "no probe yet"
+		sub := "nodes not visible"
 		if !reachable {
 			sub = strings.ToLower(st.Reach.String())
 		}
@@ -311,11 +343,8 @@ func (m Model) clusterTiles(st model.ClusterState, s clusterStats) []dashTile {
 		if s.degraded > 0 {
 			t.sub = fmt.Sprintf("%d degraded", s.degraded)
 			t.style = th.StatusWrn
-			for _, u := range s.unhealthy {
-				if u.bad {
-					t.style = th.StatusBad
-					break
-				}
+			if s.zeroReady > 0 {
+				t.style = th.StatusBad
 			}
 		}
 		tiles = append(tiles, t)
@@ -381,7 +410,7 @@ func (m Model) clusterDashIdentity(st model.ClusterState, w int) string {
 	if display == "" {
 		display = m.WatchedContext
 	}
-	ns := m.namespace
+	ns := m.dashboardNamespace()
 	if ns == "" {
 		ns = "all"
 	}
@@ -390,7 +419,7 @@ func (m Model) clusterDashIdentity(st model.ClusterState, w int) string {
 	if v := cleanDetail(shortVersion(st.ServerVersion)); v != "" {
 		left += th.Dim.Render(" " + v)
 	}
-	left += th.Dim.Render(" · ns:" + ns)
+	left += th.Dim.Render(" · ns:" + cleanDetail(ns))
 	if st.Reach != model.ReachHealthy && st.Reach != model.ReachDegraded {
 		msg := strings.ToLower(st.Reach.String())
 		if e := cleanDetail(st.LastError); e != "" {
@@ -403,12 +432,12 @@ func (m Model) clusterDashIdentity(st model.ClusterState, w int) string {
 	// loop cluster-wide, the focused pod-metrics poller under a
 	// namespace scope (where the fleet loop's node list is denied).
 	available, at := st.MetricsAvailable, st.MetricsAt
-	if m.namespace != "" {
+	if m.dashboardNamespace() != "" {
 		available, at = m.focusedMetrics.ok, m.focusedMetrics.at
 	}
 	var right []string
 	switch {
-	case m.namespace != "" && !m.focusedMetrics.seen:
+	case m.dashboardNamespace() != "" && !m.focusedMetrics.seen:
 		right = append(right, th.Dim.Render("metrics pending"))
 	case !available:
 		right = append(right, th.Dim.Render("metrics unavailable"))
@@ -417,8 +446,8 @@ func (m Model) clusterDashIdentity(st model.ClusterState, w int) string {
 	default:
 		right = append(right, th.Dim.Render("metrics "+formatAge(at)+" ago"))
 	}
-	if m.clusterNetOK && len(m.netHistory.at) > 0 {
-		right = append(right, th.Dim.Render("net "+formatAge(m.netHistory.at[len(m.netHistory.at)-1])+" ago"))
+	if m.clusterNetOK && !m.clusterNetAt.IsZero() {
+		right = append(right, th.Dim.Render("net "+m.clusterNetCoverage+formatAge(m.clusterNetAt)+" ago"))
 	}
 	right = append(right, th.Dim.Render(time.Now().Format("15:04:05")))
 	r := strings.Join(right, th.Dim.Render(" · "))
@@ -471,7 +500,7 @@ func spanLabel(d time.Duration) string {
 func (m Model) gaugeLines(label string, st model.ClusterState, used, alloc int64, hist []int, span time.Duration,
 	scopedSum int64, format func(int64) string, w int) []string {
 	th := m.Theme
-	if m.namespace != "" {
+	if m.dashboardNamespace() != "" {
 		fm := m.focusedMetrics
 		switch {
 		case !m.syncedPods || !fm.seen:
@@ -513,10 +542,17 @@ func (m Model) gaugeLines(label string, st model.ClusterState, used, alloc int64
 func (m Model) netLines(w int) []string {
 	th := m.Theme
 	if !m.clusterNetOK {
-		return []string{padCol("NET no network data", w, th.Dim)}
+		status := m.clusterNetStatus
+		if status == "" {
+			status = "no network data"
+		}
+		return []string{padCol("NET "+status, w, th.Dim)}
 	}
 	head := th.Dim.Render("NET ") + th.Header.Render("↓ "+formatRate(m.clusterNetRX)+"  ↑ "+formatRate(m.clusterNetTX))
 	lines := []string{padCellANSI(head, w)}
+	if m.clusterNetCoverage != "" {
+		return append(lines, padCol(strings.TrimSuffix(m.clusterNetCoverage, " · "), w, th.StatusWrn))
+	}
 	if sl := spanLabel(m.netHistory.span()); sl != "" && w >= 16 {
 		each := (w - len(sl) - 3) / 2
 		rx := sparkline(scaleSpark(m.netHistory.rx), each)
@@ -612,10 +648,8 @@ func (m Model) nodeLines(st model.ClusterState, s clusterStats, w, h int) []stri
 		switch {
 		case m.syncedNodes:
 			return []string{padCol("no nodes", w, th.Dim)}
-		case st.NodeCount < 0 && st.Reach == model.ReachHealthy:
-			// The probe could not list nodes either: namespace-scoped
-			// credentials, so no node watcher runs for this context.
-			return []string{padCol("nodes not visible with namespace-scoped access", w, th.Dim)}
+		case st.NodeCount < 0 && (st.Reach == model.ReachHealthy || st.Reach == model.ReachDegraded):
+			return []string{padCol("nodes not visible", w, th.Dim)}
 		default:
 			return []string{padCol("syncing", w, th.Dim)}
 		}
@@ -816,6 +850,9 @@ func (m Model) renderClusterDashStacked(st model.ClusterState, s clusterStats, w
 	var row string
 	for _, t := range m.clusterTiles(st, s) {
 		cell := th.Dim.Render(t.label+" ") + t.style.Render(t.value)
+		if t.value == "—" {
+			cell += th.Dim.Render(" " + t.sub)
+		}
 		if row == "" {
 			row = cell
 		} else if lipgloss.Width(row)+3+lipgloss.Width(cell) <= w {
@@ -841,13 +878,11 @@ func (m Model) renderClusterDashStacked(st model.ClusterState, s clusterStats, w
 	scopedCPU, scopedMem := m.scopedUsage()
 	lines = append(lines, m.gaugeLines("CPU", st, st.UsageCPUMilli, st.AllocCPUMilli, cpuHist, span, scopedCPU, cpuOrZero, w)...)
 	lines = append(lines, m.gaugeLines("MEM", st, st.UsageMemBytes, st.AllocMemBytes, memHist, span, scopedMem, memOrZero, w)...)
-	if m.clusterNetOK {
-		net := m.netLines(w)
-		if w < 60 {
-			net = net[:1]
-		}
-		lines = append(lines, net...)
+	net := m.netLines(w)
+	if w < 60 && m.clusterNetCoverage == "" {
+		net = net[:1]
 	}
+	lines = append(lines, net...)
 
 	type section struct {
 		label string

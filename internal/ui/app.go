@@ -42,6 +42,10 @@ type IngEventMsg cluster.IngressEvent
 // rather than merged into the service row.
 type EndpointSliceEventMsg cluster.EndpointSliceEvent
 
+// ResourceBatchMsg applies a bounded informer burst before the next render.
+// The forwarder binds the whole batch to one FocusTarget with FocusedMsg.
+type ResourceBatchMsg []tea.Msg
+
 // MetricsSnapshotMsg wraps a focused-cluster metrics snapshot.
 type MetricsSnapshotMsg cluster.MetricsSnapshot
 
@@ -81,10 +85,6 @@ type NodeOpResultMsg cluster.NodeOpResult
 // without the message.
 type toastClearMsg time.Time
 
-// PodsClearedMsg is sent when the focused cluster changes so the
-// pods/nodes tables empty before new ADD events arrive.
-type PodsClearedMsg struct{}
-
 // View identifies which resource view is currently shown.
 type View int
 
@@ -110,10 +110,13 @@ type ProbeTickMsg time.Time
 
 // Model is the top-level bubbletea Model.
 type Model struct {
-	WatchedContext string
-	Store          *model.Store
-	Theme          Theme
-	Contexts       []string // ordered list of all kubeconfig contexts
+	WatchedContext  string
+	focusGeneration uint64
+	focusLife       *focusLifetime
+	tables          *tableCache
+	Store           *model.Store
+	Theme           Theme
+	Contexts        []string // ordered list of all kubeconfig contexts
 	// Build is the version line shown in the help overlay. main wires
 	// this; left empty when not provided (the help renders without it).
 	Build string
@@ -134,7 +137,7 @@ type Model struct {
 	// OnFocusChange is called from a tea.Cmd when the user switches
 	// the focused cluster (Tab/Shift-Tab). Main wires this to the
 	// watcher swap coordinator.
-	OnFocusChange func(ctx string)
+	OnFocusChange func(FocusTarget)
 
 	// OnDescribe runs the describe fetch off-thread and returns the
 	// result as a tea.Msg. Main wires this so the UI doesn't have to
@@ -158,13 +161,11 @@ type Model struct {
 	// OnRolloutRestart bumps a template annotation to roll a deployment.
 	OnRolloutRestart func(focusedCtx string, ref cluster.DescribeRef) tea.Msg
 
-	// OnLogsStart kicks off a follow=true log stream. Reply messages
+	// OnLogsStart kicks off a follow=true log stream using req.Context.
+	// Reply messages
 	// (LogLineMsg / LogErrorMsg / LogEOSMsg) will arrive on the
 	// program's message channel.
 	OnLogsStart func(focusedCtx string, req LogStartMsg) tea.Msg
-
-	// OnLogsStop cancels the active log stream.
-	OnLogsStop func()
 
 	// OnExec opens an interactive shell into a pod container. Unlike
 	// the other callbacks which return a tea.Msg (synchronous fetch),
@@ -172,7 +173,7 @@ type Model struct {
 	// that wraps tea.Exec(cluster.ExecCmd) so bubbletea releases the
 	// alt-screen for the lifetime of the session and reclaims it on
 	// the user's `exit` / `Ctrl-D`.
-	OnExec func(focusedCtx string, ref cluster.DescribeRef, container string, command []string) tea.Cmd
+	OnExec func(focus FocusTarget, ref cluster.DescribeRef, container string, command []string) tea.Cmd
 
 	// OnCordon / OnUncordon: synchronous one-shot PATCH on
 	// /spec/unschedulable. Returns a NodeOpResultMsg.
@@ -182,10 +183,9 @@ type Model struct {
 	// OnDrainStart begins an async drain. It returns DrainStartMsg
 	// synchronously to confirm the supervisor accepted the request
 	// (or surface a setup error); subsequent DrainProgressMsg /
-	// DrainDoneMsg events flow asynchronously over the program's
-	// channel — main.go spawns a forwarder goroutine for the same
-	// reason logs do.
-	OnDrainStart func(focusedCtx, node string) tea.Msg
+	// DrainDoneMsg events flow through DrainMsg envelopes carrying
+	// req.Session, inside the existing FocusedMsg envelope.
+	OnDrainStart func(req DrainRequest) tea.Msg
 
 	pods        map[types.UID]podRow
 	nodes       map[types.UID]nodeRow
@@ -207,7 +207,7 @@ type Model struct {
 	filterFocused  bool   // capturing keystrokes into filterText
 
 	// Per-view "first event received" flags. Reset when the focused
-	// cluster changes (PodsClearedMsg), set to true on the first event
+	// cluster changes synchronously, set to true on the first event
 	// of that kind. Used so the empty-table placeholder can distinguish
 	// "still syncing" from "synced with zero rows" — otherwise a Tab to
 	// a cluster with no pods looks identical to a stuck informer.
@@ -215,15 +215,18 @@ type Model struct {
 	syncedServices, syncedIngresses                                        bool
 	syncStartedAt                                                          time.Time
 
-	// Cluster-aggregate network rates, last sample. clusterNetOK is
-	// false until the first non-error NetworkSnapshotMsg arrives —
-	// without that flag a fresh Tab would briefly show "0 B/s" which
-	// is indistinguishable from "scraped successfully and traffic is
-	// idle". When OK=false the UI hides the network panels entirely.
+	// Retained network rates, with availability and sample time tracked
+	// separately. Partial samples carry a coverage label.
 	clusterNetRX, clusterNetTX int64
 	clusterNetOK               bool
+	clusterNetAt               time.Time
+	clusterNetStatus           string
+	clusterNetCoverage         string // empty for a complete sample
+	networkSnapshotAt          time.Time
+	networkExpiresAt           time.Time
 	netHistory                 netRing
 	focusedMetrics             focusedMetricsState
+	watchNamespace             string
 	restartBaseline            map[types.UID]int32 // first-seen restart count per pod, see noteRestartBaseline
 
 	namespace       string // empty = all namespaces
@@ -249,6 +252,7 @@ type Model struct {
 	restartConfirm      restartConfirmState
 	drainConfirm        drainConfirmState
 	drainProgress       drainProgressState
+	drainSession        uint64
 	logs                logsState
 	eventsLens          eventsLensState
 	exec                execState
@@ -270,6 +274,8 @@ type Model struct {
 func New(context string, store *model.Store, contexts []string) Model {
 	return Model{
 		WatchedContext: context,
+		focusLife:      newFocusLifetime(),
+		tables:         &tableCache{},
 		Store:          store,
 		Theme:          DefaultTheme(),
 		Contexts:       contexts,
@@ -306,7 +312,52 @@ func tickCmd() tea.Cmd {
 
 // Update handles all incoming messages.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if focused, ok := msg.(FocusedMsg); ok {
+		if focused.Focus != m.Focus() {
+			discardFocusedMessage(focused.Msg)
+			return m, nil
+		}
+		msg = focused.Msg
+	} else if m.focusGeneration != 0 {
+		// Once focus has changed, untagged cluster work cannot identify
+		// which visit produced it, even when its context name matches.
+		switch msg.(type) {
+		case ResourceBatchMsg, PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
+			SvcEventMsg, IngEventMsg, EndpointSliceEventMsg, MetricsSnapshotMsg, NetworkSnapshotMsg,
+			modalResultMsg, DescribeResultMsg, PermissionResultMsg, DeleteResultMsg, ScaleResultMsg, RolloutResultMsg,
+			NodeOpResultMsg, DrainMsg, DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
+			discardFocusedMessage(msg)
+			return m, nil
+		}
+	}
+	if drain, ok := msg.(DrainMsg); ok {
+		if drain.Session == 0 || drain.Session != m.drainProgress.session || m.drainProgress.finished {
+			discardFocusedMessage(drain.Msg)
+			return m, nil
+		}
+		msg = drain.Msg
+	} else {
+		switch msg.(type) {
+		case DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
+			discardFocusedMessage(msg)
+			return m, nil
+		}
+	}
+	var request *modalRequest
+	if result, ok := msg.(modalResultMsg); ok {
+		request, msg = result.request, result.msg
+	}
 	switch msg := msg.(type) {
+	case ResourceBatchMsg:
+		var cmds []tea.Cmd
+		for _, event := range msg {
+			updated, cmd := m.Update(FocusedMsg{Focus: m.Focus(), Msg: event})
+			m = updated.(Model)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		return m, tea.Batch(cmds...)
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -375,9 +426,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
+		if msg.Kind == cluster.PodSynced {
+			m.syncedPods = true
+			m.watchNamespace = msg.WatchNamespace
+			return m, nil
+		}
 		noteRestartBaseline(m.restartBaseline, msg.UID, msg.Restarts, msg.Kind == cluster.PodDeleted)
+		before, existed := m.pods[msg.UID]
 		applyPodEvent(m.pods, cluster.PodEvent(msg))
-		m.syncedPods = true
+		after, exists := m.pods[msg.UID]
+		m.invalidatePodOrder(before, after)
+		if existed != exists || before.Phase != after.Phase {
+			m.tables.phasesValid = false
+		}
+		if existed != exists || before.Namespace != after.Namespace {
+			m.invalidateTables(ViewNamespaces)
+			m.tables.nsCounts = nil
+		}
 		// Guard cursor wipe to ViewPods only — non-pod views park the
 		// cursor on a non-pod UID that will never appear in m.pods,
 		// and without the view guard every pod event nukes the cursor
@@ -392,6 +457,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyNodeEvent(m.nodes, cluster.NodeEvent(msg))
+		m.invalidateTables(ViewNodes)
 		m.syncedNodes = true
 		if _, ok := m.nodes[m.cursor]; !ok && m.view == ViewNodes {
 			m.cursor = ""
@@ -402,8 +468,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
+		if msg.Kind == cluster.DeploySynced {
+			m.syncedDeploys = true
+			return m, nil
+		}
 		applyDeployEvent(m.deployments, cluster.DeployEvent(msg))
-		m.syncedDeploys = true
+		m.invalidateTables(ViewDeployments, ViewNamespaces)
+		m.tables.nsCounts = nil
 		if _, ok := m.deployments[m.cursor]; !ok && m.view == ViewDeployments {
 			m.cursor = ""
 		}
@@ -413,8 +484,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
+		if msg.Kind == cluster.EvtSynced {
+			m.syncedEvents = true
+			return m, nil
+		}
 		applyEvtEvent(m.events, cluster.EventEvent(msg))
-		m.syncedEvents = true
+		m.invalidateTables(ViewNamespaces)
+		m.tables.nsCounts = nil
 		return m, nil
 
 	case NsEventMsg:
@@ -422,6 +498,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyNsEvent(m.namespaces, cluster.NamespaceEvent(msg))
+		m.invalidateTables(ViewNamespaces)
 		m.syncedNamespaces = true
 		return m, nil
 
@@ -430,6 +507,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyServiceEvent(m.services, cluster.ServiceEvent(msg))
+		m.invalidateTables(ViewServices)
 		m.syncedServices = true
 		if _, ok := m.services[m.cursor]; !ok && m.view == ViewServices {
 			m.cursor = ""
@@ -441,6 +519,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		applyIngressEvent(m.ingresses, cluster.IngressEvent(msg))
+		m.invalidateTables(ViewIngresses)
 		m.syncedIngresses = true
 		if _, ok := m.ingresses[m.cursor]; !ok && m.view == ViewIngresses {
 			m.cursor = ""
@@ -457,12 +536,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case DescribeResultMsg:
-		// Drop describes that returned from a context we already
-		// Tabbed away from — otherwise stale YAML overwrites the new
-		// view's loading state.
-		if msg.Context != m.WatchedContext {
+		if msg.Context != m.WatchedContext || !m.describe.open || !m.describe.loading || !m.describe.request.accepts(request) {
 			return m, nil
 		}
+		m.describe.request.stop()
 		m.describe.loading = false
 		m.describe.result = cluster.DescribeResult(msg)
 		m.describe.scroll = 0
@@ -501,13 +578,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case DeleteResultMsg:
 		res := cluster.DeleteResult(msg)
-		// Drop results from a context the user already Tabbed away
-		// from. Without this, an in-flight Delete that returns after
-		// the user opened a fresh confirm on cluster B would force-
-		// close B's modal and toast "Deleted A/foo" over the top.
-		if res.Context != m.WatchedContext {
+		if res.Context != m.WatchedContext || !m.deleteConfirm.open || !m.deleteConfirm.pending || !m.deleteConfirm.request.accepts(request) {
 			return m, nil
 		}
+		m.deleteConfirm.request.stop()
 		// Close the confirm modal whether it succeeded or not — the
 		// result is communicated via the footer toast.
 		m.deleteConfirm.open = false
@@ -550,6 +624,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyDrainDone(msg)
 
 	case ExecDoneMsg:
+		if msg.Focus != m.Focus() {
+			return m, nil
+		}
 		// Bubbletea has already reclaimed the alt-screen by the time
 		// this arrives. We only need to surface non-nil errors so a
 		// failed setup ("rbac: create pods/exec denied", "container
@@ -565,9 +642,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ScaleResultMsg:
 		res := cluster.ScaleResult(msg)
-		if res.Context != m.WatchedContext {
+		if res.Context != m.WatchedContext || !m.scaleConfirm.open || !m.scaleConfirm.pending || !m.scaleConfirm.request.accepts(request) {
 			return m, nil
 		}
+		m.scaleConfirm.request.stop()
 		m.scaleConfirm.open = false
 		m.scaleConfirm.pending = false
 		if res.OK {
@@ -580,9 +658,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case RolloutResultMsg:
 		res := cluster.RolloutResult(msg)
-		if res.Context != m.WatchedContext {
+		if res.Context != m.WatchedContext || !m.restartConfirm.open || !m.restartConfirm.pending || !m.restartConfirm.request.accepts(request) {
 			return m, nil
 		}
+		m.restartConfirm.request.stop()
 		m.restartConfirm.open = false
 		m.restartConfirm.pending = false
 		if res.OK {
@@ -653,28 +732,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
-		if !msg.OK {
-			// Don't clobber a previously-good reading on a transient
-			// failure — the existing rates remain on screen until the
-			// next successful scrape.
-			return m, nil
-		}
-		netByKey := make(map[string]cluster.PodNetwork, len(msg.Pods))
-		for _, n := range msg.Pods {
-			netByKey[n.Namespace+"/"+n.Name] = n
-		}
-		for uid, row := range m.pods {
-			if n, ok := netByKey[row.Namespace+"/"+row.Name]; ok {
-				row.NetRXBps = n.RXBytesPerSec
-				row.NetTXBps = n.TXBytesPerSec
-				row.HasNetwork = true
-				m.pods[uid] = row
-			}
-		}
-		m.clusterNetRX = msg.Cluster.RXBytesPerSec
-		m.clusterNetTX = msg.Cluster.TXBytesPerSec
-		m.clusterNetOK = true
-		m.netHistory.push(msg.Cluster.RXBytesPerSec, msg.Cluster.TXBytesPerSec, msg.At)
+		m.applyNetworkSnapshot(msg, time.Now())
 		return m, nil
 
 	case MetricsSnapshotMsg:
@@ -701,6 +759,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// failure, RBAC change, eviction-then-recreate with new UID)
 		// keeps its old numbers indefinitely.
 		for uid, row := range m.pods {
+			before := row
 			if pm, ok := pmByKey[row.Namespace+"/"+row.Name]; ok {
 				row.CPUMilli = pm.CPUMilli
 				row.MemBytes = pm.MemBytes
@@ -711,6 +770,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				row.ContainerMemBytes = nil
 			}
 			m.pods[uid] = row
+			m.invalidatePodOrder(before, row)
 		}
 		nmByName := make(map[string]cluster.NodeMetric, len(msg.Nodes))
 		for _, nm := range msg.Nodes {
@@ -728,35 +788,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case PodsClearedMsg:
-		m.pods = make(map[types.UID]podRow)
-		m.nodes = make(map[types.UID]nodeRow)
-		m.deployments = make(map[types.UID]deploymentRow)
-		m.events = make(map[types.UID]eventRow)
-		m.namespaces = make(map[types.UID]nsRow)
-		m.services = make(map[types.UID]serviceRow)
-		m.ingresses = make(map[types.UID]ingressRow)
-		m.endpointSlices = make(map[types.UID]endpointSliceRow)
-		m.cursor = ""
-		m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents, m.syncedNamespaces = false, false, false, false, false
-		m.syncedServices, m.syncedIngresses = false, false
-		m.syncStartedAt = time.Now()
-		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 0, 0, false
-		m.netHistory = netRing{}
-		m.focusedMetrics = focusedMetricsState{}
-		m.restartBaseline = make(map[types.UID]int32)
-		// A scoped object on the previous cluster doesn't exist on the
-		// new one — close the lens rather than leave it filtered down
-		// to zero matches with no obvious way to recover. The
-		// dashboard's target is the same story, and it owns a log
-		// stream that has to stop with it.
-		m.eventsLens = eventsLensState{}
-		if m.dashboard.open {
-			m.dashboard = dashboardState{}
-			m.stopDashboardLogs()
-		}
-		return m, nil
-
 	case FleetDetailMsg:
 		// Guard on the cluster the dashboard requested, not on
 		// WatchedContext — the dashboard shows all clusters. A result
@@ -770,6 +801,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ProbeTickMsg:
+		m.expireNetwork(time.Time(msg))
 		m.sampleFleetTrends()
 		// A zero timestamp is immediately due: an offline expansion
 		// has no result, and when the probe later promotes that
@@ -1019,6 +1051,7 @@ func (m Model) openActionMenu() (tea.Model, tea.Cmd) {
 // acts on the target it drilled into, and on the replica selected in
 // its PODS pane.
 func (m Model) openActionMenuFor(ref cluster.DescribeRef, uid types.UID) (tea.Model, tea.Cmd) {
+	ref.UID = uid
 	m.actionMenu.open = true
 	m.actionMenu.ref = ref
 	m.actionMenu.uid = uid
@@ -1132,9 +1165,9 @@ func (m *Model) dispatchPermissionChecks(ref cluster.DescribeRef) []tea.Cmd {
 		ctxName := m.WatchedContext
 		ns := ref.Namespace
 		v := av
-		cmds = append(cmds, func() tea.Msg {
+		cmds = append(cmds, m.focusedCmd(func() tea.Msg {
 			return cb(ctxName, v.Verb, v.Group, v.Resource, ns)
-		})
+		}))
 	}
 	return cmds
 }
@@ -1165,9 +1198,9 @@ func (m *Model) dispatchRBACOverview() []tea.Cmd {
 			cb := m.OnCanI
 			ctxName := m.WatchedContext
 			verb, group, res, scope := p.Verb, p.APIGroup, p.Resource, ns
-			cmds = append(cmds, func() tea.Msg {
+			cmds = append(cmds, m.focusedCmd(func() tea.Msg {
 				return cb(ctxName, verb, group, res, scope)
-			})
+			}))
 		}
 	}
 	return cmds
@@ -1222,17 +1255,7 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 	case ActDescribe:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
-		if m.OnDescribe == nil {
-			return m, nil
-		}
-		m.describe.open = true
-		m.describe.loading = true
-		m.describe.scroll = 0
-		m.describe.result = cluster.DescribeResult{Ref: ref}
-		req := DescribeRequestMsg{Ref: ref, Reveal: false}
-		cb := m.OnDescribe
-		focused := m.WatchedContext
-		return m, func() tea.Msg { return cb(req, focused) }
+		return m.startDescribe(ref, false)
 	case ActLogs:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1262,7 +1285,7 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		cb := m.OnCordon
 		focused := m.WatchedContext
 		name := ref.Name
-		return m, func() tea.Msg { return cb(focused, name) }
+		return m, m.focusedCmd(func() tea.Msg { return cb(focused, name) })
 	case ActUncordon:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1272,7 +1295,7 @@ func (m Model) executeAction(a Action) (tea.Model, tea.Cmd) {
 		cb := m.OnUncordon
 		focused := m.WatchedContext
 		name := ref.Name
-		return m, func() tea.Msg { return cb(focused, name) }
+		return m, m.focusedCmd(func() tea.Msg { return cb(focused, name) })
 	case ActDrain:
 		ref := m.actionMenu.ref
 		m.actionMenu.open = false
@@ -1309,17 +1332,7 @@ func (m Model) openDescribe(reveal bool) (tea.Model, tea.Cmd) {
 	if !ok {
 		return m, nil
 	}
-	if m.OnDescribe == nil {
-		return m, nil
-	}
-	m.describe.open = true
-	m.describe.loading = true
-	m.describe.scroll = 0
-	m.describe.result = cluster.DescribeResult{Ref: ref}
-	req := DescribeRequestMsg{Ref: ref, Reveal: reveal}
-	cb := m.OnDescribe
-	focused := m.WatchedContext
-	return m, func() tea.Msg { return cb(req, focused) }
+	return m.startDescribe(ref, reveal)
 }
 
 // handleDescribeKey routes input while the describe overlay is open.
@@ -1330,14 +1343,9 @@ func (m Model) handleDescribeKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch k.String() {
 	case "esc", "q":
-		m.describe.open = false
-		// Drop the YAML buffer once the modal closes. When reveal=true
-		// was used the buffer holds plaintext Secret values; we don't
-		// want them to linger in the model for the rest of the session
-		// (panic stack dumps, scroll-up artefacts, etc.).
-		m.describe.result.YAML = ""
-		m.describe.revealed = false
+		m.closeDescribe()
 	case "ctrl+c":
+		m.closeDescribe()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case "j", "down":
@@ -1368,13 +1376,7 @@ func (m Model) handleDescribeKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// the entire session of this modal.
 		ref := m.describe.result.Ref
 		if ref.Kind == "Secret" && m.OnDescribe != nil {
-			m.describe.loading = true
-			m.describe.scroll = 0
-			m.describe.revealed = true
-			req := DescribeRequestMsg{Ref: ref, Reveal: true}
-			cb := m.OnDescribe
-			focused := m.WatchedContext
-			return m, func() tea.Msg { return cb(req, focused) }
+			return m.startDescribe(ref, true)
 		}
 	}
 	return m, nil
@@ -1441,7 +1443,7 @@ func (m Model) handleFilterKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *Model) cycleFocus(delta int) tea.Cmd {
 	// <=1 rather than ==0: with a single context the loop below lands
 	// back on the context already focused and "switches" to it, which
-	// cancels every watcher, blanks the tables via PodsClearedMsg and
+	// cancels every watcher, blanks the tables and
 	// pays for a full re-list — a visible resync in exchange for no
 	// navigation at all.
 	if len(m.Contexts) <= 1 || m.OnFocusChange == nil {
@@ -1489,17 +1491,25 @@ func (m *Model) cycleFocus(delta int) tea.Cmd {
 
 // focusContext points the watchers and the tables at ctx.
 func (m *Model) focusContext(c string) tea.Cmd {
+	if c == m.WatchedContext {
+		return nil
+	}
+	if m.focusLife != nil {
+		m.focusLife.cancel()
+	}
+	m.focusLife = newFocusLifetime()
+	m.focusGeneration++
 	m.WatchedContext = c
-	// Permissions are per-cluster — a stale entry from the old
-	// context would let the new view paint a confident wrong
-	// answer (the RBAC overlay especially, which renders straight
-	// from cache). Drop both caches; they refill on demand.
-	m.permissions = make(map[string]permState)
-	m.permissionsInFlight = make(map[string]struct{})
+	// Clear before returning a command: its execution may be delayed
+	// or reordered relative to the next focus change.
+	m.clearFocusedState()
 	cb := m.OnFocusChange
+	focus := m.Focus()
 	return func() tea.Msg {
-		cb(c)
-		return PodsClearedMsg{}
+		if cb != nil {
+			cb(focus)
+		}
+		return nil
 	}
 }
 
@@ -1554,7 +1564,7 @@ func uidIndex(uids []types.UID, uid types.UID) int {
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // emptyPlaceholder produces the right-shaped "no rows" text for a view.
-// When the informer for that view hasn't fired its first event yet we
+// Until the informer has delivered its initial objects we
 // show a syncing line with the elapsed seconds so the user can tell
 // the difference between "still loading" and "loaded, zero rows".
 func (m Model) emptyPlaceholder(synced bool, kindPlural string) string {
@@ -1596,6 +1606,70 @@ func (m Model) View() string {
 		bodyHeight = 1
 	}
 
+	var body string
+	// Overlay precedence (highest first):
+	// logs → confirms (delete/scale/restart) → describe → action menu
+	// → exec picker → help → ns picker.
+	switch {
+	case m.logs.open:
+		body = m.renderLogs(m.width, bodyHeight)
+	case m.deleteConfirm.open:
+		body = m.renderDeleteConfirm(m.width, bodyHeight)
+	case m.scaleConfirm.open:
+		body = m.renderScaleConfirm(m.width, bodyHeight)
+	case m.restartConfirm.open:
+		body = m.renderRestartConfirm(m.width, bodyHeight)
+	case m.drainProgress.open:
+		body = m.renderDrainProgress(m.width, bodyHeight)
+	case m.drainConfirm.open:
+		body = m.renderDrainConfirm(m.width, bodyHeight)
+	case m.describe.open:
+		body = m.renderDescribe(m.width, bodyHeight)
+	case m.eventsLens.open:
+		body = m.renderEventsLens(m.width, bodyHeight)
+	case m.actionMenu.open:
+		// Floating overlay: keep the underlying table visible around
+		// the menu so the user can still see the row they came from.
+		// clampCanvas below guarantees the composited result matches
+		// (m.width, bodyHeight) — overlayAt only splices, it doesn't
+		// alter visible dimensions.
+		body = clampCanvas(m.renderBody(bodyHeight, fleetFull), m.width, bodyHeight)
+		panel := m.renderActionMenuPanel()
+		panelW, panelH := lipgloss.Width(panel), lipgloss.Height(panel)
+		col := (m.width - panelW) / 2
+		row := (bodyHeight - panelH) / 2
+		if row < 0 {
+			row = 0
+		}
+		body = overlayAt(body, panel, col, row)
+	case m.exec.pickerOpen:
+		body = m.renderExecPicker(m.width, bodyHeight)
+	case m.helpOpen:
+		body = m.renderHelp(m.width, bodyHeight)
+	case m.rbacOpen:
+		body = m.renderRBAC(m.width, bodyHeight)
+	case m.nsPickerOpen:
+		body = m.renderNsPicker(m.width, bodyHeight)
+	default:
+		body = m.renderBody(bodyHeight, fleetFull)
+	}
+	// Body and footer are run through clampCanvas so their dimensions
+	// match what bodyHeight + footerHeight told JoinVertical to expect.
+	// Without this, trailing newlines in body strings or wider-than-
+	// inner separators in overlay boxes silently add visual rows that
+	// scroll the top header line off the alt-screen.
+	footerH := lipgloss.Height(footer)
+	body = clampCanvas(body, m.width, bodyHeight)
+	footer = clampCanvas(footer, m.width, footerH)
+	if noHeader {
+		// Joining the empty header string would add a phantom blank
+		// row; the full-bleed layout has no header at all.
+		return lipgloss.JoinVertical(lipgloss.Left, body, footer)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+}
+
+func (m Model) renderBody(bodyHeight int, fleetFull bool) string {
 	mainWidth := m.width - SidebarWidth
 	var body string
 	switch {
@@ -1623,64 +1697,7 @@ func (m Model) View() string {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, main)
 	}
 
-	// Overlay precedence (highest first):
-	// logs → confirms (delete/scale/restart) → describe → action menu
-	// → exec picker → help → ns picker.
-	switch {
-	case m.logs.open:
-		body = m.renderLogs(m.width, bodyHeight)
-	case m.deleteConfirm.open:
-		body = m.renderDeleteConfirm(m.width, bodyHeight)
-	case m.scaleConfirm.open:
-		body = m.renderScaleConfirm(m.width, bodyHeight)
-	case m.restartConfirm.open:
-		body = m.renderRestartConfirm(m.width, bodyHeight)
-	case m.drainProgress.open:
-		body = m.renderDrainProgress(m.width, bodyHeight)
-	case m.drainConfirm.open:
-		body = m.renderDrainConfirm(m.width, bodyHeight)
-	case m.describe.open:
-		body = m.renderDescribe(m.width, bodyHeight)
-	case m.eventsLens.open:
-		body = m.renderEventsLens(m.width, bodyHeight)
-	case m.actionMenu.open:
-		// Floating overlay: keep the underlying table visible around
-		// the menu so the user can still see the row they came from.
-		// clampCanvas below guarantees the composited result matches
-		// (m.width, bodyHeight) — overlayAt only splices, it doesn't
-		// alter visible dimensions.
-		body = clampCanvas(body, m.width, bodyHeight)
-		panel := m.renderActionMenuPanel()
-		panelW, panelH := lipgloss.Width(panel), lipgloss.Height(panel)
-		col := (m.width - panelW) / 2
-		row := (bodyHeight - panelH) / 2
-		if row < 0 {
-			row = 0
-		}
-		body = overlayAt(body, panel, col, row)
-	case m.exec.pickerOpen:
-		body = m.renderExecPicker(m.width, bodyHeight)
-	case m.helpOpen:
-		body = m.renderHelp(m.width, bodyHeight)
-	case m.rbacOpen:
-		body = m.renderRBAC(m.width, bodyHeight)
-	case m.nsPickerOpen:
-		body = m.renderNsPicker(m.width, bodyHeight)
-	}
-	// Body and footer are run through clampCanvas so their dimensions
-	// match what bodyHeight + footerHeight told JoinVertical to expect.
-	// Without this, trailing newlines in body strings or wider-than-
-	// inner separators in overlay boxes silently add visual rows that
-	// scroll the top header line off the alt-screen.
-	footerH := lipgloss.Height(footer)
-	body = clampCanvas(body, m.width, bodyHeight)
-	footer = clampCanvas(footer, m.width, footerH)
-	if noHeader {
-		// Joining the empty header string would add a phantom blank
-		// row; the header-less layouts have no header at all.
-		return lipgloss.JoinVertical(lipgloss.Left, body, footer)
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
+	return body
 }
 
 // chromeHeights returns the header and footer heights View() will use,
@@ -1720,13 +1737,23 @@ func (m Model) mainPane(height, width int) string {
 // visibleUIDs returns the set of UIDs currently visible (filter +
 // namespace + view) so cursor logic can be written generically.
 func (m Model) visibleUIDs() []types.UID {
+	if m.view == ViewCluster {
+		return nil
+	}
+	if m.view == ViewFleet {
+		return make([]types.UID, len(m.fleetOrder()))
+	}
+	return m.tableUIDs(m.view)
+}
+
+func (m Model) buildTableUIDs(view View) []types.UID {
 	needle := strings.ToLower(m.filterText)
-	switch m.view {
+	switch view {
 	case ViewNodes:
 		rows := sortedNodeRows(m.nodes)
 		out := make([]types.UID, 0, len(rows))
 		for _, r := range rows {
-			if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
+			if !matchesNames("", r.Name, "", needle) {
 				continue
 			}
 			out = append(out, r.UID)
@@ -1736,12 +1763,7 @@ func (m Model) visibleUIDs() []types.UID {
 		rows := sortedDeployRows(m.deployments)
 		out := make([]types.UID, 0, len(rows))
 		for _, r := range rows {
-			if m.namespace != "" && r.Namespace != m.namespace {
-				continue
-			}
-			if needle != "" &&
-				!strings.Contains(strings.ToLower(r.Name), needle) &&
-				!strings.Contains(strings.ToLower(r.Namespace), needle) {
+			if !matchesNames(r.Namespace, r.Name, m.namespace, needle) {
 				continue
 			}
 			out = append(out, r.UID)
@@ -1753,11 +1775,11 @@ func (m Model) visibleUIDs() []types.UID {
 		// view should still show every namespace. Walk in the same
 		// order the renderer paints (active sort key + direction) so
 		// j/k step through the visible table.
-		counts := m.collectNsCounts()
+		counts := m.namespaceCounts()
 		rows := sortedNsRows(m.namespaces, m.nsSortKey, m.nsSortDesc, counts)
 		out := make([]types.UID, 0, len(rows))
 		for _, r := range rows {
-			if needle != "" && !strings.Contains(strings.ToLower(r.Name), needle) {
+			if !matchesNames("", r.Name, "", needle) {
 				continue
 			}
 			out = append(out, r.UID)
@@ -1779,17 +1801,7 @@ func (m Model) visibleUIDs() []types.UID {
 			out = append(out, r.UID)
 		}
 		return out
-	case ViewCluster:
-		return nil
-	case ViewFleet:
-		// The dashboard's cursor is context-keyed, not UID-keyed; this
-		// only feeds the filter footer's matched count.
-		order := m.fleetOrder()
-		out := make([]types.UID, 0, len(order))
-		for range order {
-			out = append(out, "")
-		}
-		return out
+
 	}
 	rows := m.visibleRows()
 	out := make([]types.UID, 0, len(rows))
@@ -1803,22 +1815,12 @@ func (m Model) visibleUIDs() []types.UID {
 // sorted pod rows. Text filter matches namespace and name (case-insensitive).
 func (m Model) visibleRows() []podRow {
 	rows := sortedRows(m.pods, m.sortKey, m.sortDesc)
-	needle := ""
-	if m.filterText != "" {
-		needle = strings.ToLower(m.filterText)
-	}
+	needle := strings.ToLower(m.filterText)
 	out := make([]podRow, 0, len(rows))
 	for _, r := range rows {
-		if m.namespace != "" && r.Namespace != m.namespace {
-			continue
+		if matchesNames(r.Namespace, r.Name, m.namespace, needle) {
+			out = append(out, r)
 		}
-		if needle != "" {
-			if !strings.Contains(strings.ToLower(r.Namespace), needle) &&
-				!strings.Contains(strings.ToLower(r.Name), needle) {
-				continue
-			}
-		}
-		out = append(out, r)
 	}
 	return out
 }
@@ -1852,10 +1854,7 @@ func (m Model) renderHeader() string {
 // looking at.
 func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 	dot := m.Theme.styleForReach(st.Reach).Render(st.Reach.Glyph())
-	display := st.RawName
-	if display == "" {
-		display = m.WatchedContext
-	}
+	display := m.WatchedContext
 	ns := m.namespace
 	if ns == "" {
 		ns = "all"
@@ -1883,7 +1882,7 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 		fmt.Sprintf(" kubetin %s · ns:%s · %s ", strings.TrimSpace(display), ns, viewLabel),
 	)
 
-	visible := len(m.visibleUIDs())
+	visible, _ := m.filterCounts()
 	right := fmt.Sprintf(" %d/%d %s · %s · %s ",
 		visible, total, viewLabel, st.Reach, time.Now().Format("15:04:05"))
 	right = m.Theme.Dim.Render(right)
@@ -1904,19 +1903,9 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 // modal swap, and the sidebar's compact bars don't carry the
 // absolute numbers a top-like tool needs.
 func (m Model) renderHeaderMetrics(st model.ClusterState) string {
-	// Pod phase tally — only walk if we have pods cached. This is the
-	// focused cluster's pod set, not a fleet aggregate.
-	var running, pending, failed int
-	for _, p := range m.pods {
-		switch p.Phase {
-		case corev1.PodRunning:
-			running++
-		case corev1.PodPending:
-			pending++
-		case corev1.PodFailed:
-			failed++
-		}
-	}
+	// The focused cluster's phase tally changes only with pod membership
+	// or phase updates, independently of the table's sort and filters.
+	running, pending, failed := m.podPhaseCounts()
 
 	podStr := fmt.Sprintf("pods %d", len(m.pods))
 	if pending > 0 || failed > 0 {
@@ -1943,12 +1932,12 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 		verStr = "—"
 	}
 
-	// Network panel: only show when we have a real reading. Hidden
-	// otherwise so users without nodes/proxy RBAC don't see "0 B/s"
-	// that they can't act on.
+	// Show rates only while fresh; failed or expired samples show status.
 	netStr := ""
 	if m.clusterNetOK {
-		netStr = fmt.Sprintf("  ·  ↓ %s  ↑ %s", formatRate(m.clusterNetRX), formatRate(m.clusterNetTX))
+		netStr = fmt.Sprintf("  ·  %s↓ %s  ↑ %s", m.clusterNetCoverage, formatRate(m.clusterNetRX), formatRate(m.clusterNetTX))
+	} else if m.clusterNetStatus != "" {
+		netStr = "  ·  net " + m.clusterNetStatus
 	}
 
 	// Right-side context strip (net · pods · nodes · version) is
@@ -2065,11 +2054,15 @@ func (m Model) filterCounts() (matched, total int) {
 	case ViewFleet:
 		total = len(m.Contexts)
 	case ViewCluster:
-		total = 0
+		return 0, 0
 	default:
 		total = len(m.pods)
 	}
-	matched = len(m.visibleUIDs())
+	if m.view == ViewFleet {
+		matched = len(m.fleetOrder())
+	} else {
+		matched = m.tableCount(m.view)
+	}
 	return
 }
 
@@ -2094,7 +2087,7 @@ var podColumns = []column{
 }
 
 func (m Model) renderTable(maxRows int, maxWidth int) string {
-	rows := m.visibleRows()
+	rows := rowsForUIDs(m.pods, m.windowUIDs(ViewPods, maxRows))
 
 	// maxWidth-1: the warn-glyph column prefixes every line.
 	w := fitColumns(podColumns, maxWidth-1)
@@ -2137,36 +2130,13 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 	b.WriteString(header)
 	b.WriteByte('\n')
 
-	if len(rows) == 0 {
+	if m.tableCount(ViewPods) == 0 {
 		b.WriteString(m.emptyPlaceholder(m.syncedPods, "pods"))
 		return b.String()
 	}
 
-	visible := rows
-	if maxRows > 0 && len(visible) > maxRows-1 {
-		// Keep cursor in view: simple windowing centered on cursor.
-		idx := rowIndex(rows, m.cursor)
-		if idx < 0 {
-			idx = 0
-		}
-		half := (maxRows - 1) / 2
-		start := idx - half
-		if start < 0 {
-			start = 0
-		}
-		end := start + (maxRows - 1)
-		if end > len(rows) {
-			end = len(rows)
-			start = end - (maxRows - 1)
-			if start < 0 {
-				start = 0
-			}
-		}
-		visible = rows[start:end]
-	}
-
 	warnIdx := recentWarningIndex(m.events)
-	for _, r := range visible {
+	for _, r := range rows {
 		cpuStr, memStr := "—", "—"
 		if r.HasMetrics {
 			cpuStr = formatCPU(r.CPUMilli)
@@ -2176,11 +2146,7 @@ func (m Model) renderTable(maxRows int, maxWidth int) string {
 		if p, ok := podMemPct(r); ok {
 			memPctCell = m.Theme.loadStyle(p).Render(fmt.Sprintf("%d%%", p))
 		}
-		rxStr, txStr := "—", "—"
-		if r.HasNetwork {
-			rxStr = formatRate(r.NetRXBps)
-			txStr = formatRate(r.NetTXBps)
-		}
+		rxStr, txStr := r.networkDisplay()
 		line := warnGlyph(warnIdx, "Pod", r.Namespace, r.Name, m.Theme) + joinCells(
 			padCol(r.Namespace, w[0], m.Theme.Base),
 			padCol(r.Name, w[1], m.Theme.Base),

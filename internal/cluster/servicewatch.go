@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,21 +53,22 @@ type ServiceEvent struct {
 }
 
 // ServiceWatcher mirrors DeployWatcher: a namespaced informer feeding a
-// bounded channel, dropping on consumer backpressure.
+// bounded channel with coalesced state delivery on consumer backpressure.
 type ServiceWatcher struct {
-	Context       string
-	Out           chan ServiceEvent
-	DroppedEvents atomic.Uint64
+	Context string
+	*eventDelivery[ServiceEvent]
 }
 
 func NewServiceWatcher(ctxName string, cap int) *ServiceWatcher {
 	return &ServiceWatcher{
-		Context: ctxName,
-		Out:     make(chan ServiceEvent, cap),
+		Context:       ctxName,
+		eventDelivery: newEventDelivery[ServiceEvent](cap),
 	}
 }
 
 func (w *ServiceWatcher) Run(ctx context.Context, sup *Supervisor) error {
+	ctx, stop := w.start(ctx)
+	defer stop()
 	restCfg, err := sup.RestConfigFor(w.Context)
 	if err != nil {
 		return fmt.Errorf("rest config: %w", err)
@@ -152,9 +152,5 @@ func (w *ServiceWatcher) emit(kind SvcEventKind, obj any) {
 		Selector:     copyLabels(svc.Spec.Selector),
 		CreatedAt:    svc.CreationTimestamp.Time,
 	}
-	select {
-	case w.Out <- ev:
-	default:
-		w.DroppedEvents.Add(1)
-	}
+	w.publish(ev.UID, ev, kind == SvcDeleted)
 }

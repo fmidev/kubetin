@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -11,10 +12,7 @@ import (
 	"github.com/fmidev/kubetin/internal/cluster"
 )
 
-// drainConfirmState is the simple y/N modal that gates Drain. We
-// don't ask the user to type the node name (the way the Delete
-// confirm does) because drain is recoverable — uncordon brings the
-// node back. Delete is irreversible; drain is just expensive.
+// drainConfirmState holds the confirmation before drain preflight.
 type drainConfirmState struct {
 	open    bool
 	node    string
@@ -25,28 +23,47 @@ type drainConfirmState struct {
 // the drain is dispatched. It absorbs the stream of cluster.DrainProgress
 // events the supervisor sends down a channel via DrainProgressMsg.
 //
-// "blocked" pods (PDB violations past retries) accumulate in a list
+// "blocked" pods (failed eviction requests) accumulate in a list
 // so the user can see exactly what's stuck rather than just a count;
 // successfully-evicted pods just bump the Done counter.
 type drainProgressState struct {
-	open    bool
-	context string // origin cluster, for the Tab-away guard
-	node    string
-	current string // pod currently being evicted
-	done    int
-	total   int
-	blocked []string // ns/name of pods that exceeded PDB retries
-	phase   string   // mirrors cluster.DrainProgress.Phase
-	err     string
-	cancel  func()
-	started time.Time
+	session      uint64
+	request      *modalRequest
+	acknowledged bool
+	finished     bool
+	open         bool
+	context      string // origin cluster, for the Tab-away guard
+	node         string
+	current      string // pod currently being evicted
+	done         int
+	total        int
+	blocked      []string // ns/name and error for pods whose eviction failed
+	remaining    []string
+	phase        string // mirrors cluster.DrainProgress.Phase
+	err          string
+	cancel       func()
+	started      time.Time
+}
+
+// DrainRequest allocates cancellation and identity before startup is queued.
+type DrainRequest struct {
+	Context context.Context
+	Focus   FocusTarget
+	Session uint64
+	Node    string
+}
+
+// DrainMsg binds every event, including the startup acknowledgement, to one drain.
+type DrainMsg struct {
+	Session uint64
+	Msg     tea.Msg
 }
 
 // DrainStartMsg / DrainProgressMsg / DrainDoneMsg are the lifecycle
 // of one drain operation. Start surfaces a fatal setup error (RBAC
 // or kubeconfig failure before the first evict); Progress is one
-// event per pod / phase transition; Done fires once and closes the
-// modal.
+// event per pod / phase transition; Done closes a successful drain
+// or leaves an incomplete result open for inspection.
 type DrainStartMsg struct {
 	Context string
 	Node    string
@@ -57,21 +74,37 @@ type DrainStartMsg struct {
 type DrainProgressMsg cluster.DrainProgress
 
 type DrainDoneMsg struct {
-	Context string
-	Node    string
-	Done    int
-	Total   int
-	Err     string
-	Blocked []string
+	Context   string
+	Node      string
+	Done      int
+	Total     int
+	Err       string
+	Blocked   []string
+	Remaining []string
 }
 
 // openDrainConfirm shows the y/N modal for the given node. The
 // actual drain doesn't start until the user confirms.
 func (m Model) openDrainConfirm(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
+	m.stopDrain()
 	m.drainConfirm.open = true
 	m.drainConfirm.node = ref.Name
 	m.drainConfirm.pending = false
 	return m, nil
+}
+
+func (m *Model) cancelDrain() {
+	m.drainProgress.request.stop()
+	if m.drainProgress.cancel != nil {
+		m.drainProgress.cancel()
+		m.drainProgress.cancel = nil
+	}
+}
+
+func (m *Model) stopDrain() {
+	m.cancelDrain()
+	m.drainProgress = drainProgressState{}
+	m.drainConfirm = drainConfirmState{}
 }
 
 // handleDrainConfirmKey routes input while the confirm modal is open.
@@ -79,17 +112,22 @@ func (m Model) handleDrainConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.drainConfirm.pending {
 		// In-flight: ignore everything except Esc (still allow
 		// cancelling before the supervisor accepts).
-		if k.String() == "esc" || k.String() == "q" {
-			m.drainConfirm.open = false
-			m.drainConfirm.pending = false
+		switch k.String() {
+		case "esc", "q":
+			m.stopDrain()
+		case "ctrl+c":
+			m.stopDrain()
+			m.quitMsg = "bye"
+			return m, tea.Quit
 		}
 		return m, nil
 	}
 	switch k.String() {
 	case "esc", "q", "n", "N":
-		m.drainConfirm.open = false
+		m.stopDrain()
 		return m, nil
 	case "ctrl+c":
+		m.stopDrain()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case "y", "Y", "enter":
@@ -100,8 +138,19 @@ func (m Model) handleDrainConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.drainConfirm.pending = true
 		cb := m.OnDrainStart
 		node := m.drainConfirm.node
-		focused := m.WatchedContext
-		return m, func() tea.Msg { return cb(focused, node) }
+		m.drainSession++
+		request := newModalRequest(m.focusLife.ctx)
+		m.drainProgress = drainProgressState{
+			session: m.drainSession, request: request,
+			context: m.WatchedContext, node: node, phase: "starting", started: time.Now(),
+		}
+		req := DrainRequest{Context: request.ctx, Focus: m.Focus(), Session: m.drainSession, Node: node}
+		return m, m.focusedCmd(func() tea.Msg {
+			if req.Context.Err() != nil {
+				return nil
+			}
+			return DrainMsg{Session: req.Session, Msg: cb(req)}
+		})
 	}
 	return m, nil
 }
@@ -113,11 +162,16 @@ func (m Model) handleDrainConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleDrainProgressKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "esc", "q":
-		if m.drainProgress.cancel != nil {
-			m.drainProgress.cancel()
+		if m.drainProgress.finished {
+			m.stopDrain()
+			return m, nil
 		}
+		// Keep the identity until the terminal summary arrives, including
+		// confirmation of pods whose eviction was already accepted.
+		m.cancelDrain()
 		return m, nil
 	case "ctrl+c":
+		m.stopDrain()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	}
@@ -128,23 +182,31 @@ func (m Model) handleDrainProgressKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 // opens the progress modal and remembers the cancel function. On
 // failure it surfaces a toast and closes the confirm modal.
 func (m Model) applyDrainStart(msg DrainStartMsg) (tea.Model, tea.Cmd) {
-	if msg.Context != m.WatchedContext {
+	if msg.Context != m.WatchedContext || msg.Node != m.drainProgress.node {
+		discardFocusedMessage(msg)
 		return m, nil
 	}
+	if m.drainProgress.acknowledged {
+		return m, nil
+	}
+	m.drainProgress.acknowledged = true
 	m.drainConfirm.open = false
 	m.drainConfirm.pending = false
 	if msg.Err != "" {
-		m.toast = "✕ Drain: " + msg.Err
+		discardFocusedMessage(msg)
+		m.cancelDrain()
+		m.drainProgress.finished = true
+		m.drainProgress.open = false
+		m.toast = "✕ Drain: " + cleanDetail(msg.Err)
 		m.toastUntil = time.Now().Add(5 * time.Second)
 		return m, tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
 	}
-	m.drainProgress = drainProgressState{
-		open:    true,
-		context: msg.Context,
-		node:    msg.Node,
-		cancel:  msg.Cancel,
-		started: time.Now(),
-		phase:   "starting",
+	// Progress may already have arrived. Attach the handle without
+	// replacing counters or the phase established by the forwarder.
+	m.drainProgress.open = true
+	m.drainProgress.cancel = msg.Cancel
+	if m.drainProgress.request != nil && m.drainProgress.request.ctx.Err() != nil {
+		m.cancelDrain()
 	}
 	return m, nil
 }
@@ -152,9 +214,11 @@ func (m Model) applyDrainStart(msg DrainStartMsg) (tea.Model, tea.Cmd) {
 // applyDrainProgress folds one DrainProgressMsg into drainProgressState.
 // Out-of-context messages are dropped (cluster Tab guard pattern).
 func (m Model) applyDrainProgress(msg DrainProgressMsg) (tea.Model, tea.Cmd) {
-	if msg.Context != m.drainProgress.context {
+	if msg.Context != m.drainProgress.context || msg.Node != m.drainProgress.node {
 		return m, nil
 	}
+	m.drainConfirm.open, m.drainConfirm.pending = false, false
+	m.drainProgress.open = true
 	m.drainProgress.phase = msg.Phase
 	if msg.Total > 0 {
 		m.drainProgress.total = msg.Total
@@ -163,28 +227,54 @@ func (m Model) applyDrainProgress(msg DrainProgressMsg) (tea.Model, tea.Cmd) {
 		m.drainProgress.done = msg.Done
 	}
 	switch msg.Phase {
-	case "evicting":
+	case "evicting", "accepted":
 		m.drainProgress.current = msg.Pod
 	case "blocked":
 		m.drainProgress.blocked = append(m.drainProgress.blocked,
-			msg.Pod+" ("+msg.Err+")")
+			msg.Pod+" ("+cleanDetail(msg.Err)+")")
 	}
 	return m, nil
 }
 
-// applyDrainDone is the terminal event. We close the progress modal
-// and surface a toast with the summary.
+// applyDrainDone retains incomplete results until the user dismisses them.
 func (m Model) applyDrainDone(msg DrainDoneMsg) (tea.Model, tea.Cmd) {
-	if msg.Context != m.WatchedContext {
+	if msg.Context != m.WatchedContext || msg.Node != m.drainProgress.node {
 		return m, nil
 	}
+	m.drainConfirm.open, m.drainConfirm.pending = false, false
+	m.cancelDrain()
+	m.drainProgress.finished = true
 	m.drainProgress.open = false
-	m.drainProgress.cancel = nil
+	m.drainProgress.phase = "done"
+	m.drainProgress.done = msg.Done
+	m.drainProgress.total = msg.Total
+	m.drainProgress.err = cleanDetail(msg.Err)
+	if msg.Total > msg.Done {
+		m.drainProgress.open = true
+		blockedDetails := make(map[string]string, len(msg.Blocked))
+		for _, detail := range msg.Blocked {
+			pod, _, _ := strings.Cut(detail, " (")
+			blockedDetails[pod] = cleanDetail(detail)
+		}
+		m.drainProgress.remaining = make([]string, len(msg.Remaining))
+		for i, pod := range msg.Remaining {
+			m.drainProgress.remaining[i] = cleanDetail(pod)
+			if detail, ok := blockedDetails[pod]; ok {
+				m.drainProgress.remaining[i] = detail
+			}
+		}
+	}
 	if msg.Err != "" {
-		m.toast = fmt.Sprintf("✕ Drain %s: %s", msg.Node, msg.Err)
+		if msg.Total == 0 {
+			m.toast = fmt.Sprintf("✕ Drain %s: %s", msg.Node, cleanDetail(msg.Err))
+		} else {
+			m.toast = fmt.Sprintf("✕ Drain %s: %d/%d terminated; %s", msg.Node, msg.Done, msg.Total, cleanDetail(msg.Err))
+		}
 	} else if len(msg.Blocked) > 0 {
-		m.toast = fmt.Sprintf("⚠ Drained %s: %d/%d (%d blocked by PDB)",
+		m.toast = fmt.Sprintf("⚠ Drain %s incomplete: %d/%d (%d blocked)",
 			msg.Node, msg.Done, msg.Total, len(msg.Blocked))
+	} else if msg.Done < msg.Total {
+		m.toast = fmt.Sprintf("⚠ Drain %s incomplete: %d/%d terminated", msg.Node, msg.Done, msg.Total)
 	} else {
 		m.toast = fmt.Sprintf("✓ Drained %s: %d/%d", msg.Node, msg.Done, msg.Total)
 	}
@@ -203,10 +293,12 @@ func (m Model) renderDrainConfirm(canvasWidth, canvasHeight int) string {
 		m.Theme.Dim.Render(" "+m.drainConfirm.node)
 	b.WriteString(title + "\n")
 	b.WriteString(m.Theme.Dim.Render(strings.Repeat("─", w-2)) + "\n\n")
-	b.WriteString(" This will cordon the node and evict every pod on it\n")
-	b.WriteString(" (except mirror pods, DaemonSet-owned pods, and pods\n")
-	b.WriteString(" that are already Succeeded / Failed). Pods blocked\n")
-	b.WriteString(" by a PodDisruptionBudget are reported individually.\n\n")
+	b.WriteString(" This will cordon the node, then check all candidates.\n")
+	b.WriteString(" No pods are evicted if any candidate uses emptyDir\n")
+	b.WriteString(" or its controller cannot be verified. The node stays\n")
+	b.WriteString(" cordoned if checks fail. Mirror, DaemonSet-owned,\n")
+	b.WriteString(" and completed pods are skipped. PDBs are respected.\n")
+	b.WriteString(" Waits for pod termination; stops after 10 minutes.\n\n")
 	if m.drainConfirm.pending {
 		b.WriteString(m.Theme.StatusWrn.Render(" starting…") + "\n")
 	} else {
@@ -231,34 +323,55 @@ func (m Model) renderDrainProgress(canvasWidth, canvasHeight int) string {
 
 	switch m.drainProgress.phase {
 	case "starting":
-		b.WriteString(" cordoning + listing pods…\n")
+		b.WriteString(" cordoning + checking pods and controllers…\n")
 	case "evicting":
-		fmt.Fprintf(&b, " %d / %d evicted    %s\n",
+		fmt.Fprintf(&b, " %d / %d terminated    %s\n",
 			m.drainProgress.done, m.drainProgress.total,
 			m.Theme.Dim.Render("evicting "+m.drainProgress.current))
+	case "waiting":
+		fmt.Fprintf(&b, " %d / %d terminated\n", m.drainProgress.done, m.drainProgress.total)
+		b.WriteString(m.Theme.Dim.Render(" waiting for pod termination") + "\n")
+	case "accepted":
+		fmt.Fprintf(&b, " %d / %d terminated\n", m.drainProgress.done, m.drainProgress.total)
+		b.WriteString(m.Theme.Dim.Render(" eviction accepted: "+truncate(m.drainProgress.current, w-24)) + "\n")
 	case "evicted", "blocked":
-		fmt.Fprintf(&b, " %d / %d evicted\n",
+		fmt.Fprintf(&b, " %d / %d terminated\n",
 			m.drainProgress.done, m.drainProgress.total)
+	case "done", "error":
+		fmt.Fprintf(&b, " Drain incomplete: %d / %d terminated\n", m.drainProgress.done, m.drainProgress.total)
+		if m.drainProgress.err != "" {
+			b.WriteString(" " + truncate(m.drainProgress.err, w-6) + "\n")
+		}
 	}
 
-	if n := len(m.drainProgress.blocked); n > 0 {
+	lines := m.drainProgress.blocked
+	label := "pod(s) blocked"
+	if len(m.drainProgress.remaining) > 0 {
+		lines = m.drainProgress.remaining
+		label = "pod(s) not confirmed terminated"
+	}
+	if n := len(lines); n > 0 {
 		b.WriteString("\n")
-		b.WriteString(m.Theme.StatusWrn.Render(fmt.Sprintf(" %d pod(s) blocked by PDB:\n", n)))
+		b.WriteString(m.Theme.StatusWrn.Render(fmt.Sprintf(" %d %s:", n, label)) + "\n")
 		// Cap to last 5 — for nodes with dozens of blocked pods the
 		// modal would otherwise grow taller than the canvas.
 		start := 0
 		if n > 5 {
 			start = n - 5
-			b.WriteString(m.Theme.Dim.Render(fmt.Sprintf("   …%d earlier omitted\n", start)))
+			b.WriteString(m.Theme.Dim.Render(fmt.Sprintf("   …%d earlier omitted", start)) + "\n")
 		}
-		for _, line := range m.drainProgress.blocked[start:] {
+		for _, line := range lines[start:] {
 			b.WriteString(m.Theme.Dim.Render("   " + truncate(line, w-6)))
 			b.WriteByte('\n')
 		}
 	}
 
 	b.WriteString("\n")
-	b.WriteString(m.Theme.Footer.Render(" esc to cancel  (already-evicted pods stay evicted)"))
+	if m.drainProgress.finished {
+		b.WriteString(m.Theme.Footer.Render(" esc to close  (node remains cordoned)"))
+	} else {
+		b.WriteString(m.Theme.Footer.Render(" esc to cancel  (accepted evictions continue)"))
+	}
 	return m.boxed(b.String(), w, canvasWidth, canvasHeight)
 }
 

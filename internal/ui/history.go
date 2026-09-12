@@ -49,9 +49,8 @@ type focusedMetricsState struct {
 }
 
 // noteRestartBaseline records a pod's restart count the first time
-// the watcher shows it to us. The informer's initial list arrives as
-// ordinary Added events with no end marker, so "restarts since the
-// watch started" can only be honest per pod: whatever a pod already
+// the watcher shows it to us. New pods also arrive after initial sync,
+// so "restarts since the watch started" is measured per pod: whatever it
 // had when first seen is the floor it is measured against.
 func noteRestartBaseline(baseline map[types.UID]int32, uid types.UID, restarts int32, deleted bool) {
 	if deleted {

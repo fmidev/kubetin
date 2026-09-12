@@ -1,8 +1,10 @@
 package ui
 
 import (
+	"context"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -11,8 +13,9 @@ import (
 // DescribeRequestMsg asks main to fetch a describe for the given ref.
 // (We tunnel through main because the supervisor lives there.)
 type DescribeRequestMsg struct {
-	Ref    cluster.DescribeRef
-	Reveal bool
+	Context context.Context
+	Ref     cluster.DescribeRef
+	Reveal  bool
 }
 
 // DescribeResultMsg is the response — fetched YAML or an error.
@@ -20,6 +23,7 @@ type DescribeResultMsg cluster.DescribeResult
 
 // describeState holds whatever we know about the open describe overlay.
 type describeState struct {
+	request *modalRequest
 	open    bool
 	loading bool
 	scroll  int
@@ -33,6 +37,27 @@ type describeState struct {
 	revealed bool
 }
 
+func (m Model) startDescribe(ref cluster.DescribeRef, reveal bool) (tea.Model, tea.Cmd) {
+	if m.OnDescribe == nil {
+		return m, nil
+	}
+	m.describe.request.stop()
+	request := newModalRequest(m.focusLife.ctx)
+	m.describe = describeState{
+		request: request, open: true, loading: true, revealed: reveal,
+		result: cluster.DescribeResult{Ref: ref},
+	}
+	req := DescribeRequestMsg{Context: request.ctx, Ref: ref, Reveal: reveal}
+	cb, focused := m.OnDescribe, m.WatchedContext
+	return m, m.modalCmd(request, func() tea.Msg { return cb(req, focused) })
+}
+
+func (m *Model) closeDescribe() {
+	m.describe.request.stop()
+	// Drop any revealed Secret YAML together with the request identity.
+	m.describe = describeState{}
+}
+
 // refForCursor returns the DescribeRef for the currently-selected row
 // in the active view, or false if there's no valid selection.
 func (m Model) refForCursor() (cluster.DescribeRef, bool) {
@@ -44,28 +69,28 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 		if r, ok := m.pods[m.cursor]; ok {
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "pods", Kind: "Pod",
-				Namespace: r.Namespace, Name: r.Name,
+				Namespace: r.Namespace, Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewDeployments:
 		if r, ok := m.deployments[m.cursor]; ok {
 			return cluster.DescribeRef{
 				Group: "apps", Version: "v1", Resource: "deployments", Kind: "Deployment",
-				Namespace: r.Namespace, Name: r.Name,
+				Namespace: r.Namespace, Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewNodes:
 		if r, ok := m.nodes[m.cursor]; ok {
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "nodes", Kind: "Node",
-				Name: r.Name,
+				Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewServices:
 		if r, ok := m.services[m.cursor]; ok {
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "services", Kind: "Service",
-				Namespace: r.Namespace, Name: r.Name,
+				Namespace: r.Namespace, Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewIngresses:
@@ -73,7 +98,7 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 			return cluster.DescribeRef{
 				Group: "networking.k8s.io", Version: "v1",
 				Resource: "ingresses", Kind: "Ingress",
-				Namespace: r.Namespace, Name: r.Name,
+				Namespace: r.Namespace, Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	case ViewNamespaces:
@@ -90,11 +115,12 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 					Resource: "projects",
 					Kind:     "Project",
 					Name:     r.Name,
+					UID:      m.cursor,
 				}, true
 			}
 			return cluster.DescribeRef{
 				Version: "v1", Resource: "namespaces", Kind: "Namespace",
-				Name: r.Name,
+				Name: r.Name, UID: m.cursor,
 			}, true
 		}
 	}

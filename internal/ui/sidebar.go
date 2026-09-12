@@ -169,11 +169,7 @@ func (m Model) renderSidebarRow(st model.ClusterState) string {
 	if nameWidth < 1 {
 		nameWidth = 1
 	}
-	displayName := st.RawName
-	if displayName == "" {
-		displayName = st.Context
-	}
-	name := truncate(displayName, nameWidth)
+	name := truncate(st.Context, nameWidth)
 
 	prefix := " "
 	if st.Context == m.WatchedContext {

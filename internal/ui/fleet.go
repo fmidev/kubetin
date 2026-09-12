@@ -502,10 +502,7 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 	// Offline rows: name plus the reason, nothing else pretends to be
 	// known.
 	if st.Reach == model.ReachUnreachable || st.Reach == model.ReachAuthFailed {
-		name := st.RawName
-		if name == "" {
-			name = st.Context
-		}
+		name := st.Context
 		nameW := width / 3
 		if nameW > 24 {
 			nameW = 24
@@ -529,10 +526,7 @@ func (m Model) renderFleetCompactRow(st model.ClusterState, width int) string {
 func (m Model) fleetRow(st model.ClusterState, spine, badges string, width int) string {
 	th := m.Theme
 
-	name := st.RawName
-	if name == "" {
-		name = st.Context
-	}
+	name := st.Context
 	badgesW := lipgloss.Width(badges)
 
 	type cell struct {

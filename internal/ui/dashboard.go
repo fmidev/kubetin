@@ -125,7 +125,7 @@ func (m *Model) prepareLogTarget(t dashboardTarget) {
 		if !ok {
 			return
 		}
-		p, ok := newestRunningPod(m.deployOwnedPods(d))
+		p, ok := newestRunningPod(m.deploymentPods(d))
 		if !ok {
 			return
 		}
@@ -165,7 +165,7 @@ func newestRunningPod(pods []podRow) (podRow, bool) {
 func podRefFor(p podRow) cluster.DescribeRef {
 	return cluster.DescribeRef{
 		Version: "v1", Resource: "pods", Kind: "Pod",
-		Namespace: p.Namespace, Name: p.Name,
+		Namespace: p.Namespace, Name: p.Name, UID: p.UID,
 	}
 }
 
@@ -176,9 +176,12 @@ func podRefFor(p podRow) cluster.DescribeRef {
 func (m *Model) startDashboardLogs() tea.Cmd {
 	ref := m.dashboard.logRef
 	if ref.Name == "" {
+		m.stopDashboardLogs()
+		m.logs.session++ // Reject messages already queued by the canceled stream.
+		m.logs.lineBase += len(m.logs.lines)
 		m.logs.lines = nil
+		m.recomputeLogsMatches()
 		m.logs.err = "no pod available to stream logs from"
-		m.logs.streaming = false
 		return nil
 	}
 	if st, ok := m.permissions[cluster.PermissionKey(m.WatchedContext, "get", "", "pods/log", ref.Namespace)]; ok && !st.Allowed {
@@ -216,8 +219,9 @@ func (m Model) popDashboard() (tea.Model, tea.Cmd) {
 
 func (m *Model) stopDashboardLogs() tea.Cmd {
 	m.logs.streaming = false
-	if m.OnLogsStop != nil {
-		m.OnLogsStop()
+	if m.logs.cancel != nil {
+		m.logs.cancel()
+		m.logs.cancel = nil
 	}
 	return nil
 }
@@ -246,7 +250,7 @@ func (m Model) dashSubjectNow() (dashSubject, bool) {
 		if !ok {
 			return dashSubject{}, false
 		}
-		return dashSubject{Kind: "Deployment", Deploy: d, Pods: m.deployOwnedPods(d)}, true
+		return dashSubject{Kind: "Deployment", Deploy: d, Pods: m.deploymentPods(d)}, true
 	}
 	r, ok := m.pods[t.UID]
 	if !ok {
@@ -815,7 +819,7 @@ func (m Model) openDescribeFor(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
 	cb := m.OnDescribe
 	focused := m.WatchedContext
 	req := DescribeRequestMsg{Ref: ref}
-	return m, func() tea.Msg { return cb(req, focused) }
+	return m, m.focusedCmd(func() tea.Msg { return cb(req, focused) })
 }
 
 // drillIntoSelectedPod pushes the pod under the PODS-pane cursor onto

@@ -14,6 +14,7 @@ import (
 // scaleConfirmState owns the Scale modal — single-line numeric input
 // pre-populated with the deployment's current replica count.
 type scaleConfirmState struct {
+	request *modalRequest
 	open    bool
 	ref     cluster.DescribeRef
 	current int32
@@ -26,6 +27,8 @@ type scaleConfirmState struct {
 type ScaleResultMsg cluster.ScaleResult
 
 func (m Model) openScaleConfirm(ref cluster.DescribeRef) (tea.Model, tea.Cmd) {
+	m.scaleConfirm.request.stop()
+	m.scaleConfirm.request = newModalRequest(m.focusLife.ctx)
 	current := int32(0)
 	for _, d := range m.deployments {
 		if d.Namespace == ref.Namespace && d.Name == ref.Name {
@@ -47,9 +50,11 @@ func (m Model) handleScaleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// ctrl+c must still quit even while "scaling…" is on screen.
 		switch k.Type {
 		case tea.KeyEsc:
+			m.scaleConfirm.request.stop()
 			m.scaleConfirm.open = false
 			m.scaleConfirm.pending = false
 		case tea.KeyCtrlC:
+			m.scaleConfirm.request.stop()
 			m.quitMsg = "bye"
 			return m, tea.Quit
 		}
@@ -57,9 +62,11 @@ func (m Model) handleScaleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch k.Type {
 	case tea.KeyEsc:
+		m.scaleConfirm.request.stop()
 		m.scaleConfirm.open = false
 		return m, nil
 	case tea.KeyCtrlC:
+		m.scaleConfirm.request.stop()
 		m.quitMsg = "bye"
 		return m, tea.Quit
 	case tea.KeyBackspace:
@@ -90,7 +97,7 @@ func (m Model) handleScaleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		cb := m.OnScale
 		focused := m.WatchedContext
 		replicas := int32(n)
-		return m, func() tea.Msg { return cb(focused, ref, replicas) }
+		return m, m.modalCmd(m.scaleConfirm.request, func() tea.Msg { return cb(focused, ref, replicas) })
 	case tea.KeyRunes:
 		// Digits only — ignore stray letters so the input never
 		// becomes invalid mid-typing.

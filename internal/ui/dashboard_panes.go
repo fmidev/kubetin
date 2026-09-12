@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/fmidev/kubetin/internal/cluster"
 )
@@ -72,10 +73,11 @@ func (m Model) renderDashPodStatus(r podRow, w, h int) string {
 		dashField("cpu", formatCPU(r.CPUMilli), th.Base, th),
 		memField,
 	}
-	if r.HasNetwork {
+	if r.HasNetwork || !r.NetAt.IsZero() {
+		rx, tx := r.networkDisplay()
 		line2 = append(line2,
-			dashField("↓", formatRate(r.NetRXBps), th.Base, th),
-			dashField("↑", formatRate(r.NetTXBps), th.Base, th))
+			dashField("↓", rx, th.Base, th),
+			dashField("↑", tx, th.Base, th))
 	}
 	if r.ServiceAccount != "" {
 		line2 = append(line2, dashField("sa", r.ServiceAccount, th.Base, th))
@@ -641,22 +643,12 @@ func (m Model) renderDashDeployStatus(d deploymentRow, w, h int) string {
 	return clampCanvas(strings.Join(rows, "\n"), w, h)
 }
 
-// formatSelector renders match labels in the k=v,k=v form kubectl
-// prints, sorted so the string is stable across renders.
-func formatSelector(sel map[string]string) string {
-	if len(sel) == 0 {
+func formatSelector(sel *metav1.LabelSelector) string {
+	compiled, err := metav1.LabelSelectorAsSelector(sel)
+	if err != nil {
 		return ""
 	}
-	keys := make([]string, 0, len(sel))
-	for k := range sel {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, k+"="+sel[k])
-	}
-	return strings.Join(parts, ",")
+	return compiled.String()
 }
 
 // dashPodColumns for the deployment's owned-pod list. POD never drops;
@@ -719,46 +711,6 @@ func windowAround(lines []string, cursor, h int) []string {
 		start = len(lines) - h
 	}
 	return lines[start : start+h]
-}
-
-// deployOwnedPods resolves the deployment's pods by label selector.
-// That's exact, unlike matching on the "<name>-" prefix, which also
-// catches a "payments-api-worker" deployment's pods when you're
-// looking at "payments-api". The prefix heuristic stays as a fallback
-// for the case where no selector was projected at all.
-func (m Model) deployOwnedPods(d deploymentRow) []podRow {
-	out := make([]podRow, 0, 8)
-	if len(d.Selector) > 0 {
-		for _, p := range m.pods {
-			if p.Namespace == d.Namespace && labelsMatch(p.Labels, d.Selector) {
-				out = append(out, p)
-			}
-		}
-	} else {
-		prefix := d.Name + "-"
-		for _, p := range m.pods {
-			if p.Namespace == d.Namespace && strings.HasPrefix(p.Name, prefix) {
-				out = append(out, p)
-			}
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Name != out[j].Name {
-			return out[i].Name < out[j].Name
-		}
-		return out[i].UID < out[j].UID
-	})
-	return out
-}
-
-// labelsMatch reports whether labels satisfies every key/value in sel.
-func labelsMatch(labels, sel map[string]string) bool {
-	for k, v := range sel {
-		if labels[k] != v {
-			return false
-		}
-	}
-	return true
 }
 
 // dashDeployEvents gathers the three event sources that matter for a

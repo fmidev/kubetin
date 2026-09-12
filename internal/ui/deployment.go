@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/fmidev/kubetin/internal/cluster"
@@ -27,7 +29,7 @@ type deploymentRow struct {
 	StrategyType   string
 	MaxSurge       string
 	MaxUnavailable string
-	Selector       map[string]string
+	Selector       *metav1.LabelSelector
 	Conditions     []cluster.DeployCondition
 }
 
@@ -70,6 +72,31 @@ func sortedDeployRows(m map[types.UID]deploymentRow) []deploymentRow {
 	return out
 }
 
+// deploymentPods groups pods by the deployment's selector, as log lookup
+// does in kubectl. It does not establish the ReplicaSet ownership chain.
+func (m Model) deploymentPods(d deploymentRow) []podRow {
+	if d.Selector == nil {
+		return nil
+	}
+	sel, err := metav1.LabelSelectorAsSelector(d.Selector)
+	if err != nil || sel.Empty() {
+		return nil
+	}
+	out := make([]podRow, 0, 8)
+	for _, p := range m.pods {
+		if p.Namespace == d.Namespace && sel.Matches(labels.Set(p.Labels)) {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].UID < out[j].UID
+	})
+	return out
+}
+
 // deployColumns in display order; UP-TO-DATE and AVAILABLE drop
 // first (READY already carries the health signal), DEPLOYMENT never
 // drops and absorbs spare width.
@@ -84,23 +111,7 @@ var deployColumns = []column{
 
 // renderDeployTable mirrors the pod / node tables.
 func (m Model) renderDeployTable(maxRows, maxWidth int) string {
-	// Apply the same namespace + text filter the cursor logic in
-	// visibleUIDs uses, otherwise the rendered table includes rows the
-	// cursor can't reach and `n: <ns>` looks broken.
-	all := sortedDeployRows(m.deployments)
-	needle := strings.ToLower(m.filterText)
-	rows := make([]deploymentRow, 0, len(all))
-	for _, r := range all {
-		if m.namespace != "" && r.Namespace != m.namespace {
-			continue
-		}
-		if needle != "" &&
-			!strings.Contains(strings.ToLower(r.Name), needle) &&
-			!strings.Contains(strings.ToLower(r.Namespace), needle) {
-			continue
-		}
-		rows = append(rows, r)
-	}
+	rows := rowsForUIDs(m.deployments, m.windowUIDs(ViewDeployments, maxRows))
 
 	w := fitColumns(deployColumns, maxWidth-1)
 
@@ -118,40 +129,9 @@ func (m Model) renderDeployTable(maxRows, maxWidth int) string {
 	b.WriteString(header)
 	b.WriteByte('\n')
 
-	if len(rows) == 0 {
+	if m.tableCount(ViewDeployments) == 0 {
 		b.WriteString(m.emptyPlaceholder(m.syncedDeploys, "deployments"))
 		return b.String()
-	}
-
-	// Cursor-centred windowing — match the pod table at app.go:1300+.
-	// Naive head-truncation hides any deployment past row maxRows-1
-	// from the cursor, which made bottom rows unreachable on clusters
-	// with more deployments than fit on screen.
-	if maxRows > 0 && len(rows) > maxRows-1 {
-		idx := -1
-		for i, r := range rows {
-			if r.UID == m.cursor {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			idx = 0
-		}
-		half := (maxRows - 1) / 2
-		start := idx - half
-		if start < 0 {
-			start = 0
-		}
-		end := start + (maxRows - 1)
-		if end > len(rows) {
-			end = len(rows)
-			start = end - (maxRows - 1)
-			if start < 0 {
-				start = 0
-			}
-		}
-		rows = rows[start:end]
 	}
 
 	warnIdx := recentWarningIndex(m.events)

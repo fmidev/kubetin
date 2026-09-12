@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,8 +28,9 @@ type logsState struct {
 	pickerOpen bool
 	pickerCur  int
 
-	lines []string // ring buffer; oldest evicted first
-	cap   int
+	lines    []string // bounded buffer; oldest evicted first
+	lineBase int      // sequence number of lines[0], including evicted history
+	cap      int
 	// tail is what this stream requested; full is set once the user
 	// has pulled the whole log. Together they drive the "there is more
 	// behind this window" hint.
@@ -40,14 +43,15 @@ type logsState struct {
 
 	// In-buffer search. Activated by `/`, like the table filter but
 	// scoped to the streaming buffer. While searchFocused, key input
-	// edits searchTerm; on each edit and on each new line batch we
-	// rebuild searchMatches (line indices into lines[]). n/N step
-	// through matches, scrolling the viewport so the current match
-	// lands inside it.
+	// edits searchTerm. Matches use sequence numbers so head eviction
+	// does not require rebasing the retained matches. n/N step through
+	// matches, scrolling the current match into view.
 	searchTerm    string
 	searchFocused bool
 	searchMatches []int
 	searchIdx     int
+	searchNeedle  string
+	searchNext    int // first sequence number not yet searched
 
 	// reconnecting is set when the streamer signalled a transient
 	// failure and is retrying. Cleared automatically when the next
@@ -63,6 +67,7 @@ type logsState struct {
 	// the view (or switches pods) can't contaminate the new stream's
 	// state. Same shape as PermissionResultMsg's context-keyed cache.
 	session uint64
+	cancel  context.CancelFunc
 }
 
 // LogStartMsg asks main to begin streaming. Session is a monotonic
@@ -70,6 +75,8 @@ type logsState struct {
 // downstream message so the UI can drop late lines from a previously-
 // cancelled stream.
 type LogStartMsg struct {
+	// Context is canceled synchronously when this session is superseded or closed.
+	Context   context.Context
 	Session   uint64
 	Ref       cluster.DescribeRef
 	Container string
@@ -175,6 +182,11 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	if m.OnLogsStart == nil {
 		return nil
 	}
+	if m.logs.cancel != nil {
+		m.logs.cancel()
+	}
+	streamCtx, cancel := context.WithCancel(m.focusLife.ctx)
+	m.logs.cancel = cancel
 	m.logs.session++
 	m.logs.streaming = true
 	m.logs.tail = tail
@@ -182,6 +194,9 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	m.logs.ref = ref
 	m.logs.container = container
 	m.logs.lines = make([]string, 0, 256)
+	m.logs.lineBase = 0
+	m.logs.searchNeedle = ""
+	m.logs.searchNext = 0
 	m.logs.cap = defaultLogCap
 	if tail < 0 {
 		m.logs.cap = fullLogCap
@@ -198,8 +213,13 @@ func (m *Model) beginLogStreamTail(ref cluster.DescribeRef, container string, ta
 	m.syncDashboardLogTarget(ref, container)
 	cb := m.OnLogsStart
 	focused := m.WatchedContext
-	req := LogStartMsg{Session: m.logs.session, Ref: ref, Container: container, Tail: tail}
-	return func() tea.Msg { return cb(focused, req) }
+	req := LogStartMsg{Context: streamCtx, Session: m.logs.session, Ref: ref, Container: container, Tail: tail}
+	return m.focusedCmd(func() tea.Msg {
+		if streamCtx.Err() != nil {
+			return nil
+		}
+		return cb(focused, req)
+	})
 }
 
 // tailOrDefault reports the tail this stream actually requested,
@@ -263,40 +283,19 @@ func (m Model) openLogsForPod(ref cluster.DescribeRef, containers []string) (tea
 	return m, nil
 }
 
-// openLogsForDeployment finds a Running pod from the local cache that
-// belongs to the deployment and streams its logs. The owner mapping
-// is heuristic: deployment "foo" produces pods "foo-<rs-hash>-<id>",
-// so namespace match + Name prefix `foo-` is correct in practice. We
-// pick the most recently created Running pod so a recent rollout
-// surfaces over older replicas.
+// openLogsForDeployment uses the dashboard's membership and replica choice.
 func (m Model) openLogsForDeployment(deployRef cluster.DescribeRef) (tea.Model, tea.Cmd) {
-	prefix := deployRef.Name + "-"
-	var picked *podRow
-	for _, p := range m.pods {
-		if p.Namespace != deployRef.Namespace {
-			continue
-		}
-		if !strings.HasPrefix(p.Name, prefix) {
-			continue
-		}
-		if string(p.Phase) != "Running" {
-			continue
-		}
-		if picked == nil || p.CreatedAt.After(picked.CreatedAt) {
-			pp := p
-			picked = &pp
+	for _, d := range m.deployments {
+		if d.Namespace == deployRef.Namespace && d.Name == deployRef.Name {
+			if p, ok := newestRunningPod(m.deploymentPods(d)); ok {
+				return m.openLogsForPod(podRefFor(p), p.Containers)
+			}
+			break
 		}
 	}
-	if picked == nil {
-		m.toast = "✕ No Running pod found for " + deployRef.Name
-		m.toastUntil = time.Now().Add(3 * time.Second)
-		return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
-	}
-	podRef := cluster.DescribeRef{
-		Version: "v1", Resource: "pods", Kind: "Pod",
-		Namespace: picked.Namespace, Name: picked.Name,
-	}
-	return m.openLogsForPod(podRef, picked.Containers)
+	m.toast = "✕ No matching pod found for " + deployRef.Name
+	m.toastUntil = time.Now().Add(3 * time.Second)
+	return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return toastClearMsg(t) })
 }
 
 func (m Model) handleLogsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -313,8 +312,7 @@ func (m Model) handleLogsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// at the top level.
 		if m.logs.searchTerm != "" {
 			m.logs.searchTerm = ""
-			m.logs.searchMatches = nil
-			m.logs.searchIdx = 0
+			m.recomputeLogsMatches()
 			return m, nil
 		}
 		return m.closeLogs()
@@ -387,8 +385,7 @@ func (m Model) handleLogsSearchKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.Type {
 	case tea.KeyEsc:
 		m.logs.searchTerm = ""
-		m.logs.searchMatches = nil
-		m.logs.searchIdx = 0
+		m.recomputeLogsMatches()
 		m.logs.searchFocused = false
 		return m, nil
 	case tea.KeyEnter:
@@ -418,25 +415,34 @@ func (m Model) handleLogsSearchKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// recomputeLogsMatches walks the buffer for case-insensitive
-// substring matches against searchTerm. Empty term clears the list.
+// recomputeLogsMatches rescans only when the term changes. Otherwise
+// it expires evicted matches and searches the newly retained lines.
 func (m *Model) recomputeLogsMatches() {
-	if m.logs.searchTerm == "" {
-		m.logs.searchMatches = nil
-		m.logs.searchIdx = 0
+	l := &m.logs
+	needle := strings.ToLower(l.searchTerm)
+	if needle != l.searchNeedle {
+		l.searchMatches = nil
+		l.searchIdx = 0
+		l.searchNext = l.lineBase
+		l.searchNeedle = needle
+	}
+	end := l.lineBase + len(l.lines)
+	if needle == "" {
+		l.searchMatches = nil
+		l.searchIdx = 0
+		l.searchNext = end
 		return
 	}
-	needle := strings.ToLower(m.logs.searchTerm)
-	out := m.logs.searchMatches[:0]
-	for i, line := range m.logs.lines {
+	expired := sort.SearchInts(l.searchMatches, l.lineBase)
+	l.searchMatches = l.searchMatches[expired:]
+	l.searchIdx = max(0, l.searchIdx-expired)
+	start := max(l.searchNext, l.lineBase)
+	for i, line := range l.lines[start-l.lineBase:] {
 		if strings.Contains(strings.ToLower(line), needle) {
-			out = append(out, i)
+			l.searchMatches = append(l.searchMatches, start+i)
 		}
 	}
-	m.logs.searchMatches = out
-	if m.logs.searchIdx >= len(out) {
-		m.logs.searchIdx = 0
-	}
+	l.searchNext = end
 }
 
 // stepLogsMatch moves the search cursor by delta wrap-around through
@@ -450,9 +456,10 @@ func (m *Model) stepLogsMatch(delta int) {
 	m.scrollLogsToMatch(m.logs.searchMatches[m.logs.searchIdx])
 }
 
-// scrollLogsToMatch sets scroll so the given line index is roughly
+// scrollLogsToMatch sets scroll so the given sequence number is roughly
 // centred in the viewport. Approximates bodyHeight from m.height.
 func (m *Model) scrollLogsToMatch(lineIdx int) {
+	lineIdx -= m.logs.lineBase
 	const overhead = 8
 	approxBody := m.height - overhead
 	if approxBody < 1 {
@@ -524,12 +531,8 @@ func (m Model) closeLogs() (tea.Model, tea.Cmd) {
 	if m.dashboard.open {
 		return m, nil
 	}
-	m.logs.streaming = false
-	if m.OnLogsStop != nil {
-		cb := m.OnLogsStop
-		return m, func() tea.Msg { cb(); return nil }
-	}
-	return m, nil
+	cmd := m.stopDashboardLogs()
+	return m, cmd
 }
 
 func (m Model) handleContainerPickerKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -865,38 +868,20 @@ func (m *Model) applyLogLines(lines []string) {
 	}
 	added := len(lines)
 
-	// Trim the head if we're over cap. A trim of N means the absolute
-	// position the user is pinned to has slid N indices to the left,
-	// so the offset-from-tail decreases by N (clamped at 0).
-	dropped := 0
 	if len(m.logs.lines) > m.logs.cap {
-		dropped = len(m.logs.lines) - m.logs.cap
+		dropped := len(m.logs.lines) - m.logs.cap
+		clear(m.logs.lines[:dropped])
 		m.logs.lines = m.logs.lines[dropped:]
+		m.logs.lineBase += dropped
 	}
 
 	if !m.logs.follow {
-		// Net effect on a tail-relative scroll counter: tail advances
-		// by `added`, so we need +added to stay in place. Cap-trim
-		// shifts the absolute origin by `dropped` lines that have
-		// fallen off the bottom of history; that subtracts from how
-		// far back we are. Then clamp so we never point past either end.
-		m.logs.scroll += added - dropped
-		if m.logs.scroll < 0 {
-			m.logs.scroll = 0
-		}
-		if m.logs.scroll > len(m.logs.lines) {
-			m.logs.scroll = len(m.logs.lines)
-		}
+		// The tail advances by added even when the head is evicted.
+		// If the anchor expires, keep at least the oldest line visible.
+		m.logs.scroll = clampLogsScrollTo(m.logs.scroll+added, len(m.logs.lines), 1)
 	}
 
-	// Keep search results in sync. Indices in searchMatches point into
-	// lines[], so a head-trim invalidates the lower indices entirely
-	// and shifts the rest. Cheaper to just recompute than to walk and
-	// rebase — the buffer is bounded by m.logs.cap and the term is a
-	// substring scan, not a regex.
-	if m.logs.searchTerm != "" {
-		m.recomputeLogsMatches()
-	}
+	m.recomputeLogsMatches()
 }
 
 // renderLogs draws the logs viewport.
@@ -944,30 +929,21 @@ func (m Model) renderLogs(canvasWidth, canvasHeight int) string {
 		start = 0
 	}
 
-	// Build a quick lookup so per-line rendering can highlight matches
-	// without walking searchMatches each iteration. currentMatchLine
-	// is the absolute line index of the active n/N target — that line
-	// gets a brighter highlight than other matches.
-	var matchSet map[int]struct{}
+	// Seek directly to the viewport; off-screen matches need no lookup
+	// entries or rendering work. The active n/N target is brighter.
+	matches := m.logs.searchMatches
+	matchPos := sort.SearchInts(matches, m.logs.lineBase+start)
 	currentMatchLine := -1
-	if len(m.logs.searchMatches) > 0 {
-		matchSet = make(map[int]struct{}, len(m.logs.searchMatches))
-		for _, idx := range m.logs.searchMatches {
-			matchSet[idx] = struct{}{}
-		}
-		if m.logs.searchIdx < len(m.logs.searchMatches) {
-			currentMatchLine = m.logs.searchMatches[m.logs.searchIdx]
-		}
+	if m.logs.searchIdx < len(matches) {
+		currentMatchLine = matches[m.logs.searchIdx]
 	}
 
 	for i, ln := range lines[start:end] {
-		absIdx := start + i
+		absIdx := m.logs.lineBase + start + i
 		rendered := fitLogLine(ln, innerW)
-		if matchSet != nil {
-			if _, hit := matchSet[absIdx]; hit {
-				bold := absIdx == currentMatchLine
-				rendered = highlightMatches(rendered, m.logs.searchTerm, bold)
-			}
+		if matchPos < len(matches) && matches[matchPos] == absIdx {
+			rendered = highlightMatches(rendered, m.logs.searchTerm, absIdx == currentMatchLine)
+			matchPos++
 		}
 		b.WriteString(rendered + "\n")
 	}
