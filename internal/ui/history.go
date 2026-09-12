@@ -6,6 +6,23 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// Preserve the full time window named by the adjacent span label. Each
+// cell averages a contiguous bucket when there are more samples than cells.
+func historySparkline(values []int, width int) string {
+	if width <= 0 || len(values) <= width {
+		return sparkline(values, width)
+	}
+	buckets := make([]int, width)
+	for i := range buckets {
+		start, end := i*len(values)/width, (i+1)*len(values)/width
+		for _, v := range values[start:end] {
+			buckets[i] += v
+		}
+		buckets[i] /= end - start
+	}
+	return sparkline(buckets, width)
+}
+
 // netHistoryCap bounds the focused cluster's network-rate history:
 // 60 samples at the poller's 15s cadence is 15 minutes.
 const netHistoryCap = 60
@@ -38,10 +55,19 @@ func (r netRing) span() time.Duration {
 	return r.at[len(r.at)-1].Sub(r.at[0])
 }
 
+// focusedMetricsState is the outcome of the focused cluster's latest
+// pod-metrics poll. Pod rows only carry HasMetrics, which a failed
+// snapshot clears for every pod — indistinguishable from an idle
+// namespace without this.
+type focusedMetricsState struct {
+	seen bool // at least one snapshot arrived since focus
+	ok   bool
+	at   time.Time
+}
+
 // noteRestartBaseline records a pod's restart count the first time
-// the watcher shows it to us. The informer's initial list arrives as
-// ordinary Added events with no end marker, so "restarts since the
-// watch started" can only be honest per pod: whatever a pod already
+// the watcher shows it to us. New pods also arrive after initial sync,
+// so "restarts since the watch started" is measured per pod: whatever it
 // had when first seen is the floor it is measured against.
 func noteRestartBaseline(baseline map[types.UID]int32, uid types.UID, restarts int32, deleted bool) {
 	if deleted {
@@ -54,12 +80,15 @@ func noteRestartBaseline(baseline map[types.UID]int32, uid types.UID, restarts i
 }
 
 // restartDelta sums restarts accumulated by the currently cached pods
-// since each was first seen. Pods that vanished take their count with
-// them; a pod's count going down (container status reset) clamps to 0
-// rather than subtracting from the others.
-func restartDelta(pods map[types.UID]podRow, baseline map[types.UID]int32) int32 {
+// in namespace ("" = all) since each was first seen. Pods that vanished
+// take their count with them; a pod's count going down (container
+// status reset) clamps to 0 rather than subtracting from the others.
+func restartDelta(pods map[types.UID]podRow, baseline map[types.UID]int32, namespace string) int32 {
 	var total int32
 	for uid, p := range pods {
+		if namespace != "" && p.Namespace != namespace {
+			continue
+		}
 		if d := p.Restarts - baseline[uid]; d > 0 {
 			total += d
 		}

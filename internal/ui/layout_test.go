@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -146,6 +147,70 @@ func TestViewFitsCanvas(t *testing.T) {
 		})},
 		{"rbac-over-fleet", 120, 40, ViewFleet, fleetLayoutFixture(func(m *Model) {
 			m.rbacOpen = true
+		})},
+
+		{"cluster/empty-store", 120, 30, ViewCluster, nil},
+		{"cluster/wide", 200, 50, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/wide-min-with-rail", 130, 25, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/rail-forces-stacked", 100, 24, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/wide-min-no-rail", 100, 25, ViewCluster, singleContext(clusterDashFixture(nil))},
+		{"cluster/namespace-scoped-metrics-failed", 160, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.namespace = "prod"
+			m.focusedMetrics = focusedMetricsState{seen: true, ok: false, at: time.Now()}
+		})},
+		{"cluster/narrow", 80, 24, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/very-narrow", 60, 20, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/tiny", 40, 12, ViewCluster, clusterDashFixture(nil)},
+		{"cluster/nothing-synced", 160, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.pods = map[types.UID]podRow{}
+			m.nodes = map[types.UID]nodeRow{}
+			m.deployments = map[types.UID]deploymentRow{}
+			m.events = map[types.UID]eventRow{}
+			m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents = false, false, false, false
+			m.clusterNetOK = false
+			m.netHistory = netRing{}
+		})},
+		{"cluster/no-metrics", 160, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.Store.ApplyMetrics("alpha", model.MetricsFields{MetricsAvailable: false})
+			for uid, p := range m.pods {
+				p.HasMetrics = false
+				m.pods[uid] = p
+			}
+		})},
+		{"cluster/stale-metrics", 160, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.Store.ApplyMetrics("alpha", model.MetricsFields{
+				UsageCPUMilli: 4000, UsageMemBytes: 60 << 20,
+				MetricsAvailable: true, MetricsAt: time.Now().Add(-10 * time.Minute),
+			})
+		})},
+		{"cluster/namespace-scoped", 160, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.namespace = "prod"
+		})},
+		{"cluster/offline", 160, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			pf := model.NewProbeFields()
+			pf.Reach = model.ReachUnreachable
+			pf.LastError = strings.Repeat("dial tcp 10.0.0.1:6443: i/o timeout ", 6)
+			m.Store.ApplyProbe("alpha", pf)
+		})},
+		{"cluster/unicode", 160, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.pods["cjk"] = podRow{
+				UID: "cjk", Namespace: "デフォルト", Name: strings.Repeat("名前", 40), Phase: "Failed",
+				Node: "worker-01", CreatedAt: time.Now().Add(-time.Hour),
+				HasMetrics: true, CPUMilli: 9000, MemBytes: 9 << 30,
+			}
+			m.events["cjk-evt"] = eventRow{
+				UID: "cjk-evt", Type: "Warning", Reason: strings.Repeat("R", 40),
+				Message: "x\x1b]0;evil\x07" + strings.Repeat("本", 200), LastSeen: time.Now(),
+				InvolvedKind: "Pod", InvolvedNs: "デフォルト", InvolvedName: strings.Repeat("名前", 40),
+			}
+		})},
+		{"single-cluster/cluster", 120, 30, ViewCluster, singleContext(clusterDashFixture(nil))},
+		{"help-over-cluster", 120, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.helpOpen = true
+		})},
+		{"nspicker-over-cluster", 120, 40, ViewCluster, clusterDashFixture(func(m *Model) {
+			m.nsPickerOpen = true
+			m.nsPickerOptions = []string{"all", "default", "prod"}
 		})},
 
 		{"with-filter", 100, 30, ViewPods, func(m *Model) { m.filterText = "kube-system" }},
@@ -898,6 +963,105 @@ func fleetLayoutFixture(extra func(*Model)) func(*Model) {
 		})
 		m.Store = store
 		m.Contexts = []string{"alpha", fleetCJKContext, "gamma"}
+		if extra != nil {
+			extra(m)
+		}
+	}
+}
+
+// clusterDashFixture seeds the cluster dashboard with every pane
+// populated: a probed cluster with fresh metrics and trend history,
+// pods across two namespaces (one crashlooping, one long-pending, one
+// failed), nodes with allocatable and usage, a degraded deployment,
+// recent warning events and a network history.
+func clusterDashFixture(extra func(*Model)) func(*Model) {
+	return func(m *Model) {
+		now := time.Now()
+		store := model.NewStore()
+		seedFleetCluster(store, "alpha", func(pf *model.ProbeFields) {
+			pf.RawName = "prod-eu"
+			pf.NodeCount, pf.NodeReady = 3, 3
+			pf.NodesCordoned, pf.NodesCordonedReady = 1, 1
+			pf.AllocCPUMilli, pf.AllocMemBytes = 12000, 48<<30
+		})
+		store.ApplyMetrics("alpha", model.MetricsFields{
+			UsageCPUMilli: 7400, UsageMemBytes: 37 << 30,
+			MetricsAvailable: true, MetricsAt: now,
+		})
+		seedFleetCluster(store, "beta", nil)
+		seedFleetCluster(store, "gamma", nil)
+		m.Store = store
+		m.syncStartedAt = now.Add(-18 * time.Minute)
+
+		ring := &trendRing{}
+		for i := 0; i < 30; i++ {
+			ring.push(40+i, 60+i/2, now.Add(time.Duration(i-30)*30*time.Second))
+		}
+		m.fleetTrends["alpha"] = ring
+		for i := 0; i < 20; i++ {
+			m.netHistory.push(int64(1000*(i+1)), int64(400*(20-i)), now.Add(time.Duration(i-20)*15*time.Second))
+		}
+		m.clusterNetRX, m.clusterNetTX, m.clusterNetOK = 20000, 400, true
+		m.clusterNetAt = now
+		m.focusedMetrics = focusedMetricsState{seen: true, ok: true, at: now}
+
+		pod := func(uid, ns, name, node string, phase corev1.PodPhase, cpu, mem int64, restarts int32) podRow {
+			return podRow{
+				UID: types.UID(uid), Namespace: ns, Name: name, Node: node, Phase: phase,
+				Restarts: restarts, CreatedAt: now.Add(-3 * time.Hour),
+				Containers: []string{"app"}, HasMetrics: true, CPUMilli: cpu, MemBytes: mem,
+				MemLimitBytes: 2 << 30,
+				ContainerInfo: []cluster.ContainerInfo{{Name: "app", Ready: phase == "Running", State: cluster.ContainerReady}},
+			}
+		}
+		m.pods["p1"] = pod("p1", "prod", "api-7f9c8-x2k4l", "worker-01", "Running", 1800, 1<<30, 0)
+		m.pods["p2"] = pod("p2", "prod", "worker-5d4b-9qz7p", "worker-02", "Running", 2600, 3<<30, 41)
+		m.pods["p3"] = pod("p3", "default", "cache-0", "worker-01", "Running", 300, 512<<20, 2)
+		crash := pod("p4", "prod", "ingest-6c8d-h7v2n", "worker-03", "Running", 50, 128<<20, 17)
+		crash.ContainerInfo = []cluster.ContainerInfo{{Name: "app", State: cluster.ContainerError, Reason: "CrashLoopBackOff", Restarts: 17}}
+		crash.ContainerStates = []cluster.ContainerState{cluster.ContainerError}
+		m.pods["p4"] = crash
+		pend := pod("p5", "default", "batch-28d4f-abc12", "", "Pending", 0, 0, 0)
+		pend.HasMetrics = false
+		pend.CreatedAt = now.Add(-12 * time.Minute)
+		pend.ContainerInfo = []cluster.ContainerInfo{{Name: "app", State: cluster.ContainerWaiting, Reason: "ImagePullBackOff"}}
+		m.pods["p5"] = pend
+		failed := pod("p6", "prod", "migrate-once-zz9", "worker-02", "Failed", 0, 0, 0)
+		failed.HasMetrics = false
+		m.pods["p6"] = failed
+		m.restartBaseline = map[types.UID]int32{"p1": 0, "p2": 38, "p3": 2, "p4": 17}
+		m.syncedPods = true
+
+		node := func(uid, name string, ready, sched bool, cpu, mem int64) nodeRow {
+			return nodeRow{
+				UID: types.UID(uid), Name: name, Ready: ready, Schedulable: sched,
+				AllocCPUMilli: 4000, AllocMemBytes: 16 << 30,
+				CPUMilli: cpu, MemBytes: mem, HasMetrics: true,
+			}
+		}
+		m.nodes["n1"] = node("n1", "worker-01", true, true, 2500, 12<<30)
+		m.nodes["n2"] = node("n2", "worker-02", true, false, 3900, 15<<30)
+		m.nodes["n3"] = node("n3", "worker-03.example.com", true, true, 1000, 10<<30)
+		m.syncedNodes = true
+
+		m.deployments["d1"] = deploymentRow{UID: "d1", Namespace: "prod", Name: "api", Replicas: 3, Ready: 3}
+		m.deployments["d2"] = deploymentRow{UID: "d2", Namespace: "prod", Name: "ingest", Replicas: 2, Ready: 0}
+		m.deployments["d3"] = deploymentRow{UID: "d3", Namespace: "default", Name: "cache", Replicas: 5, Ready: 4}
+		m.syncedDeploys = true
+
+		m.events["e1"] = eventRow{UID: "e1", Type: "Warning", Reason: "BackOff", Count: 14,
+			Message:  "Back-off restarting failed container app in pod ingest-6c8d-h7v2n_prod",
+			LastSeen: now.Add(-2 * time.Minute), InvolvedKind: "Pod", InvolvedNs: "prod", InvolvedName: "ingest-6c8d-h7v2n"}
+		m.events["e2"] = eventRow{UID: "e2", Type: "Warning", Reason: "FailedScheduling", Count: 3,
+			Message:  "0/3 nodes are available: 1 node(s) were unschedulable, 2 Insufficient memory.",
+			LastSeen: now.Add(-40 * time.Second), InvolvedKind: "Pod", InvolvedNs: "default", InvolvedName: "batch-28d4f-abc12"}
+		m.events["e3"] = eventRow{UID: "e3", Type: "Normal", Reason: "Pulled", Count: 1,
+			Message: "Successfully pulled image", LastSeen: now, InvolvedKind: "Pod", InvolvedNs: "prod", InvolvedName: "api-7f9c8-x2k4l"}
+		m.events["e4"] = eventRow{UID: "e4", Type: "Warning", Reason: "Unhealthy", Count: 2,
+			Message:  "Liveness probe failed: HTTP probe failed with statuscode: 503",
+			LastSeen: now.Add(-40 * time.Minute), InvolvedKind: "Pod", InvolvedNs: "prod", InvolvedName: "api-7f9c8-x2k4l"}
+		m.syncedEvents = true
+
 		if extra != nil {
 			extra(m)
 		}

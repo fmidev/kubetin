@@ -74,6 +74,8 @@ func (m *Model) clearFocusedState() {
 	m.clusterNetAt, m.networkSnapshotAt, m.networkExpiresAt = time.Time{}, time.Time{}, time.Time{}
 	m.clusterNetStatus = ""
 	m.netHistory = netRing{}
+	m.focusedMetrics = focusedMetricsState{}
+	m.watchNamespace = ""
 	m.restartBaseline = make(map[types.UID]int32)
 	m.permissions = make(map[string]permState)
 	m.permissionsInFlight = make(map[string]struct{})

@@ -19,6 +19,7 @@ const (
 	EvtAdded EvtKind = iota
 	EvtUpdated
 	EvtDeleted
+	EvtSynced
 )
 
 // EventEvent is the projection of a *corev1.Event used by the UI.
@@ -65,10 +66,11 @@ func (w *EventWatcher) Run(ctx context.Context, sup *Supervisor) error {
 		return fmt.Errorf("clientset: %w", err)
 	}
 
-	factory := newScopedFactory(clientset, sup.ResolveScope(ctx, w.Context, clientset))
+	scope := sup.ResolveScope(ctx, w.Context, clientset)
+	factory := newScopedFactory(clientset, scope)
 	informer := factory.Core().V1().Events().Informer()
 
-	_, err = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	handler, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { w.emit(EvtAdded, obj) },
 		UpdateFunc: func(_, obj any) { w.emit(EvtUpdated, obj) },
 		DeleteFunc: func(obj any) {
@@ -87,7 +89,7 @@ func (w *EventWatcher) Run(ctx context.Context, sup *Supervisor) error {
 
 	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer syncCancel()
-	if !cache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced) {
+	if !cache.WaitForCacheSync(syncCtx.Done(), handler.HasSynced) {
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -95,6 +97,9 @@ func (w *EventWatcher) Run(ctx context.Context, sup *Supervisor) error {
 		return fmt.Errorf("event cache sync timed out (30s)")
 	}
 	klog.Infof("eventwatch[%s]: synced, %d initial events", w.Context, len(informer.GetStore().List()))
+
+	// The empty UID is reserved for this ordered cache-completion marker.
+	w.publish("", EventEvent{Kind: EvtSynced, Context: w.Context}, false)
 
 	<-ctx.Done()
 	return nil

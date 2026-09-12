@@ -99,14 +99,18 @@ func TestHelpUsesTwoColumnsWhenWide(t *testing.T) {
 			wideLines, narrowLines)
 	}
 
-	// Two groups on the same row is the observable signature.
+	// Two groups on the same row is the observable signature: the
+	// first group heads column one, and whichever group the packer
+	// picked to head column two shares its line.
 	out := wide.renderHelp(140, 36)
-	if !strings.Contains(out, "Move") || !strings.Contains(out, "Events lens") {
-		t.Errorf("expected both column heads on screen:\n%s", out)
-	}
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "Move") && strings.Contains(line, "Events lens") {
-			return
+		if !strings.Contains(line, "Move") {
+			continue
+		}
+		for _, g := range helpGroups[1:] {
+			if strings.Contains(line, g.Title) {
+				return
+			}
 		}
 	}
 	t.Error("no line carries two group titles; layout is not two-column")

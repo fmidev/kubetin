@@ -237,6 +237,10 @@ func (m Model) handleFleetKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "f1":
 		m.leaveFleet(m.fleet.returnView)
 		return m, nil
+	case "f3":
+		m.leaveFleet(m.fleet.returnView)
+		m.enterClusterDash()
+		return m, nil
 	case "1", "2", "3", "4", "5", "6":
 		// switchView will set the destination; restore the parked
 		// resource filter and drop the expansion before it applies,

@@ -20,6 +20,7 @@ const (
 	DeployAdded DeployEventKind = iota
 	DeployUpdated
 	DeployDeleted
+	DeploySynced
 )
 
 // DeployCondition projects one entry of deployment.Status.Conditions.
@@ -82,10 +83,11 @@ func (w *DeployWatcher) Run(ctx context.Context, sup *Supervisor) error {
 		return fmt.Errorf("clientset: %w", err)
 	}
 
-	factory := newScopedFactory(clientset, sup.ResolveScope(ctx, w.Context, clientset))
+	scope := sup.ResolveScope(ctx, w.Context, clientset)
+	factory := newScopedFactory(clientset, scope)
 	informer := factory.Apps().V1().Deployments().Informer()
 
-	_, err = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	handler, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { w.emit(DeployAdded, obj) },
 		UpdateFunc: func(_, obj any) { w.emit(DeployUpdated, obj) },
 		DeleteFunc: func(obj any) {
@@ -104,7 +106,7 @@ func (w *DeployWatcher) Run(ctx context.Context, sup *Supervisor) error {
 
 	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer syncCancel()
-	if !cache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced) {
+	if !cache.WaitForCacheSync(syncCtx.Done(), handler.HasSynced) {
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -112,6 +114,9 @@ func (w *DeployWatcher) Run(ctx context.Context, sup *Supervisor) error {
 		return fmt.Errorf("deployment cache sync timed out (30s)")
 	}
 	klog.Infof("deploywatch[%s]: synced, %d initial deployments", w.Context, len(informer.GetStore().List()))
+
+	// The empty UID is reserved for this ordered cache-completion marker.
+	w.publish("", DeployEvent{Kind: DeploySynced, Context: w.Context}, false)
 
 	<-ctx.Done()
 	return nil

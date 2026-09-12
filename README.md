@@ -13,6 +13,11 @@ agent, no installed CRDs.
 
 - **Multi-cluster fleet view.** Every context in your kubeconfig is probed
   in the background; switch focus with Tab.
+- **Cluster dashboard** (`F3`): KPI tiles for nodes / pods / deployments /
+  containers / restarts / warnings, CPU / memory / network gauges with
+  recent history, top pods by usage, per-node utilisation, warning events
+  and unhealthy workloads for the focused cluster. Unknown values render as
+  `—`, stale metrics are tagged, never presented as current.
 - **Live tables** for pods, deployments, nodes, events, namespaces,
   services and ingresses — sortable, filterable in-place.
 - **Endpoint health on services.** The `READY` column counts ready
@@ -124,6 +129,7 @@ kubetin -trust
 | Cluster | `Tab` / `Shift-Tab` | next / previous cluster in rail order (prefers reachable) |
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
+| | `F3` | cluster dashboard (tiles, gauges, top pods, nodes, warnings; `Tab` cycles clusters, `n` scopes it) |
 | | `1` – `6` | pods / deployments / services / ingresses / nodes / namespaces |
 | Inspect the selected row | `i` | status dashboard |
 | | `l` | logs |

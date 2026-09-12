@@ -100,7 +100,8 @@ const (
 	ViewIngresses
 	ViewNodes
 	ViewNamespaces
-	ViewFleet // fleet dashboard, full-bleed triage view
+	ViewFleet   // fleet dashboard, full-bleed triage view
+	ViewCluster // per-cluster dashboard: tiles, gauges, top pods, warnings
 )
 
 // ProbeTickMsg fires periodically so the header reflects fresh probe
@@ -224,6 +225,8 @@ type Model struct {
 	networkSnapshotAt          time.Time
 	networkExpiresAt           time.Time
 	netHistory                 netRing
+	focusedMetrics             focusedMetricsState
+	watchNamespace             string
 	restartBaseline            map[types.UID]int32 // first-seen restart count per pod, see noteRestartBaseline
 
 	namespace       string // empty = all namespaces
@@ -259,6 +262,7 @@ type Model struct {
 	rbacOpen            bool
 	fleet               fleetState
 	fleetTrends         map[string]*trendRing
+	clusterDash         clusterDashState
 	toast               string // ephemeral one-line status (e.g. "Deleted Pod/foo")
 	toastUntil          time.Time
 
@@ -408,6 +412,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.view == ViewFleet {
 			return m.handleFleetKey(msg)
 		}
+		if m.view == ViewCluster {
+			return m.handleClusterDashKey(msg)
+		}
 		return m.handleKey(msg)
 
 	case PodEventMsg:
@@ -417,6 +424,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// without this guard the new cluster's m.pods inherits foreign
 		// UIDs that never receive a matching DELETE.
 		if msg.Context != m.WatchedContext {
+			return m, nil
+		}
+		if msg.Kind == cluster.PodSynced {
+			m.syncedPods = true
+			m.watchNamespace = msg.WatchNamespace
 			return m, nil
 		}
 		noteRestartBaseline(m.restartBaseline, msg.UID, msg.Restarts, msg.Kind == cluster.PodDeleted)
@@ -431,7 +443,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.invalidateTables(ViewNamespaces)
 			m.tables.nsCounts = nil
 		}
-		m.syncedPods = true
 		// Guard cursor wipe to ViewPods only — non-pod views park the
 		// cursor on a non-pod UID that will never appear in m.pods,
 		// and without the view guard every pod event nukes the cursor
@@ -457,10 +468,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
+		if msg.Kind == cluster.DeploySynced {
+			m.syncedDeploys = true
+			return m, nil
+		}
 		applyDeployEvent(m.deployments, cluster.DeployEvent(msg))
 		m.invalidateTables(ViewDeployments, ViewNamespaces)
 		m.tables.nsCounts = nil
-		m.syncedDeploys = true
 		if _, ok := m.deployments[m.cursor]; !ok && m.view == ViewDeployments {
 			m.cursor = ""
 		}
@@ -470,10 +484,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
+		if msg.Kind == cluster.EvtSynced {
+			m.syncedEvents = true
+			return m, nil
+		}
 		applyEvtEvent(m.events, cluster.EventEvent(msg))
 		m.invalidateTables(ViewNamespaces)
 		m.tables.nsCounts = nil
-		m.syncedEvents = true
 		return m, nil
 
 	case NsEventMsg:
@@ -727,6 +744,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Context != m.WatchedContext {
 			return m, nil
 		}
+		m.focusedMetrics = focusedMetricsState{seen: true, ok: msg.OK, at: msg.At}
 		// metrics-server PodMetrics/NodeMetrics resources don't carry
 		// the source object's UID — they have their own metadata. So
 		// match by namespace/name (pods) and name (nodes).
@@ -830,6 +848,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Esc/F1 in the dashboard restores returnView with the row
 		// still selected.
 		m.enterFleet()
+	case "f3":
+		m.enterClusterDash()
 	case "f2":
 		m.debugMode = !m.debugMode
 	case "?":
@@ -1382,10 +1402,13 @@ func (m Model) handleFilterKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Pre-empt navigation keys: unfocus the filter (preserve text) and
 	// fall through to the normal handler.
 	switch k.String() {
-	case "f1", "f2", "tab", "shift+tab":
+	case "f1", "f2", "f3", "tab", "shift+tab":
 		m.filterFocused = false
 		if m.view == ViewFleet {
 			return m.handleFleetKey(k)
+		}
+		if m.view == ViewCluster {
+			return m.handleClusterDashKey(k)
 		}
 		return m.handleKey(k)
 	}
@@ -1541,7 +1564,7 @@ func uidIndex(uids []types.UID, uid types.UID) int {
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // emptyPlaceholder produces the right-shaped "no rows" text for a view.
-// When the informer for that view hasn't fired its first event yet we
+// Until the informer has delivered its initial objects we
 // show a syncing line with the elapsed seconds so the user can tell
 // the difference between "still loading" and "loaded, zero rows".
 func (m Model) emptyPlaceholder(synced bool, kindPlural string) string {
@@ -1564,17 +1587,19 @@ func (m Model) View() string {
 		return "kubetin loading…"
 	}
 
-	// The fleet dashboard is full-bleed: the selected-cluster header
-	// would repeat what the dashboard itself shows, so it is dropped
-	// and the body takes its rows. Everything else keeps the header.
+	// The dashboards drop the selected-cluster header: it would repeat
+	// what they show themselves, so the body takes its rows. The fleet
+	// one is additionally full-bleed (no rail); the cluster one keeps
+	// the rail so Tab visibly walks the fleet underneath it.
 	fleetFull := m.view == ViewFleet && !m.dashboard.open
+	noHeader := fleetFull || (m.view == ViewCluster && !m.dashboard.open)
 	header := ""
-	if !fleetFull {
+	if !noHeader {
 		header = m.renderHeader()
 	}
 	footer := m.renderFooter()
 	bodyHeight := m.height - lipgloss.Height(footer)
-	if !fleetFull {
+	if !noHeader {
 		bodyHeight -= lipgloss.Height(header)
 	}
 	if bodyHeight < 1 {
@@ -1636,7 +1661,7 @@ func (m Model) View() string {
 	footerH := lipgloss.Height(footer)
 	body = clampCanvas(body, m.width, bodyHeight)
 	footer = clampCanvas(footer, m.width, footerH)
-	if fleetFull {
+	if noHeader {
 		// Joining the empty header string would add a phantom blank
 		// row; the full-bleed layout has no header at all.
 		return lipgloss.JoinVertical(lipgloss.Left, body, footer)
@@ -1681,7 +1706,7 @@ func (m Model) renderBody(bodyHeight int, fleetFull bool) string {
 // full-bleed: zero header rows while it owns the view.
 func (m Model) chromeHeights() (headerH, footerH int) {
 	footerH = lipgloss.Height(m.renderFooter())
-	if m.view == ViewFleet && !m.dashboard.open {
+	if (m.view == ViewFleet || m.view == ViewCluster) && !m.dashboard.open {
 		return 0, footerH
 	}
 	return lipgloss.Height(m.renderHeader()), footerH
@@ -1703,6 +1728,8 @@ func (m Model) mainPane(height, width int) string {
 		return m.renderServiceTable(height, width)
 	case ViewIngresses:
 		return m.renderIngressTable(height, width)
+	case ViewCluster:
+		return m.renderClusterDash(height, width)
 	}
 	return m.renderTable(height, width)
 }
@@ -1710,6 +1737,9 @@ func (m Model) mainPane(height, width int) string {
 // visibleUIDs returns the set of UIDs currently visible (filter +
 // namespace + view) so cursor logic can be written generically.
 func (m Model) visibleUIDs() []types.UID {
+	if m.view == ViewCluster {
+		return nil
+	}
 	if m.view == ViewFleet {
 		return make([]types.UID, len(m.fleetOrder()))
 	}
@@ -1960,6 +1990,9 @@ func (m Model) renderFooter() string {
 	if m.view == ViewFleet && !m.dashboard.open {
 		hint = " j/k:cluster  Enter:details  o:open  r:refresh  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
 	}
+	if m.view == ViewCluster && !m.dashboard.open {
+		hint = " Tab:cluster  n:ns  0:all-ns  1-6:tables  F1:fleet  Esc/F3:back  ?:help  q:quit "
+	}
 	if m.dashboard.open {
 		hint = " Tab:pane  j/k:move  g/G:top/bottom  f:follow  i:open pod  c:container  l:logs  d:describe  Enter:actions  Esc:back "
 	}
@@ -2020,6 +2053,8 @@ func (m Model) filterCounts() (matched, total int) {
 		total = len(m.ingresses)
 	case ViewFleet:
 		total = len(m.Contexts)
+	case ViewCluster:
+		return 0, 0
 	default:
 		total = len(m.pods)
 	}

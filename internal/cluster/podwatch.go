@@ -19,6 +19,7 @@ const (
 	PodAdded PodEventKind = iota
 	PodUpdated
 	PodDeleted
+	PodSynced
 )
 
 // ContainerState is a coarse-grained classification of a single
@@ -94,16 +95,18 @@ func (k PodEventKind) String() string {
 // the spike consumes, so we don't pin the full *corev1.Pod in memory
 // once it's emitted.
 type PodEvent struct {
-	Kind       PodEventKind
-	Context    string
-	Namespace  string
-	Name       string
-	UID        types.UID
-	Phase      corev1.PodPhase
-	NodeName   string
-	Restarts   int32
-	CreatedAt  time.Time
-	Containers []string // names of spec.containers (excluding init/ephemeral)
+	// WatchNamespace is the effective informer scope on PodSynced.
+	WatchNamespace string
+	Kind           PodEventKind
+	Context        string
+	Namespace      string
+	Name           string
+	UID            types.UID
+	Phase          corev1.PodPhase
+	NodeName       string
+	Restarts       int32
+	CreatedAt      time.Time
+	Containers     []string // names of spec.containers (excluding init/ephemeral)
 
 	// Per-container coarse state, parallel to ContainerStatuses
 	// ordering in the apiserver response. Drives the four-colour dot
@@ -176,10 +179,11 @@ func (w *PodWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	// resyncs. If the kubeconfig pins a namespace (typical OpenShift /
 	// multi-tenant setup), scope the factory there — listing pods at
 	// cluster scope would 403 for a namespace-restricted user.
-	factory := newScopedFactory(clientset, sup.ResolveScope(ctx, w.Context, clientset))
+	scope := sup.ResolveScope(ctx, w.Context, clientset)
+	factory := newScopedFactory(clientset, scope)
 	informer := factory.Core().V1().Pods().Informer()
 
-	_, err = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	handler, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(obj any) { w.emit(PodAdded, obj) },
 		UpdateFunc: func(_, obj any) { w.emit(PodUpdated, obj) },
 		DeleteFunc: func(obj any) {
@@ -202,7 +206,7 @@ func (w *PodWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	// the default 5 minutes.
 	syncCtx, syncCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer syncCancel()
-	synced := cache.WaitForCacheSync(syncCtx.Done(), informer.HasSynced)
+	synced := cache.WaitForCacheSync(syncCtx.Done(), handler.HasSynced)
 	if !synced {
 		if ctx.Err() != nil {
 			return nil
@@ -211,6 +215,9 @@ func (w *PodWatcher) Run(ctx context.Context, sup *Supervisor) error {
 		return fmt.Errorf("pod cache sync timed out (30s) — RBAC or network")
 	}
 	klog.Infof("podwatch[%s]: synced, %d initial pods", w.Context, len(informer.GetStore().List()))
+
+	// The empty UID is reserved for this ordered cache-completion marker.
+	w.publish("", PodEvent{Kind: PodSynced, Context: w.Context, WatchNamespace: scope}, false)
 
 	<-ctx.Done()
 	return nil

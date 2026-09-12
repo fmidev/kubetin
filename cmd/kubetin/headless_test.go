@@ -20,6 +20,7 @@ func TestHeadlessCountsCoalescedPodState(t *testing.T) {
 			event cluster.PodEvent
 			want  int64
 		}{
+			{cluster.PodEvent{Kind: cluster.PodSynced}, 0},
 			{cluster.PodEvent{Kind: cluster.PodUpdated, UID: "old", Name: "api"}, 1},
 			{cluster.PodEvent{Kind: cluster.PodAdded, UID: "old", Name: "api"}, 1},
 			{cluster.PodEvent{Kind: cluster.PodDeleted, UID: "unseen"}, 1},
