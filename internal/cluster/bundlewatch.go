@@ -55,8 +55,9 @@ const (
 	// BundleNoAPI: not a Fleet manager — the normal case for most clusters.
 	BundleNoAPI BundleUnavailableReason = iota
 	BundleForbidden
-	// BundleCheckFailed: discovery or the access review errored. Retried
-	// for "bundles"; the other resources stay off for this focus.
+	// BundleCheckFailed: discovery, scope resolution or the access review
+	// errored. Retried for "bundles" and reported once per outage; the
+	// other resources stay off for this focus.
 	BundleCheckFailed
 )
 
@@ -281,9 +282,8 @@ func (w *BundleWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	if err != nil {
 		return fmt.Errorf("clientset: %w", err)
 	}
-	scope := sup.ResolveScope(ctx, w.Context, clientset)
 
-	watched := w.gate(ctx, sup, restCfg, scope)
+	watched, scope := w.gate(ctx, sup, restCfg, clientset)
 	if len(watched) == 0 {
 		<-ctx.Done()
 		return nil
@@ -344,56 +344,73 @@ func (w *BundleWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	return nil
 }
 
-// gate picks the resources to watch, retrying while the Bundles check
-// itself errors: a cluster briefly unreachable at focus time is not a
-// cluster without Fleet.
-func (w *BundleWatcher) gate(ctx context.Context, sup *Supervisor, restCfg *rest.Config, scope string) []bundleResource {
+// gate picks the resources to watch and their scope, retrying while
+// the Bundles check itself fails: a cluster briefly unreachable at
+// focus time is not a cluster without Fleet.
+func (w *BundleWatcher) gate(ctx context.Context, sup *Supervisor, restCfg *rest.Config, cs *kubernetes.Clientset) ([]bundleResource, string) {
+	reported := false
 	for {
-		watched, retry := w.check(ctx, sup, restCfg, scope)
-		if !retry {
-			return watched
+		watched, scope, failure := w.check(ctx, sup, restCfg, cs)
+		if failure == "" {
+			return watched, scope
+		}
+		// Once per outage: a second publish would bump the pending
+		// event's version, and delivery re-queues an updated in-flight
+		// event behind everything after it — including BundleSynced.
+		if !reported {
+			w.unavailable(bundlesGVR.Resource, BundleCheckFailed, failure)
+			reported = true
 		}
 		select {
 		case <-ctx.Done():
-			return nil
+			return nil, ""
 		case <-time.After(bundleGateRetry):
 		}
 	}
 }
 
-func (w *BundleWatcher) check(ctx context.Context, sup *Supervisor, restCfg *rest.Config, scope string) ([]bundleResource, bool) {
+// check returns the resources to watch and their scope, or why the
+// check itself failed. A missing API or a denied Bundles list is an
+// answer, not a failure: it is published and nothing is watched.
+func (w *BundleWatcher) check(ctx context.Context, sup *Supervisor, restCfg *rest.Config, cs *kubernetes.Clientset) ([]bundleResource, string, string) {
 	discCfg := rest.CopyConfig(restCfg)
 	discCfg.Timeout = 10 * time.Second
 	has, err := hasAPIResource(discCfg, bundlesGVR)
 	if err != nil {
-		w.unavailable(bundlesGVR.Resource, BundleCheckFailed, "discovery: "+err.Error())
-		return nil, true
+		return nil, "", "discovery: " + err.Error()
 	}
 	if !has {
 		klog.Infof("bundlewatch[%s]: skipped (no fleet.cattle.io API)", w.Context)
 		w.unavailable(bundlesGVR.Resource, BundleNoAPI, "")
-		return nil, false
+		return nil, "", ""
+	}
+
+	// An unsettled scope is the kubeconfig's namespace hint, left by a
+	// probe that failed in transit. Watching it would sync a cluster-wide
+	// user to one namespace, missing every Fleet workspace.
+	scope := sup.ResolveScope(ctx, w.Context, cs)
+	if _, settled := sup.scopes.Load(w.Context); !settled {
+		return nil, "", "namespace scope unresolved"
 	}
 
 	var watched []bundleResource
 	for i, r := range bundleResources {
 		res := sup.CanI(ctx, w.Context, "list", r.gvr.Group, r.gvr.Resource, scope)
 		switch {
+		case res.Err != "" && i == 0:
+			return nil, "", res.Err
 		case res.Err != "":
 			w.unavailable(r.gvr.Resource, BundleCheckFailed, res.Err)
-			if i == 0 {
-				return nil, true
-			}
 		case !res.Allowed:
 			w.unavailable(r.gvr.Resource, BundleForbidden, res.Reason)
 			if i == 0 {
-				return nil, false
+				return nil, "", ""
 			}
 		default:
 			watched = append(watched, r)
 		}
 	}
-	return watched, false
+	return watched, scope, ""
 }
 
 func (w *BundleWatcher) unavailable(resource string, reason BundleUnavailableReason, detail string) {
