@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -299,20 +300,35 @@ const fleetDiscoveryJSON = `{"kind":"APIResourceList","apiVersion":"v1","groupVe
 	{"name":"gitrepos","namespaced":true,"kind":"GitRepo","verbs":["list","watch"]},
 	{"name":"clusters","namespaced":true,"kind":"Cluster","verbs":["list","watch"]}]}`
 
-// fakeFleetManager serves discovery, access reviews and the four lists.
+// fakeFleetManager serves discovery, access reviews and the Fleet lists.
+// It never answers the pod probe: the watcher must not depend on it.
 type fakeFleetManager struct {
 	t         *testing.T
 	discovery func(attempt int) int
-	// pods, when set, answers the scope probe; otherwise the scope is
-	// pre-settled to cluster-wide.
-	pods   func(attempt int) int
-	denied map[string]bool
-	items  map[string][]string
+	// served limits discovery to these resources; nil serves all four.
+	served []string
+	// allow decides each access review; nil allows everything.
+	allow func(verb, resource, namespace string) bool
+	// items and failing are keyed by list path below the group-version:
+	// "bundles", or "namespaces/<ns>/bundles".
+	items   map[string][]string
+	failing map[string]bool
 
-	mu          sync.Mutex
-	attempts    int
-	podAttempts int
-	listed      map[string]bool
+	mu       sync.Mutex
+	attempts int
+	listed   map[string]bool
+}
+
+func (f *fakeFleetManager) discoveryJSON() string {
+	if f.served == nil {
+		return fleetDiscoveryJSON
+	}
+	var resources []string
+	for _, r := range f.served {
+		resources = append(resources, fmt.Sprintf(`{"name":%q,"namespaced":true,"kind":"X","verbs":["list","watch"]}`, r))
+	}
+	return `{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"fleet.cattle.io/v1alpha1","resources":[` +
+		strings.Join(resources, ",") + `]}`
 }
 
 func (f *fakeFleetManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -326,16 +342,7 @@ func (f *fakeFleetManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		w.WriteHeader(code)
 		if code == http.StatusOK {
-			fmt.Fprint(w, fleetDiscoveryJSON)
-		}
-	case r.URL.Path == "/api/v1/pods" && f.pods != nil:
-		f.mu.Lock()
-		f.podAttempts++
-		code := f.pods(f.podAttempts)
-		f.mu.Unlock()
-		w.WriteHeader(code)
-		if code == http.StatusOK {
-			fmt.Fprint(w, `{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},"items":[]}`)
+			fmt.Fprint(w, f.discoveryJSON())
 		}
 	case r.URL.Path == "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews":
 		var review authv1.SelfSubjectAccessReview
@@ -346,16 +353,26 @@ func (f *fakeFleetManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		attrs := review.Spec.ResourceAttributes
-		if attrs.Verb != "list" || attrs.Group != "fleet.cattle.io" || attrs.Namespace != "" {
+		if attrs.Group != "fleet.cattle.io" {
 			f.t.Errorf("unexpected review: %+v", attrs)
 		}
-		review.Status.Allowed = !f.denied[attrs.Resource]
+		review.Status.Allowed = f.allow == nil || f.allow(attrs.Verb, attrs.Resource, attrs.Namespace)
 		json.NewEncoder(w).Encode(review)
 	case strings.HasPrefix(r.URL.Path, prefix+"/"):
-		resource := strings.TrimPrefix(r.URL.Path, prefix+"/")
+		path := strings.TrimPrefix(r.URL.Path, prefix+"/")
 		f.mu.Lock()
-		f.listed[resource] = true
+		f.listed[path] = true
 		f.mu.Unlock()
+		if f.served != nil && !slices.Contains(f.served, path[strings.LastIndex(path, "/")+1:]) {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"apiVersion":"v1","kind":"Status","reason":"NotFound","code":404}`)
+			return
+		}
+		if f.failing[path] {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"apiVersion":"v1","kind":"Status","reason":"InternalError","code":500}`)
+			return
+		}
 		if r.URL.Query().Get("watch") == "true" {
 			if r.URL.Query().Get("sendInitialEvents") == "true" {
 				w.WriteHeader(http.StatusBadRequest)
@@ -367,17 +384,17 @@ func (f *fakeFleetManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fmt.Fprintf(w, `{"apiVersion":"fleet.cattle.io/v1alpha1","kind":"List","metadata":{"resourceVersion":"1"},"items":[%s]}`,
-			strings.Join(f.items[resource], ","))
+			strings.Join(f.items[path], ","))
 	default:
 		f.t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 		w.WriteHeader(http.StatusNotFound)
 	}
 }
 
-func (f *fakeFleetManager) wasListed(resource string) bool {
+func (f *fakeFleetManager) wasListed(path string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.listed[resource]
+	return f.listed[path]
 }
 
 // startFakeManager runs a BundleWatcher for context "slow" against f,
@@ -389,9 +406,6 @@ func startFakeManager(t *testing.T, f *fakeFleetManager, hint string, capacity i
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	sup, _ := newProbeFixture(t, srv, hint)
-	if f.pods == nil {
-		sup.scopes.Store("slow", "")
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	w := NewBundleWatcher("slow", capacity)
@@ -434,48 +448,108 @@ func collectBundleEvents(t *testing.T, w *BundleWatcher, done func(BundleEvent) 
 	}
 }
 
-func runFakeManager(t *testing.T, f *fakeFleetManager, done func(BundleEvent) bool) []BundleEvent {
-	t.Helper()
-	return collectBundleEvents(t, startFakeManager(t, f, "", 4), done)
-}
-
 func shortenGateRetry(t *testing.T) {
 	old := bundleGateRetry
 	bundleGateRetry = 10 * time.Millisecond
 	t.Cleanup(func() { bundleGateRetry = old })
 }
 
-func isSynced(ev BundleEvent) bool { return ev.Kind == BundleSynced }
+func first(BundleEvent) bool { return true }
+
+// syncedAll accepts the event that completes a BundleSynced for every
+// one of resources.
+func syncedAll(resources ...string) func(BundleEvent) bool {
+	pending := map[string]bool{}
+	for _, r := range resources {
+		pending[r] = true
+	}
+	return func(ev BundleEvent) bool {
+		if ev.Kind == BundleSynced {
+			delete(pending, ev.Resource)
+		}
+		return len(pending) == 0
+	}
+}
+
+func objectResource(ev BundleEvent) string {
+	switch {
+	case ev.Bundle != nil:
+		return "bundles"
+	case ev.Deployment != nil:
+		return "bundledeployments"
+	case ev.GitRepo != nil:
+		return "gitrepos"
+	case ev.Cluster != nil:
+		return "clusters"
+	}
+	return ""
+}
+
+// checkSyncOrder fails if any object arrives after its resource's
+// BundleSynced, and returns the object count per resource.
+func checkSyncOrder(t *testing.T, events []BundleEvent) map[string]int {
+	t.Helper()
+	synced := map[string]bool{}
+	counts := map[string]int{}
+	for _, ev := range events {
+		if ev.Kind == BundleSynced {
+			synced[ev.Resource] = true
+			continue
+		}
+		if res := objectResource(ev); res != "" {
+			if synced[res] {
+				t.Errorf("%s object after its BundleSynced: %+v", res, ev)
+			}
+			counts[res]++
+		}
+	}
+	return counts
+}
+
+func unavailableMarkers(events []BundleEvent) map[string]BundleEvent {
+	out := map[string]BundleEvent{}
+	for _, ev := range events {
+		if ev.Kind == BundleUnavailable {
+			out[ev.Resource] = ev
+		}
+	}
+	return out
+}
 
 func TestBundleWatcherIdlesWithoutFleetAPI(t *testing.T) {
 	f := &fakeFleetManager{discovery: func(int) int { return http.StatusNotFound }}
-	got := runFakeManager(t, f, func(BundleEvent) bool { return true })
+	got := collectBundleEvents(t, startFakeManager(t, f, "", 4), first)
 	if ev := got[0]; ev.Kind != BundleUnavailable || ev.Resource != "bundles" || ev.Reason != BundleNoAPI {
 		t.Fatalf("got %+v", ev)
 	}
 }
 
 func TestBundleWatcherParksWhenBundlesForbidden(t *testing.T) {
-	f := &fakeFleetManager{
-		discovery: func(int) int { return http.StatusOK },
-		denied:    map[string]bool{"bundles": true},
-	}
-	got := runFakeManager(t, f, func(BundleEvent) bool { return true })
-	if ev := got[0]; ev.Kind != BundleUnavailable || ev.Resource != "bundles" || ev.Reason != BundleForbidden {
-		t.Fatalf("got %+v", ev)
-	}
-	time.Sleep(50 * time.Millisecond)
-	for _, r := range bundleResources {
-		if f.wasListed(r.gvr.Resource) {
-			t.Errorf("listed %s without permission to list bundles", r.gvr.Resource)
-		}
+	for _, verb := range []string{"list", "watch"} {
+		t.Run(verb, func(t *testing.T) {
+			f := &fakeFleetManager{
+				discovery: func(int) int { return http.StatusOK },
+				allow:     func(v, res, _ string) bool { return v != verb || res != "bundles" },
+			}
+			got := collectBundleEvents(t, startFakeManager(t, f, "", 4), first)
+			ev := got[0]
+			if ev.Kind != BundleUnavailable || ev.Resource != "bundles" || ev.Reason != BundleForbidden ||
+				!strings.HasPrefix(ev.Detail, verb+" bundles denied") {
+				t.Fatalf("got %+v", ev)
+			}
+			time.Sleep(50 * time.Millisecond)
+			for _, r := range bundleResources {
+				if f.wasListed(r.gvr.Resource) {
+					t.Errorf("listed %s without access to bundles", r.gvr.Resource)
+				}
+			}
+		})
 	}
 }
 
-func TestBundleWatcherSyncsAfterInitialObjectsAndSkipsDenied(t *testing.T) {
+func TestBundleWatcherSyncsEachResourceAfterItsObjects(t *testing.T) {
 	f := &fakeFleetManager{
 		discovery: func(int) int { return http.StatusOK },
-		denied:    map[string]bool{"bundledeployments": true},
 		items: map[string][]string{
 			"bundles":           {bundleHealthyJSON, bundleFailingJSON},
 			"bundledeployments": {bundleDeploymentJSON},
@@ -483,97 +557,144 @@ func TestBundleWatcherSyncsAfterInitialObjectsAndSkipsDenied(t *testing.T) {
 			"clusters":          {bundleClusterJSON},
 		},
 	}
-	got := runFakeManager(t, f, isSynced)
-
-	seen := map[string]bool{}
-	var unavailable []BundleEvent
-	for _, ev := range got[:len(got)-1] {
-		switch {
-		case ev.Kind == BundleUnavailable:
-			unavailable = append(unavailable, ev)
-		case ev.Bundle != nil:
-			seen["bundle/"+ev.Bundle.Name] = true
-		case ev.GitRepo != nil:
-			seen["gitrepo/"+ev.GitRepo.Name] = true
-		case ev.Cluster != nil:
-			seen["cluster/"+ev.Cluster.Name] = true
-		case ev.Deployment != nil:
-			t.Fatal("delivered a resource the user may not list")
+	got := collectBundleEvents(t, startFakeManager(t, f, "", 4),
+		syncedAll("bundles", "bundledeployments", "gitrepos", "clusters"))
+	counts := checkSyncOrder(t, got)
+	want := map[string]int{"bundles": 2, "bundledeployments": 1, "gitrepos": 1, "clusters": 1}
+	if !reflect.DeepEqual(counts, want) {
+		t.Fatalf("objects: %v, want %v", counts, want)
+	}
+	if u := unavailableMarkers(got); len(u) != 0 {
+		t.Fatalf("unexpected unavailable markers: %+v", u)
+	}
+	for _, ev := range got {
+		if ev.Kind == BundleSynced && ev.WatchNamespace != "" {
+			t.Fatalf("lost scope: %+v", ev)
 		}
 	}
-	want := map[string]bool{
-		"bundle/platform-dns": true, "bundle/platform-ingress": true,
-		"gitrepo/platform": true, "cluster/c-abcde": true,
+}
+
+// An enrichment resource that is denied — either verb — or not served
+// is reported and never listed; the rest still sync.
+func TestBundleWatcherSkipsUnavailableEnrichment(t *testing.T) {
+	f := &fakeFleetManager{
+		discovery: func(int) int { return http.StatusOK },
+		served:    []string{"bundles", "bundledeployments", "gitrepos"},
+		allow: func(verb, res, _ string) bool {
+			return res != "bundledeployments" && !(verb == "watch" && res == "gitrepos")
+		},
+		items: map[string][]string{"bundles": {bundleHealthyJSON}},
 	}
-	if !reflect.DeepEqual(seen, want) {
-		t.Fatalf("synced before initial objects: saw %v", seen)
+	got := collectBundleEvents(t, startFakeManager(t, f, "", 4), syncedAll("bundles"))
+	checkSyncOrder(t, got)
+
+	u := unavailableMarkers(got)
+	for res, want := range map[string]struct {
+		reason BundleUnavailableReason
+		detail string
+	}{
+		"bundledeployments": {BundleForbidden, "list bundledeployments denied"},
+		"gitrepos":          {BundleForbidden, "watch gitrepos denied"},
+		"clusters":          {BundleNoAPI, ""},
+	} {
+		if ev, ok := u[res]; !ok || ev.Reason != want.reason || !strings.HasPrefix(ev.Detail, want.detail) {
+			t.Errorf("%s marker: %+v, want %v %q", res, ev, want.reason, want.detail)
+		}
 	}
-	if len(unavailable) != 1 || unavailable[0].Resource != "bundledeployments" || unavailable[0].Reason != BundleForbidden {
-		t.Fatalf("unavailable markers: %+v", unavailable)
+	time.Sleep(50 * time.Millisecond)
+	for _, res := range []string{"bundledeployments", "gitrepos", "clusters"} {
+		if f.wasListed(res) {
+			t.Errorf("listed unavailable %s", res)
+		}
 	}
-	if synced := got[len(got)-1]; synced.WatchNamespace != "" {
-		t.Fatalf("lost scope: %+v", synced)
+}
+
+// One resource that never syncs must not hold back the others.
+func TestBundleWatcherSyncsDespiteAStuckResource(t *testing.T) {
+	f := &fakeFleetManager{
+		discovery: func(int) int { return http.StatusOK },
+		failing:   map[string]bool{"clusters": true},
+		items:     map[string][]string{"bundles": {bundleHealthyJSON}},
 	}
-	if f.wasListed("bundledeployments") {
-		t.Fatal("listed a denied resource")
+	got := collectBundleEvents(t, startFakeManager(t, f, "", 4),
+		syncedAll("bundles", "bundledeployments", "gitrepos"))
+	if counts := checkSyncOrder(t, got); counts["bundles"] != 1 {
+		t.Fatalf("objects: %v", counts)
 	}
+	for _, ev := range got {
+		if ev.Kind == BundleSynced && ev.Resource == "clusters" {
+			t.Fatal("a failing list reported synced")
+		}
+	}
+}
+
+// The scope comes from Fleet access, not the supervisor's pod probe —
+// the fake fails the test on any pod request. Cluster-wide when that is
+// allowed, whatever the kubeconfig hints; else the hinted namespace.
+func TestBundleWatcherScopesByFleetAccess(t *testing.T) {
+	t.Run("cluster-wide over a hint", func(t *testing.T) {
+		f := &fakeFleetManager{
+			discovery: func(int) int { return http.StatusOK },
+			items:     map[string][]string{"bundles": {bundleHealthyJSON}},
+		}
+		got := collectBundleEvents(t, startFakeManager(t, f, "default", 4), syncedAll("bundles"))
+		if counts := checkSyncOrder(t, got); counts["bundles"] != 1 {
+			t.Fatalf("objects: %v", counts)
+		}
+		if ev := got[len(got)-1]; ev.WatchNamespace != "" {
+			t.Fatalf("scoped to the hint: %+v", ev)
+		}
+	})
+	t.Run("hinted namespace when cluster-wide is denied", func(t *testing.T) {
+		f := &fakeFleetManager{
+			discovery: func(int) int { return http.StatusOK },
+			allow:     func(_, _, ns string) bool { return ns == "fleet-default" },
+			items:     map[string][]string{"namespaces/fleet-default/bundles": {bundleFailingJSON}},
+		}
+		got := collectBundleEvents(t, startFakeManager(t, f, "fleet-default", 4), syncedAll("bundles"))
+		if counts := checkSyncOrder(t, got); counts["bundles"] != 1 {
+			t.Fatalf("objects: %v", counts)
+		}
+		if ev := got[len(got)-1]; ev.WatchNamespace != "fleet-default" {
+			t.Fatalf("scope: %+v", ev)
+		}
+		if f.wasListed("bundles") {
+			t.Fatal("listed cluster-wide without access")
+		}
+	})
+	t.Run("forbidden without a hint", func(t *testing.T) {
+		f := &fakeFleetManager{
+			discovery: func(int) int { return http.StatusOK },
+			allow:     func(_, _, ns string) bool { return ns != "" },
+		}
+		got := collectBundleEvents(t, startFakeManager(t, f, "", 4), first)
+		if ev := got[0]; ev.Reason != BundleForbidden || ev.Resource != "bundles" {
+			t.Fatalf("got %+v", ev)
+		}
+	})
 }
 
 func TestBundleWatcherRetriesFailedDiscovery(t *testing.T) {
 	shortenGateRetry(t)
-
 	f := &fakeFleetManager{discovery: func(attempt int) int {
 		if attempt == 1 {
 			return http.StatusServiceUnavailable
 		}
 		return http.StatusOK
 	}}
-	got := runFakeManager(t, f, isSynced)
+	got := collectBundleEvents(t, startFakeManager(t, f, "", 4), syncedAll("bundles"))
 	if ev := got[0]; ev.Kind != BundleUnavailable || ev.Resource != "bundles" || ev.Reason != BundleCheckFailed {
 		t.Fatalf("a failed check must not read as no API: %+v", ev)
 	}
 }
 
-// A scope probe that fails in transit leaves the kubeconfig's namespace
-// hint unsettled. Watching it would sync a cluster-wide user to that one
-// namespace and silently miss every Fleet workspace.
-func TestBundleWatcherWaitsForSettledScope(t *testing.T) {
-	shortenGateRetry(t)
-	f := &fakeFleetManager{
-		discovery: func(int) int { return http.StatusOK },
-		pods: func(attempt int) int {
-			if attempt == 1 {
-				return http.StatusServiceUnavailable
-			}
-			return http.StatusOK
-		},
-		items: map[string][]string{"bundles": {bundleHealthyJSON}},
-	}
-	got := collectBundleEvents(t, startFakeManager(t, f, "default", 4), isSynced)
-
-	if ev := got[0]; ev.Kind != BundleUnavailable || ev.Resource != "bundles" || ev.Reason != BundleCheckFailed {
-		t.Fatalf("unsettled scope must read as a failed check: %+v", ev)
-	}
-	if synced := got[len(got)-1]; synced.WatchNamespace != "" {
-		t.Fatalf("synced to the fallback hint %q", synced.WatchNamespace)
-	}
-	var bundles int
-	for _, ev := range got {
-		if ev.Bundle != nil {
-			bundles++
-		}
-	}
-	if bundles != 1 {
-		t.Fatalf("got %d bundles from the cluster-wide list, want 1", bundles)
-	}
-}
-
-// pendingBundleSynced reports whether delivery has queued BundleSynced.
-func pendingBundleSynced(d *eventDelivery[BundleEvent]) bool {
+// pendingBundleSynced reports whether delivery has queued the
+// BundleSynced for resource.
+func pendingBundleSynced(d *eventDelivery[BundleEvent], resource string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for e := d.queue.Front(); e != nil; e = e.Next() {
-		if e.Value.(pendingEvent[BundleEvent]).event.Kind == BundleSynced {
+		if ev := e.Value.(pendingEvent[BundleEvent]).event; ev.Kind == BundleSynced && ev.Resource == resource {
 			return true
 		}
 	}
@@ -582,7 +703,7 @@ func pendingBundleSynced(d *eventDelivery[BundleEvent]) bool {
 
 // With the consumer stalled through an outage, an updated failure that
 // delivery has in flight is re-queued behind whatever follows it. No
-// failure may reach the consumer after BundleSynced.
+// bundles failure may reach the consumer after the bundles BundleSynced.
 func TestBundleWatcherNoStaleFailureAfterSync(t *testing.T) {
 	shortenGateRetry(t)
 	f := &fakeFleetManager{
@@ -597,25 +718,32 @@ func TestBundleWatcherNoStaleFailureAfterSync(t *testing.T) {
 	w := startFakeManager(t, f, "", 1)
 
 	deadline := time.Now().Add(5 * time.Second)
-	for !pendingBundleSynced(w.eventDelivery) {
+	for !pendingBundleSynced(w.eventDelivery, "bundles") {
 		if time.Now().After(deadline) {
-			t.Fatal("BundleSynced never queued")
+			t.Fatal("bundles BundleSynced never queued")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	got := collectBundleEvents(t, w, isSynced)
-	select {
-	case ev := <-w.Out:
-		t.Fatalf("event after BundleSynced: %+v", ev)
-	case <-time.After(50 * time.Millisecond):
-	}
-	var bundles int
-	for _, ev := range got {
-		if ev.Bundle != nil {
-			bundles++
+	got := collectBundleEvents(t, w, syncedAll("bundles", "bundledeployments", "gitrepos", "clusters"))
+drain:
+	for {
+		select {
+		case ev := <-w.Out:
+			got = append(got, ev)
+		case <-time.After(50 * time.Millisecond):
+			break drain
 		}
 	}
-	if bundles != 2 {
-		t.Fatalf("synced after %d of 2 bundles", bundles)
+	if counts := checkSyncOrder(t, got); counts["bundles"] != 2 {
+		t.Fatalf("objects: %v", counts)
+	}
+	synced := false
+	for _, ev := range got {
+		switch {
+		case ev.Kind == BundleSynced && ev.Resource == "bundles":
+			synced = true
+		case ev.Kind == BundleUnavailable && ev.Resource == "bundles" && synced:
+			t.Fatalf("bundles failure after its BundleSynced: %+v", ev)
+		}
 	}
 }

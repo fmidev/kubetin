@@ -24,25 +24,29 @@ import (
 // stable for the lifetime of a focused-cluster watcher group, so we
 // query it once at Run start rather than caching.
 func hasAPIResource(restCfg *rest.Config, gvr schema.GroupVersionResource) (bool, error) {
+	names, err := apiResourceNames(restCfg, gvr.GroupVersion())
+	return names[gvr.Resource], err
+}
+
+// apiResourceNames returns the resources discovery lists for gv. A 404
+// means the group isn't registered: an empty set, not an error.
+// Anything else is a failed check — an unreachable cluster mustn't read
+// as one without the API.
+func apiResourceNames(restCfg *rest.Config, gv schema.GroupVersion) (map[string]bool, error) {
 	disc, err := discovery.NewDiscoveryClientForConfig(restCfg)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	list, err := disc.ServerResourcesForGroupVersion(gvr.GroupVersion().String())
+	list, err := disc.ServerResourcesForGroupVersion(gv.String())
 	if err != nil {
-		// 404 from the apiserver → group not registered. That's a
-		// negative answer, not an error from the caller's POV. Anything
-		// else is a failed check: an unreachable cluster mustn't read as
-		// one without the API.
 		if apierrors.IsNotFound(err) {
-			return false, nil
+			return map[string]bool{}, nil
 		}
-		return false, err
+		return nil, err
 	}
+	names := make(map[string]bool, len(list.APIResources))
 	for _, r := range list.APIResources {
-		if r.Name == gvr.Resource {
-			return true, nil
-		}
+		names[r.Name] = true
 	}
-	return false, nil
+	return names, nil
 }
