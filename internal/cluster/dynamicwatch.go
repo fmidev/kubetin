@@ -1,7 +1,7 @@
-// Shared scaffolding for watchers that talk to OpenShift-only APIs
-// through the dynamic client. The concrete watchers
-// (projectwatch.go, and later routewatch / buildconfigwatch for
-// #21 / #22) wire their own GroupVersionResource + event projection;
+// Shared scaffolding for watchers that talk to optional APIs through
+// the dynamic client. The concrete watchers (projectwatch.go for
+// OpenShift, bundlewatch.go for Rancher Fleet) wire their own
+// GroupVersionResource + event projection;
 // the helpers here are just the discovery probe that lets each
 // watcher cleanly skip when the API surface doesn't include the
 // resource (rather than letting the dynamic informer 404-loop in
@@ -9,6 +9,7 @@
 package cluster
 
 import (
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
@@ -16,7 +17,7 @@ import (
 
 // hasAPIResource returns true when the focused cluster's discovery
 // endpoint lists the given GVR — i.e. the resource is part of the
-// API surface. Used as the first check in each OpenShift watcher's
+// API surface. Used as the first check in each dynamic watcher's
 // Run loop; the second check is RBAC (Supervisor.CanI list verb).
 //
 // Discovery is cheap (single HTTP GET) and the result is naturally
@@ -30,8 +31,13 @@ func hasAPIResource(restCfg *rest.Config, gvr schema.GroupVersionResource) (bool
 	list, err := disc.ServerResourcesForGroupVersion(gvr.GroupVersion().String())
 	if err != nil {
 		// 404 from the apiserver → group not registered. That's a
-		// negative answer, not an error from the caller's POV.
-		return false, nil
+		// negative answer, not an error from the caller's POV. Anything
+		// else is a failed check: an unreachable cluster mustn't read as
+		// one without the API.
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	for _, r := range list.APIResources {
 		if r.Name == gvr.Resource {
