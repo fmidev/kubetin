@@ -77,6 +77,11 @@ func TestFocusRejectsPreviousVisitMessages(t *testing.T) {
 	before.deployments, before.events = maps.Clone(m.deployments), maps.Clone(m.events)
 	before.namespaces, before.services = maps.Clone(m.namespaces), maps.Clone(m.services)
 	before.ingresses, before.endpointSlices = maps.Clone(m.ingresses), maps.Clone(m.endpointSlices)
+	before.bundles = bundlesState{
+		items: maps.Clone(m.bundles.items), deployments: maps.Clone(m.bundles.deployments),
+		repos: maps.Clone(m.bundles.repos), clusters: maps.Clone(m.bundles.clusters),
+		synced: maps.Clone(m.bundles.synced), unavailable: maps.Clone(m.bundles.unavailable),
+	}
 	before.permissions = maps.Clone(m.permissions)
 	for _, msg := range []tea.Msg{
 		PodEventMsg{Context: "alpha", UID: "ghost"},
@@ -88,6 +93,8 @@ func TestFocusRejectsPreviousVisitMessages(t *testing.T) {
 		SvcEventMsg{Context: "alpha", UID: "ghost"},
 		IngEventMsg{Context: "alpha", UID: "ghost"},
 		EndpointSliceEventMsg{Context: "alpha", UID: "ghost"},
+		BundleEventMsg{Context: "alpha", UID: "ghost", Bundle: &cluster.Bundle{UID: "ghost"}},
+		BundleEventMsg{Context: "alpha", Kind: cluster.BundleSynced, Resource: "bundles"},
 		MetricsSnapshotMsg{Context: "alpha"},
 		NetworkSnapshotMsg{Context: "alpha", OK: true},
 		DescribeResultMsg{Context: "alpha", YAML: "old yaml"},

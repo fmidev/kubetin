@@ -63,7 +63,7 @@ func (m Model) handleClusterDashKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.leaveClusterDash(m.clusterDash.returnView)
 		m.enterFleet()
 		return m, nil
-	case "1", "2", "3", "4", "5", "6":
+	case "1", "2", "3", "4", "5", "6", "7":
 		m.leaveClusterDash(m.clusterDash.returnView)
 		return m.handleKey(k)
 	case "j", "k", "g", "G", "up", "down", "home", "end",

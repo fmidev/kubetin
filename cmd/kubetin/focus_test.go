@@ -150,6 +150,11 @@ func TestWatchForwardersCarryFocusGeneration(t *testing.T) {
 			w.Out <- cluster.EndpointSliceEvent{Context: "alpha"}
 			forwardEndpointSliceEvents(ctx, w, sender, focus)
 		}},
+		{"bundles", func(ctx context.Context, sender watchMessageSender) {
+			w := cluster.NewBundleWatcher("alpha", 1)
+			w.Out <- cluster.BundleEvent{Context: "alpha"}
+			forwardBundleEvents(ctx, w, sender, focus)
+		}},
 		{"metrics", func(ctx context.Context, sender watchMessageSender) {
 			w := cluster.NewFocusedMetricsPoller("alpha", 1)
 			w.Out <- cluster.MetricsSnapshot{Context: "alpha"}

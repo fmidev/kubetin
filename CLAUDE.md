@@ -55,7 +55,7 @@ case PodEventMsg:
     ...
 ```
 
-Without this, a stale event from a cluster the user just Tabbed away from lands on the new view's data structures (UID-keyed maps; the matching DELETE comes from the now-cancelled informer and never arrives, so the foreign UID sticks). Same shape for `NodeEvent`, `DeployEvent`, `EvtEvent`, `MetricsSnapshot`, `NetworkSnapshot`, `DescribeResult`, `DeleteResult`, `ScaleResult`, `RolloutResult`.
+Without this, a stale event from a cluster the user just Tabbed away from lands on the new view's data structures (UID-keyed maps; the matching DELETE comes from the now-cancelled informer and never arrives, so the foreign UID sticks). Same shape for `NodeEvent`, `DeployEvent`, `EvtEvent`, `BundleEvent`, `MetricsSnapshot`, `NetworkSnapshot`, `DescribeResult`, `DeleteResult`, `ScaleResult`, `RolloutResult`.
 
 Log streams use a session ID instead of context (multiple streams to the same context are valid). `startLogs` increments `m.logs.session`, every emitted log message is tagged with it, the receiver drops mismatches.
 

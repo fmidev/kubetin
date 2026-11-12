@@ -89,6 +89,9 @@ func actionsFor(kind string) []Action {
 		// Project routes through the project.openshift.io API but the
 		// user-facing operations are identical.
 		return []Action{ActSetNamespace, ActDescribe, ActEvents, ActDelete}
+	case "Bundle":
+		// Read-only for now: Fleet owns the bundle, its GitRepo makes it.
+		return []Action{ActDescribe, ActEvents}
 	}
 	return []Action{ActDescribe}
 }

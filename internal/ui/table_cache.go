@@ -3,9 +3,12 @@ package ui
 import (
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/fmidev/kubetin/internal/cluster"
 )
 
 type tableKey struct {
@@ -86,6 +89,9 @@ func (m Model) tableKey(view View) tableKey {
 		key.size = len(m.services)
 	case ViewIngresses:
 		key.size = len(m.ingresses)
+	case ViewBundles:
+		key.size = len(m.bundles.items)
+		key.dependencies = [3]int{m.bundles.silentAgents(time.Now())}
 	}
 	return key
 }
@@ -160,6 +166,8 @@ func (m Model) tableCount(view View) int {
 			entry.count = countMatching(m.ingresses, func(r ingressRow) bool {
 				return (m.namespace == "" || r.Namespace == m.namespace) && (needle == "" || ingressMatches(r, needle))
 			})
+		case ViewBundles:
+			entry.count = countMatching(m.bundles.items, func(b cluster.Bundle) bool { return bundleMatches(b, m.namespace, needle) })
 		}
 		entry.countKey, entry.countValid = key, true
 	}

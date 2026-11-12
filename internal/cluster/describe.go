@@ -70,6 +70,9 @@ func (s *Supervisor) Describe(ctx context.Context, ctxName string, ref DescribeR
 	}
 
 	stripManagedFields(obj.Object)
+	if ref.Group == bundlesGVR.Group {
+		elideFleetPayloads(obj.Object)
+	}
 
 	if ref.Kind == "Secret" && !reveal {
 		out.Redacted = redactSecretData(obj.Object)
@@ -92,6 +95,23 @@ func stripManagedFields(o map[string]any) {
 		return
 	}
 	delete(meta, "managedFields")
+}
+
+// elideFleetPayloads replaces what buries a Fleet object's status — a
+// Bundle's gzipped manifests and Rancher's applied-object annotation,
+// each up to hundreds of KB of base64 — with its size.
+func elideFleetPayloads(o map[string]any) {
+	for _, r := range nestedObjs(o, "spec", "resources") {
+		if s, ok := r["content"].(string); ok {
+			r["content"] = fmt.Sprintf("<elided, %d bytes>", len(s))
+		}
+	}
+	if ann := nestedObj(o, "metadata", "annotations"); ann != nil {
+		const applied = "objectset.rio.cattle.io/applied"
+		if s, ok := ann[applied].(string); ok {
+			ann[applied] = fmt.Sprintf("<elided, %d bytes>", len(s))
+		}
+	}
 }
 
 // redactSecretData rewrites .data AND .stringData values to

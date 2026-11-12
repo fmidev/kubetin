@@ -68,6 +68,7 @@ func (m *Model) clearFocusedState() {
 	m.services = make(map[types.UID]serviceRow)
 	m.ingresses = make(map[types.UID]ingressRow)
 	m.endpointSlices = make(map[types.UID]endpointSliceRow)
+	m.bundles = newBundlesState()
 	m.cursor = ""
 	m.syncedPods, m.syncedNodes, m.syncedDeploys, m.syncedEvents, m.syncedNamespaces = false, false, false, false, false
 	m.syncedServices, m.syncedIngresses = false, false

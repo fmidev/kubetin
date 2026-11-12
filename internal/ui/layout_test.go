@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -538,6 +539,54 @@ func TestViewFitsCanvas(t *testing.T) {
 			r.Hosts = []string{strings.Repeat("h", 120) + ".example.com", "b.example.com"}
 			r.Address = ""
 			m.ingresses["ing-multi"] = r
+		})},
+
+		{"bundles/wide", 200, 50, ViewBundles, bundlesFixture(nil)},
+		{"bundles/mid", 120, 40, ViewBundles, bundlesFixture(nil)},
+		{"bundles/narrow", 80, 24, ViewBundles, bundlesFixture(nil)},
+		{"bundles/very-narrow", 60, 20, ViewBundles, bundlesFixture(nil)},
+		{"bundles/tiny", 40, 12, ViewBundles, bundlesFixture(nil)},
+		{"bundles/unsynced", 120, 30, ViewBundles, func(m *Model) {}},
+		{"bundles/no-api", 120, 30, ViewBundles, func(m *Model) {
+			m.bundles.apply(cluster.BundleEvent{Kind: cluster.BundleUnavailable, Resource: "bundles", Reason: cluster.BundleNoAPI})
+		}},
+		{"bundles/check-failed-long", 60, 20, ViewBundles, func(m *Model) {
+			m.bundles.apply(cluster.BundleEvent{Kind: cluster.BundleUnavailable, Resource: "bundles",
+				Reason: cluster.BundleCheckFailed, Detail: strings.Repeat("connection refused ", 20)})
+		}},
+		{"bundles/synced-empty", 120, 30, ViewBundles, func(m *Model) {
+			m.bundles.apply(cluster.BundleEvent{Kind: cluster.BundleSynced, Resource: "bundles"})
+		}},
+		{"bundles/filtered-empty", 120, 30, ViewBundles, bundlesFixture(func(m *Model) {
+			m.filterText, m.cursor = "nothing-matches", ""
+		})},
+		{"bundles/partial", 120, 30, ViewBundles, bundlesFixture(func(m *Model) {
+			delete(m.bundles.synced, "bundledeployments")
+			for _, r := range []string{"bundledeployments", "clusters", "gitrepos"} {
+				m.bundles.apply(cluster.BundleEvent{Kind: cluster.BundleUnavailable, Resource: r,
+					Reason: cluster.BundleForbidden, Detail: "list " + r + " denied"})
+			}
+		})},
+		{"bundles/wide-unicode", 120, 30, ViewBundles, bundlesFixture(func(m *Model) {
+			d := m.bundles.deployments["d-1"]
+			d.Conditions = []cluster.BundleCondition{{Type: "Deployed", Status: "False", Message: strings.Repeat("失败 ", 60)}}
+			d.Release = strings.Repeat("长", 40)
+			m.bundles.deployments["d-1"] = d
+			c := m.bundles.clusters["c-a"]
+			c.DisplayName = strings.Repeat("集群", 20)
+			m.bundles.clusters["c-a"] = c
+		})},
+		{"bundles/many-silent-agents", 80, 24, ViewBundles, bundlesFixture(func(m *Model) {
+			for i := range 40 {
+				uid := types.UID(fmt.Sprintf("c-silent-%d", i))
+				m.bundles.apply(cluster.BundleEvent{UID: uid, Cluster: &cluster.BundleCluster{UID: uid, Name: string(uid)}})
+			}
+		})},
+		{"help-over-bundles", 120, 40, ViewBundles, bundlesFixture(func(m *Model) { m.helpOpen = true })},
+		{"actions-over-bundles", 120, 40, ViewBundles, bundlesFixture(func(m *Model) {
+			m.actionMenu.open = true
+			m.actionMenu.ref = cluster.DescribeRef{Kind: "Bundle", Namespace: "fleet-default", Name: "platform-ingress"}
+			m.actionMenu.options = m.classifiedActions(m.actionMenu.ref)
 		})},
 
 		{"restart-confirm", 120, 40, ViewDeployments, func(m *Model) {

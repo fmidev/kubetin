@@ -661,6 +661,17 @@ func (c *watchCoordinator) spawnWatchers(child context.Context, focus ui.FocusTa
 		}
 	}()
 
+	// Rancher Fleet. Self-gates inside Run(): anywhere that isn't a
+	// Fleet manager it reports BundleNoAPI after one discovery call and
+	// idles, so it's safe to spawn on every cluster.
+	bw := cluster.NewBundleWatcher(target, 512)
+	go forwardBundleEvents(child, bw, c.prog, focus)
+	go func() {
+		if err := bw.Run(child, c.sup); err != nil {
+			klog.Errorf("bundle watcher (%s) exited: %v", target, err)
+		}
+	}()
+
 	mp := cluster.NewFocusedMetricsPoller(target, 4)
 	go forwardMetrics(child, mp, c.prog, focus)
 	go func() {
@@ -712,6 +723,10 @@ func forwardDeployEvents(ctx context.Context, w *cluster.DeployWatcher, p watchM
 
 func forwardReplicaSetEvents(ctx context.Context, w *cluster.ReplicaSetWatcher, p watchMessageSender, focus ui.FocusTarget) {
 	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.ReplicaSetEvent) tea.Msg { return ui.ReplicaSetEventMsg(ev) })
+}
+
+func forwardBundleEvents(ctx context.Context, w *cluster.BundleWatcher, p watchMessageSender, focus ui.FocusTarget) {
+	forwardResourceEvents(ctx, w.Out, p, focus, func(ev cluster.BundleEvent) tea.Msg { return ui.BundleEventMsg(ev) })
 }
 
 func forwardEvtEvents(ctx context.Context, w *cluster.EventWatcher, p watchMessageSender, focus ui.FocusTarget) {

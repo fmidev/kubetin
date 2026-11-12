@@ -44,6 +44,10 @@ type IngEventMsg cluster.IngressEvent
 // rather than merged into the service row.
 type EndpointSliceEventMsg cluster.EndpointSliceEvent
 
+// BundleEventMsg wraps a cluster.BundleEvent: one Rancher Fleet object,
+// or a per-resource synced / unavailable marker.
+type BundleEventMsg cluster.BundleEvent
+
 // ResourceBatchMsg applies a bounded informer burst before the next render.
 // The forwarder binds the whole batch to one FocusTarget with FocusedMsg.
 type ResourceBatchMsg []tea.Msg
@@ -102,6 +106,7 @@ const (
 	ViewIngresses
 	ViewNodes
 	ViewNamespaces
+	ViewBundles // Rancher Fleet bundles; on a Fleet manager only
 	ViewFleet   // fleet dashboard, full-bleed triage view
 	ViewCluster // per-cluster dashboard: tiles, gauges, top pods, warnings
 )
@@ -201,6 +206,7 @@ type Model struct {
 	// owns several slices and they are summed at render time. See
 	// collectEndpointCounts.
 	endpointSlices map[types.UID]endpointSliceRow
+	bundles        bundlesState
 	view           View
 	cursor         types.UID
 	width          int
@@ -298,6 +304,7 @@ func New(context string, store *model.Store, contexts []string) Model {
 		services:            make(map[types.UID]serviceRow),
 		ingresses:           make(map[types.UID]ingressRow),
 		endpointSlices:      make(map[types.UID]endpointSliceRow),
+		bundles:             newBundlesState(),
 		permissions:         make(map[string]permState),
 		permissionsInFlight: make(map[string]struct{}),
 		fleetTrends:         make(map[string]*trendRing),
@@ -329,7 +336,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// which visit produced it, even when its context name matches.
 		switch msg.(type) {
 		case ResourceBatchMsg, ReplicaSetEventMsg, PodEventMsg, NodeEventMsg, DeployEventMsg, EvtEventMsg, NsEventMsg,
-			SvcEventMsg, IngEventMsg, EndpointSliceEventMsg, MetricsSnapshotMsg, NetworkSnapshotMsg,
+			SvcEventMsg, IngEventMsg, EndpointSliceEventMsg, BundleEventMsg, MetricsSnapshotMsg, NetworkSnapshotMsg,
 			modalResultMsg, DescribeResultMsg, PermissionResultMsg, DeleteResultMsg, ScaleResultMsg, RolloutResultMsg,
 			NodeOpResultMsg, DrainMsg, DrainStartMsg, DrainProgressMsg, DrainDoneMsg:
 			discardFocusedMessage(msg)
@@ -526,6 +533,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// No synced flag and no cursor guard: slices are never rows,
 		// only a column on the Services table.
 		applyEndpointSliceEvent(m.endpointSlices, cluster.EndpointSliceEvent(msg))
+		return m, nil
+
+	case BundleEventMsg:
+		if msg.Context != m.WatchedContext {
+			return m, nil
+		}
+		m.bundles.apply(cluster.BundleEvent(msg))
+		m.invalidateTables(ViewBundles)
+		// Anchored rather than cleared: the detail pane shows the
+		// selected bundle, so the view needs one selected.
+		if _, ok := m.bundles.items[m.cursor]; !ok && m.view == ViewBundles {
+			m.anchorCursorToVisible()
+		}
 		return m, nil
 
 	case DescribeResultMsg:
@@ -929,6 +949,8 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.switchView(ViewNodes)
 	case "6":
 		return m.switchView(ViewNamespaces)
+	case "7":
+		return m.switchView(ViewBundles)
 	case "e":
 		// Events for the highlighted row. Scope is snapshotted on
 		// press rather than tracking the cursor, so the list doesn't
@@ -955,7 +977,7 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.view {
 		case ViewNamespaces:
 			m.nsSortKey = m.nsSortKey.next()
-		case ViewServices, ViewIngresses:
+		case ViewServices, ViewIngresses, ViewBundles:
 			// Fixed namespace/name order, no sort state to cycle.
 		default:
 			m.sortKey = m.sortKey.next()
@@ -965,7 +987,7 @@ func (m Model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.view {
 		case ViewNamespaces:
 			m.nsSortDesc = !m.nsSortDesc
-		case ViewServices, ViewIngresses:
+		case ViewServices, ViewIngresses, ViewBundles:
 			// See `s` above.
 		default:
 			m.sortDesc = !m.sortDesc
@@ -1768,6 +1790,8 @@ func (m Model) mainPane(height, width int) string {
 		return m.renderServiceTable(height, width)
 	case ViewIngresses:
 		return m.renderIngressTable(height, width)
+	case ViewBundles:
+		return m.renderBundlesView(height, width)
 	case ViewCluster:
 		return m.renderClusterDash(height, width)
 	}
@@ -1841,6 +1865,8 @@ func (m Model) buildTableUIDs(view View) []types.UID {
 			out = append(out, r.UID)
 		}
 		return out
+	case ViewBundles:
+		return m.sortedBundleUIDs(needle)
 
 	}
 	return sortedPodUIDs(m.pods, m.sortKey, m.sortDesc, m.namespace, needle)
@@ -1898,6 +1924,9 @@ func (m Model) renderHeaderIdentity(st model.ClusterState) string {
 	case ViewIngresses:
 		viewLabel = "ingresses"
 		total = len(m.ingresses)
+	case ViewBundles:
+		viewLabel = "bundles"
+		total = len(m.bundles.items)
 	}
 	title := m.Theme.Title.Render(
 		fmt.Sprintf(" kubetin %s · ns:%s · %s ", cleanDetail(display), cleanDetail(ns), viewLabel),
@@ -2007,12 +2036,12 @@ func (m Model) renderHeaderMetrics(st model.ClusterState) string {
 }
 
 func (m Model) renderFooter() string {
-	hint := " ?:help  F1:fleet  1:pods  2:deploy  3:svc  4:ing  5:nodes  6:ns  e:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
+	hint := " ?:help  F1:fleet  1:pods  2:deploy  3:svc  4:ing  5:nodes  6:ns  7:bundles  e:events  Tab:cluster  n:ns  /:filter  s:sort  Enter:actions  i:dashboard  q:quit "
 	if m.view == ViewFleet && !m.dashboard.open {
 		hint = " j/k:cluster  Enter:details  PgUp/Dn:scroll  o:open  r:refresh  Tab:cluster  /:filter  Esc/F1:back  ?:help  q:quit "
 	}
 	if m.view == ViewCluster && !m.dashboard.open {
-		hint = " Tab:cluster  n:ns  0:all-ns  1-6:tables  F1:fleet  Esc/F3:back  ?:help  q:quit "
+		hint = " Tab:cluster  n:ns  0:all-ns  1-7:tables  F1:fleet  Esc/F3:back  ?:help  q:quit "
 	}
 	if m.dashboard.open {
 		hint = " Tab:pane  j/k:move  g/G:top/bottom  f:follow  i:open pod  c:container  l:logs  d:describe  Enter:actions  Esc:back "
@@ -2072,6 +2101,8 @@ func (m Model) filterCounts() (matched, total int) {
 		total = len(m.services)
 	case ViewIngresses:
 		total = len(m.ingresses)
+	case ViewBundles:
+		total = len(m.bundles.items)
 	case ViewFleet:
 		total = len(m.Contexts)
 	case ViewCluster:

@@ -20,6 +20,10 @@ agent, no installed CRDs.
   `—`, stale metrics are tagged, never presented as current.
 - **Live tables** for pods, deployments, nodes, events, namespaces,
   services and ingresses — sortable, filterable in-place.
+- **Rancher Fleet bundles** (`7`) on a Fleet manager: worst first, which
+  clusters each one is failing on and why, failing GitRepos, and agents
+  that have stopped checking in. Fleet keeps calling a silent agent's
+  bundles Ready; kubetin marks them `Stale`.
 - **Endpoint health on services.** The `READY` column counts ready
   endpoints across every EndpointSlice, so a Service whose selector
   matches nothing reads `0/0` in red instead of looking healthy.
@@ -130,7 +134,7 @@ kubetin -trust
 | | `C` | show / hide the cluster rail |
 | View | `F1` | fleet overview |
 | | `F3` | cluster dashboard (tiles, gauges, top pods, nodes, warnings; `Tab` cycles clusters, `n` scopes it) |
-| | `1` – `6` | pods / deployments / services / ingresses / nodes / namespaces |
+| | `1` – `7` | pods / deployments / services / ingresses / nodes / namespaces / Rancher Fleet bundles |
 | Inspect the selected row | `i` | status dashboard |
 | | `l` | logs |
 | | `e` | events |
