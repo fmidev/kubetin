@@ -156,6 +156,14 @@ func TestAllWatchersConvergeAfterOverflow(t *testing.T) {
 			return watcherObservation{uid: ev.UID, context: ev.Context, value: ev.Name, deleted: int(ev.Kind) == 2}
 		})
 	})
+	t.Run("bundles", func(t *testing.T) {
+		w := NewBundleWatcher("alpha", 256)
+		checkWatcherBurst(t, w.eventDelivery, func(kind int, meta metav1.ObjectMeta) {
+			w.emit(BundleEventKind(kind), &unstructured.Unstructured{Object: map[string]any{"metadata": map[string]any{"uid": string(meta.UID), "name": meta.Name}}}, projectBundle)
+		}, func(ev BundleEvent) watcherObservation {
+			return watcherObservation{uid: ev.UID, context: ev.Context, value: ev.Bundle.Name, deleted: ev.Kind == BundleDeleted}
+		})
+	})
 	t.Run("endpoint-slices", func(t *testing.T) {
 		w := NewEndpointSliceWatcher("alpha", 512)
 		checkWatcherBurst(t, w.eventDelivery, func(kind int, meta metav1.ObjectMeta) {
