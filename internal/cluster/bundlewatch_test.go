@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,7 +62,7 @@ const (
 			"summary":{"state":"in-progress","transitioning":true,
 				"message":["Available: 0/1","","Deployment does not have minimum availability."]}}],
 		"modifiedStatus":[
-			{"kind":"ConfigMap","apiVersion":"v1","namespace":"ingress","name":"controller-config","patch":"{\"data\":{\"k\":\"v\"}}"},
+			{"kind":"ConfigMap","apiVersion":"v1","namespace":"ingress","name":"controller-config","patch":"{\"data\":{\"drift-payload\":\"v\"}}"},
 			{"kind":"Service","apiVersion":"v1","namespace":"ingress","name":"metrics","missing":true},
 			{"kind":"Secret","apiVersion":"v1","namespace":"ingress","name":"stale","delete":true}],
 		"resources":[{"kind":"Deployment","apiVersion":"apps/v1","namespace":"ingress","name":"controller"}],
@@ -249,7 +250,7 @@ func TestTrimBundleObjectKeepsWhatProjectionReads(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				for _, gone := range []string{"H4sI", "hunter2", "annotations", `"resources"`, "apiServerURL", "perClusterResourceCounts"} {
+				for _, gone := range []string{"H4sI", "hunter2", "annotations", `"resources"`, "apiServerURL", "perClusterResourceCounts", "drift-payload"} {
 					if strings.Contains(string(raw), gone) {
 						t.Errorf("trimmed object still holds %s: %s", gone, raw)
 					}
@@ -309,6 +310,8 @@ type fakeFleetManager struct {
 	served []string
 	// allow decides each access review; nil allows everything.
 	allow func(verb, resource, namespace string) bool
+	// evalError, when it returns one, leaves the review undecided.
+	evalError func(verb, resource, namespace string) string
 	// items and failing are keyed by list path below the group-version:
 	// "bundles", or "namespaces/<ns>/bundles".
 	items   map[string][]string
@@ -356,7 +359,11 @@ func (f *fakeFleetManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if attrs.Group != "fleet.cattle.io" {
 			f.t.Errorf("unexpected review: %+v", attrs)
 		}
-		review.Status.Allowed = f.allow == nil || f.allow(attrs.Verb, attrs.Resource, attrs.Namespace)
+		if f.evalError != nil {
+			review.Status.EvaluationError = f.evalError(attrs.Verb, attrs.Resource, attrs.Namespace)
+		}
+		review.Status.Allowed = review.Status.EvaluationError == "" &&
+			(f.allow == nil || f.allow(attrs.Verb, attrs.Resource, attrs.Namespace))
 		json.NewEncoder(w).Encode(review)
 	case strings.HasPrefix(r.URL.Path, prefix+"/"):
 		path := strings.TrimPrefix(r.URL.Path, prefix+"/")
@@ -662,6 +669,33 @@ func TestBundleWatcherScopesByFleetAccess(t *testing.T) {
 			t.Fatal("listed cluster-wide without access")
 		}
 	})
+	t.Run("each resource on its own", func(t *testing.T) {
+		f := &fakeFleetManager{
+			discovery: func(int) int { return http.StatusOK },
+			// Bundles only in their workspace, but deployments — which
+			// live in per-cluster namespaces — cluster-wide.
+			allow: func(_, res, ns string) bool { return ns == "fleet-default" || res == "bundledeployments" },
+			items: map[string][]string{
+				"namespaces/fleet-default/bundles": {bundleFailingJSON},
+				"bundledeployments":                {bundleDeploymentJSON},
+			},
+		}
+		got := collectBundleEvents(t, startFakeManager(t, f, "fleet-default", 4),
+			syncedAll("bundles", "bundledeployments", "gitrepos", "clusters"))
+		if counts := checkSyncOrder(t, got); counts["bundles"] != 1 || counts["bundledeployments"] != 1 {
+			t.Fatalf("objects: %v", counts)
+		}
+		scopes := map[string]string{}
+		for _, ev := range got {
+			if ev.Kind == BundleSynced {
+				scopes[ev.Resource] = ev.WatchNamespace
+			}
+		}
+		want := map[string]string{"bundles": "fleet-default", "bundledeployments": "", "gitrepos": "fleet-default", "clusters": "fleet-default"}
+		if !reflect.DeepEqual(scopes, want) {
+			t.Fatalf("scopes: %v, want %v", scopes, want)
+		}
+	})
 	t.Run("forbidden without a hint", func(t *testing.T) {
 		f := &fakeFleetManager{
 			discovery: func(int) int { return http.StatusOK },
@@ -685,6 +719,31 @@ func TestBundleWatcherRetriesFailedDiscovery(t *testing.T) {
 	got := collectBundleEvents(t, startFakeManager(t, f, "", 4), syncedAll("bundles"))
 	if ev := got[0]; ev.Kind != BundleUnavailable || ev.Resource != "bundles" || ev.Reason != BundleCheckFailed {
 		t.Fatalf("a failed check must not read as no API: %+v", ev)
+	}
+}
+
+// A review no authorizer could decide is a failed check, not a denial:
+// Bundles must not park as forbidden over a webhook outage.
+func TestBundleWatcherRetriesUndecidedReview(t *testing.T) {
+	shortenGateRetry(t)
+	var reviews atomic.Int32
+	f := &fakeFleetManager{
+		discovery: func(int) int { return http.StatusOK },
+		evalError: func(_, res, _ string) string {
+			if res == "bundles" && reviews.Add(1) == 1 {
+				return "webhook authorizer: connection refused"
+			}
+			return ""
+		},
+		items: map[string][]string{"bundles": {bundleHealthyJSON}},
+	}
+	got := collectBundleEvents(t, startFakeManager(t, f, "", 4), syncedAll("bundles"))
+	if ev := got[0]; ev.Kind != BundleUnavailable || ev.Resource != "bundles" || ev.Reason != BundleCheckFailed ||
+		!strings.Contains(ev.Detail, "connection refused") {
+		t.Fatalf("an undecided review must not read as a denial: %+v", ev)
+	}
+	if counts := checkSyncOrder(t, got); counts["bundles"] != 1 {
+		t.Fatalf("objects: %v", counts)
 	}
 }
 

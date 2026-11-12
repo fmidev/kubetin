@@ -282,7 +282,7 @@ func (w *BundleWatcher) Run(ctx context.Context, sup *Supervisor) error {
 		return fmt.Errorf("rest config: %w", err)
 	}
 
-	watched, scope := w.gate(ctx, sup, restCfg)
+	watched := w.gate(ctx, sup, restCfg)
 	if len(watched) == 0 {
 		<-ctx.Done()
 		return nil
@@ -292,9 +292,11 @@ func (w *BundleWatcher) Run(ctx context.Context, sup *Supervisor) error {
 	if err != nil {
 		return fmt.Errorf("dynamic client: %w", err)
 	}
-	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dyn, 0, scope, nil)
+	klog.Infof("bundlewatch[%s]: starting %d informers", w.Context, len(watched))
 	synced := make([]cache.InformerSynced, 0, len(watched))
 	for _, r := range watched {
+		// A factory each: every resource has its own scope.
+		factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dyn, 0, r.scope, nil)
 		informer := factory.ForResource(r.gvr).Informer()
 		keep := r.keep
 		if err := informer.SetTransform(func(obj any) (any, error) {
@@ -317,17 +319,15 @@ func (w *BundleWatcher) Run(ctx context.Context, sup *Supervisor) error {
 			return fmt.Errorf("add handler %s: %w", r.gvr.Resource, err)
 		}
 		synced = append(synced, handler.HasSynced)
+		factory.Start(ctx.Done())
 	}
-
-	klog.Infof("bundlewatch[%s]: starting %d informers", w.Context, len(watched))
-	factory.Start(ctx.Done())
 
 	var wg sync.WaitGroup
 	for i, r := range watched {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w.awaitSync(ctx, r.gvr.Resource, synced[i], scope)
+			w.awaitSync(ctx, r.gvr.Resource, synced[i], r.scope)
 		}()
 	}
 	<-ctx.Done()
@@ -354,15 +354,21 @@ func (w *BundleWatcher) awaitSync(ctx context.Context, resource string, hasSynce
 	}, false)
 }
 
-// gate picks the resources to watch and their scope, retrying while
-// the Bundles check itself fails: a cluster briefly unreachable at
-// focus time is not a cluster without Fleet.
-func (w *BundleWatcher) gate(ctx context.Context, sup *Supervisor, restCfg *rest.Config) ([]bundleResource, string) {
+// bundleWatch is a resource cleared for watching, and where.
+type bundleWatch struct {
+	bundleResource
+	scope string
+}
+
+// gate picks the resources to watch, retrying while the Bundles check
+// itself fails: a cluster briefly unreachable at focus time is not a
+// cluster without Fleet.
+func (w *BundleWatcher) gate(ctx context.Context, sup *Supervisor, restCfg *rest.Config) []bundleWatch {
 	reported := false
 	for {
-		watched, scope, failure := w.check(ctx, sup, restCfg)
+		watched, failure := w.check(ctx, sup, restCfg)
 		if failure == "" {
-			return watched, scope
+			return watched
 		}
 		// Once per outage: a second publish would bump the pending
 		// event's version, and delivery re-queues an updated in-flight
@@ -373,88 +379,95 @@ func (w *BundleWatcher) gate(ctx context.Context, sup *Supervisor, restCfg *rest
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ""
+			return nil
 		case <-time.After(bundleGateRetry):
 		}
 	}
 }
 
-// check returns the resources to watch and their scope, or why the
-// check itself failed. A missing API or denied Bundles access is an
-// answer, not a failure: it is published and nothing is watched.
-func (w *BundleWatcher) check(ctx context.Context, sup *Supervisor, restCfg *rest.Config) ([]bundleResource, string, string) {
+// check returns the resources to watch, or why the check itself
+// failed. A missing API or denied Bundles access is an answer, not a
+// failure: it is published and nothing is watched.
+func (w *BundleWatcher) check(ctx context.Context, sup *Supervisor, restCfg *rest.Config) ([]bundleWatch, string) {
 	discCfg := rest.CopyConfig(restCfg)
 	discCfg.Timeout = 10 * time.Second
 	served, err := apiResourceNames(discCfg, bundlesGVR.GroupVersion())
 	if err != nil {
-		return nil, "", "discovery: " + err.Error()
+		return nil, "discovery: " + err.Error()
 	}
 	if !served[bundlesGVR.Resource] {
 		klog.Infof("bundlewatch[%s]: skipped (no fleet.cattle.io API)", w.Context)
 		w.unavailable(bundlesGVR.Resource, BundleNoAPI, "")
-		return nil, "", ""
+		return nil, ""
 	}
 
-	// Not the supervisor's pod-derived scope: Fleet objects live in
-	// workspace namespaces, and a role can grant them cluster-wide
-	// without pods. Cluster-wide when Fleet access allows, else the
-	// kubeconfig's namespace.
-	scope := ""
-	allowed, denial, failure := w.canWatch(ctx, sup, bundlesGVR, scope)
-	if failure == "" && !allowed {
-		if hint := sup.scopeHint(w.Context); hint != "" {
-			scope = hint
-			allowed, denial, failure = w.canWatch(ctx, sup, bundlesGVR, scope)
-		}
-	}
+	scope, denial, failure := w.scopeFor(ctx, sup, bundlesGVR)
 	if failure != "" {
-		return nil, "", failure
+		return nil, failure
 	}
-	if !allowed {
+	if denial != "" {
 		w.unavailable(bundlesGVR.Resource, BundleForbidden, denial)
-		return nil, "", ""
+		return nil, ""
 	}
 
-	watched := []bundleResource{bundleResources[0]}
+	watched := []bundleWatch{{bundleResources[0], scope}}
 	for _, r := range bundleResources[1:] {
 		if !served[r.gvr.Resource] {
 			w.unavailable(r.gvr.Resource, BundleNoAPI, "")
 			continue
 		}
-		allowed, denial, failure := w.canWatch(ctx, sup, r.gvr, scope)
+		scope, denial, failure := w.scopeFor(ctx, sup, r.gvr)
 		switch {
 		case failure != "":
 			w.unavailable(r.gvr.Resource, BundleCheckFailed, failure)
-		case !allowed:
+		case denial != "":
 			w.unavailable(r.gvr.Resource, BundleForbidden, denial)
 		default:
-			watched = append(watched, r)
+			watched = append(watched, bundleWatch{r, scope})
 		}
 	}
-	return watched, scope, ""
+	return watched, ""
+}
+
+// scopeFor finds where gvr can be watched: cluster-wide when allowed,
+// else the kubeconfig's namespace. Not the supervisor's pod-derived
+// scope, and not shared between resources: Fleet keeps Bundles in
+// workspace namespaces but BundleDeployments in per-cluster ones, and
+// a role can grant any of them without the others or without pods.
+func (w *BundleWatcher) scopeFor(ctx context.Context, sup *Supervisor, gvr schema.GroupVersionResource) (scope, denial, failure string) {
+	denial, failure = w.canWatch(ctx, sup, gvr, "")
+	if denial == "" {
+		return "", "", failure
+	}
+	hint := sup.scopeHint(w.Context)
+	if hint == "" {
+		return "", denial, ""
+	}
+	denial, failure = w.canWatch(ctx, sup, gvr, hint)
+	return hint, denial, failure
 }
 
 // canWatch checks both verbs an informer needs: with list alone it
-// syncs once and then never sees a change. Returns whether both are
-// allowed, the denial when not, or why the review itself failed.
-func (w *BundleWatcher) canWatch(ctx context.Context, sup *Supervisor, gvr schema.GroupVersionResource, ns string) (bool, string, string) {
+// syncs once and then never sees a change. Returns the denial, or why
+// the review itself failed; neither means allowed.
+func (w *BundleWatcher) canWatch(ctx context.Context, sup *Supervisor, gvr schema.GroupVersionResource, ns string) (denial, failure string) {
 	for _, verb := range []string{"list", "watch"} {
 		res := sup.CanI(ctx, w.Context, verb, gvr.Group, gvr.Resource, ns)
 		if res.Err != "" {
-			return false, "", res.Err
+			return "", res.Err
 		}
 		if !res.Allowed {
-			denial := verb + " " + gvr.Resource + " denied"
+			denial = verb + " " + gvr.Resource + " denied"
 			if ns != "" {
 				denial += " in " + ns
 			}
 			if res.Reason != "" {
 				denial += ": " + res.Reason
 			}
-			return false, denial, ""
+			return denial, ""
 		}
 	}
-	return true, "", ""
+	return "", ""
 }
 
 func (w *BundleWatcher) unavailable(resource string, reason BundleUnavailableReason, detail string) {
@@ -477,8 +490,9 @@ func (w *BundleWatcher) emit(kind BundleEventKind, obj any, project func(*unstru
 // trimBundleObject rebuilds obj from the fields the projections read. A
 // Bundle carries its manifests gzipped in spec.resources (hundreds of
 // KB for a chart), a GitRepo lists every deployed object in its status,
-// and Rancher stamps an applied-object annotation on both; the cache
-// would otherwise hold all of it. Idempotent, as client-go requires.
+// a BundleDeployment its drift patches, and Rancher stamps an
+// applied-object annotation on all of them; the cache would otherwise
+// hold all of it. Idempotent, as client-go requires.
 func trimBundleObject(obj any, keep [][]string) any {
 	u, ok := obj.(*unstructured.Unstructured)
 	if !ok {
@@ -492,7 +506,36 @@ func trimBundleObject(obj any, keep [][]string) any {
 			}
 		}
 	}
+	if mods := nestedSlice(out, "status", "modifiedStatus"); mods != nil {
+		setNested(out, slimModifiedStatus(mods), []string{"status", "modifiedStatus"})
+	}
 	return &unstructured.Unstructured{Object: out}
+}
+
+// elidedPatch stands in for a drift patch in the cache, which can be as
+// large as the object it patches; the projection asks only whether
+// there is one, and describe fetches the object afresh.
+const elidedPatch = "(elided)"
+
+func slimModifiedStatus(mods []any) []any {
+	out := make([]any, 0, len(mods))
+	for _, m := range mods {
+		o, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		e := map[string]any{}
+		for _, k := range []string{"kind", "namespace", "name", "missing", "delete"} {
+			if v, found := o[k]; found {
+				e[k] = v
+			}
+		}
+		if nestedStr(o, "patch") != "" {
+			e["patch"] = elidedPatch
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 func setNested(obj map[string]any, v any, path []string) {

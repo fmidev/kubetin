@@ -16,7 +16,7 @@ import (
 type CanIResult struct {
 	Allowed bool
 	Reason  string // populated when not Allowed (denial reason from SSAR)
-	Err     string // transport / RBAC error
+	Err     string // transport error, or a review no authorizer could decide
 }
 
 // CanI runs a SelfSubjectAccessReview against the cluster. Same
@@ -68,6 +68,11 @@ func (s *Supervisor) CanI(ctx context.Context, ctxName, verb, group, resource, n
 	}
 	out.Allowed = res.Status.Allowed
 	out.Reason = res.Status.Reason
+	// No authorizer decided and one of them failed: the review says
+	// nothing about access, so it mustn't read as a denial.
+	if !res.Status.Allowed && !res.Status.Denied && res.Status.EvaluationError != "" {
+		out.Err = "evaluation error: " + res.Status.EvaluationError
+	}
 	return out
 }
 
