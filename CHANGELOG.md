@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.0](https://github.com/fmidev/kubetin/compare/v1.10.0...v1.11.0) (2026-11-12)
+
+
+### Features
+
+* **cluster:** watch Rancher Fleet bundles on manager clusters ([#113](https://github.com/fmidev/kubetin/issues/113)) ([65f7e7c](https://github.com/fmidev/kubetin/commit/65f7e7cdf8b1a0793c0644a3849b28956441726c))
+
 ## [1.10.0](https://github.com/fmidev/kubetin/compare/v1.9.0...v1.10.0) (2026-09-12)
 
 
