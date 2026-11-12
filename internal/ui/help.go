@@ -85,6 +85,7 @@ var helpGroups = []helpGroup{
 			{"4", "ingresses"},
 			{"5", "nodes"},
 			{"6", "namespaces"},
+			{"7", "bundles (Rancher Fleet)"},
 			{"F1", "fleet dashboard (toggle)"},
 			{"F3", "cluster dashboard (toggle)"},
 		},

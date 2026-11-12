@@ -32,6 +32,9 @@ func TestTableOrderInvalidation(t *testing.T) {
 		{ViewServices, func(uid types.UID, name string) tea.Msg { return SvcEventMsg{Context: "alpha", UID: uid, Name: name} }},
 		{ViewIngresses, func(uid types.UID, name string) tea.Msg { return IngEventMsg{Context: "alpha", UID: uid, Name: name} }},
 		{ViewNamespaces, func(uid types.UID, name string) tea.Msg { return NsEventMsg{Context: "alpha", UID: uid, Name: name} }},
+		{ViewBundles, func(uid types.UID, name string) tea.Msg {
+			return BundleEventMsg{Context: "alpha", UID: uid, Bundle: &cluster.Bundle{UID: uid, Name: name}}
+		}},
 	} {
 		t.Run(string(rune('0'+tc.view)), func(t *testing.T) {
 			m := New("alpha", model.NewStore(), []string{"alpha", "beta"})

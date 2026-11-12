@@ -123,6 +123,14 @@ func (m Model) refForCursor() (cluster.DescribeRef, bool) {
 				Name: r.Name, UID: m.cursor,
 			}, true
 		}
+	case ViewBundles:
+		if b, ok := m.bundles.items[m.cursor]; ok {
+			return cluster.DescribeRef{
+				Group: "fleet.cattle.io", Version: "v1alpha1",
+				Resource: "bundles", Kind: "Bundle",
+				Namespace: b.Namespace, Name: b.Name, UID: m.cursor,
+			}, true
+		}
 	}
 	return cluster.DescribeRef{}, false
 }

@@ -69,3 +69,17 @@ func TestRedactSecretData_StringDataOnly(t *testing.T) {
 		t.Fatal("stringData.key still contains plaintext")
 	}
 }
+
+func TestElideFleetPayloads(t *testing.T) {
+	o := mustUnstructured(t, bundleFailingJSON).Object
+	elideFleetPayloads(o)
+	if got := nestedObjs(o, "spec", "resources")[0]["content"]; got != "<elided, 18 bytes>" {
+		t.Errorf("content: %v", got)
+	}
+	if got := nestedStr(o, "metadata", "annotations", "objectset.rio.cattle.io/applied"); got != "<elided, 27 bytes>" {
+		t.Errorf("annotation: %v", got)
+	}
+	if got := nestedStr(o, "status", "display", "state"); got != "ErrApplied" {
+		t.Errorf("status lost: %v", got)
+	}
+}
